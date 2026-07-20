@@ -154,7 +154,7 @@ class TestDownstreamIntegration:
         # Should have both matmul and relu operations
         assert "linalg.matmul" in ir_str or "linalg.generic" in ir_str
         # Verify function structure is preserved
-        assert "func.return" in ir_str
+        assert "func.return" in ir_str or "return" in ir_str
 
     def test_multiple_tiles(self):
         """Test MLIR with multiple tiling levels."""
@@ -220,7 +220,7 @@ class TestDownstreamIntegration:
         assert "func.func" in ir_str
         assert "tensor<" in ir_str, "Should have tensor types"
         assert "x32" in ir_str or "f32" in ir_str, "Should have float type"
-        assert "func.return" in ir_str, "Should have return statement"
+        assert "func.return" in ir_str or "return" in ir_str, "Should have return statement"
 
 
 if __name__ == "__main__":

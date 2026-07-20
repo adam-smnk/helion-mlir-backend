@@ -87,8 +87,8 @@ class TestBasicOpLowerings:
         y = torch.randn(256, 192, dtype=torch.float32, device=device)
 
         module = generate_mlir(matmul_kernel_f32, [x, y])
-        
-        # Verify module is valid and contains expected operations
+        module.operation.verify()
+        # Verify module contains expected operations
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "scf.forall" in ir_str
@@ -114,8 +114,8 @@ class TestBasicOpLowerings:
         y = torch.randn(256, 192, dtype=torch.float64, device=device)
 
         module = generate_mlir(matmul_kernel_f64, [x, y])
-        
-        # Verify module is valid and contains expected operations
+        module.operation.verify()
+        # Verify module contains expected operations
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "scf.forall" in ir_str
@@ -136,6 +136,7 @@ class TestBasicOpLowerings:
         y = torch.randn(64, 64, dtype=torch.float32, device=device)
 
         module = generate_mlir(add_kernel, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         
         # Should have func.func and some operations
@@ -158,6 +159,7 @@ class TestBasicOpLowerings:
         x = torch.randn(32, 32, dtype=torch.float32, device=device)
         y = torch.randn(32, 32, dtype=torch.float32, device=device)
         module = generate_mlir(elem_kernel, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
 
@@ -180,6 +182,7 @@ class TestFullKernelCompilation:
         
         # Should not raise
         module = generate_mlir(simple, [x])
+        module.operation.verify()
         assert module is not None
 
     def test_matmul_with_epilogue(self):
@@ -201,6 +204,7 @@ class TestFullKernelCompilation:
         y = torch.randn(256, 192, dtype=torch.float32, device=device)
         
         module = generate_mlir(matmul_with_relu, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         
         assert "func.func" in ir_str
@@ -223,6 +227,7 @@ class TestFullKernelCompilation:
             y = torch.randn(32, 32, dtype=dtype, device=device)
             
             module = generate_mlir(add_kernel, [x, y])
+            module.operation.verify()
             assert module is not None
             
             ir_str = str(module)
@@ -246,10 +251,12 @@ class TestMLIRValidity:
         x = torch.randn(64, 128, dtype=torch.float32, device=device)
         
         module = generate_mlir(simple_kernel, [x])
+        module.operation.verify()
         ir_str = str(module)
         
-        # Should be valid textual MLIR (may have #map definitions first)
-        assert '"builtin.module"' in ir_str or 'builtin.module' in ir_str
+        # Should be valid textual MLIR (may have #map definitions first).
+        # May use generic format ("builtin.module"...) or pretty format (module {}).
+        assert '"builtin.module"' in ir_str or 'builtin.module' in ir_str or 'module {' in ir_str
         assert "func.func" in ir_str
         assert "return" in ir_str.lower()
 
@@ -272,6 +279,7 @@ class TestMLIRValidity:
         y = torch.randn(128, 96, dtype=torch.float32, device=device)
         
         module = generate_mlir(kernel_with_loops, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         
         # Check for key dialects
@@ -301,6 +309,7 @@ class TestExtendedOperations:
         
         # Should not raise an error
         module = generate_mlir(kernel_with_layer_norm, [x])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
 
@@ -319,6 +328,7 @@ class TestExtendedOperations:
         x = torch.randn(64, 128, dtype=torch.float32, device=device)
         
         module = generate_mlir(kernel_with_softmax, [x])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
 
@@ -340,6 +350,7 @@ class TestExtendedOperations:
         
         # This should work - basic kernel
         module = generate_mlir(kernel_basic, [x])
+        module.operation.verify()
         assert module is not None
 
     def test_error_diagnostics_available(self):
@@ -409,6 +420,7 @@ class TestDynamicShapes:
         
         # Should work - shape is resolved at compile time
         module = generate_mlir(kernel_dynamic_ish, [x])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
 
@@ -428,6 +440,7 @@ class TestDynamicShapes:
         
         # Generate MLIR - should use symbol table internally
         module = generate_mlir(test_kernel, [x])
+        module.operation.verify()
         assert module is not None
 
 
@@ -469,6 +482,7 @@ class TestAdvancedOperations:
         y = torch.randn(64, 128, dtype=torch.float32, device=device)
 
         module = generate_mlir(sub_kernel, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "linalg.generic" in ir_str
@@ -488,6 +502,7 @@ class TestAdvancedOperations:
         y = torch.randn(32, 64, dtype=torch.float32, device=device) + 1.0  # Avoid division by zero
 
         module = generate_mlir(div_kernel, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
 
@@ -505,6 +520,7 @@ class TestAdvancedOperations:
         x = torch.randn(32, 64, dtype=torch.float32, device=device)
 
         module = generate_mlir(exp_kernel, [x])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "linalg.generic" in ir_str
@@ -526,32 +542,30 @@ class TestAdvancedOperations:
         x = torch.randn(64, 128, dtype=torch.float32, device=device)
 
         module = generate_mlir(transpose_kernel, [x])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
         # Just verify MLIR module is generated without errors
         assert "scf.forall" in ir_str
 
     def test_clamp_operation(self):
-        """Test relu lowering (clamp is not yet supported).
-
-        TODO: lower aten.clamp_min.default / aten.clamp_max.default.
-        torch.clamp decomposes to those two ops, which the MLIR backend does
-        not yet handle.  Using relu as a stand-in until clamp is implemented.
-        """
+        """Test torch.clamp lowering via torch-mlir → linalg.generic."""
         @helion.kernel(static_shapes=True)
-        def relu_kernel(x: torch.Tensor) -> torch.Tensor:
+        def clamp_kernel(x: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
             out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
             for tile_m, tile_n in hl.tile([m, n]):
-                out[tile_m, tile_n] = torch.relu(x[tile_m, tile_n])
+                out[tile_m, tile_n] = torch.clamp(x[tile_m, tile_n], min=-1.0, max=1.0)
             return out
 
         device = torch.device("cpu")
         x = torch.randn(32, 64, dtype=torch.float32, device=device)
 
-        module = generate_mlir(relu_kernel, [x])
+        module = generate_mlir(clamp_kernel, [x])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
+        assert "linalg.generic" in ir_str
 
 
 class TestEinsumDecomposition:
@@ -585,6 +599,7 @@ class TestEinsumDecomposition:
         x = torch.randn(64, 128)
         y = torch.randn(64, 128)
         module = generate_mlir(k, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "linalg.generic" in ir_str  # from decomposed mul
@@ -606,6 +621,7 @@ class TestEinsumDecomposition:
         x = torch.randn(2, 3, 4, 5)
         y = torch.randn(2, 3, 4, 5)
         module = generate_mlir(k, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "scf.forall" in ir_str
@@ -627,11 +643,12 @@ class TestEinsumDecomposition:
         x = torch.randn(2, 2, 2, 2, 2)
         y = torch.randn(2, 2, 2, 2, 2)
         module = generate_mlir(k, [x, y])
+        module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "scf.forall" in ir_str
         assert "linalg" in ir_str
 
 
-if __name__ == "__main__":
+if __name__ =="__main__":
     pytest.main([__file__, "-v"])
