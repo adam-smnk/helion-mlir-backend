@@ -1,0 +1,62 @@
+[project]
+name = "helion-mlir"
+version = "0.1.0"
+description = "Workspace environment for local editable Helion and torch-mlir development"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML",
+  "numpy",
+  "python-dotenv",
+	"helion",
+	"torch-mlir==20260529.826",
+  "torch==2.12.1+cu130",
+  "mlir-python-bindings==20260708+478bbbeb0",
+  "ml-dtypes",
+]
+
+[dependency-groups]
+dev = [
+  "ruff==0.14.5", # Python linter and formatter
+  "pre-commit", # Tool to manage and apply pre-commit hooks
+  "pytest>=8.0.0",
+  "pytest-timeout",
+  "psutil",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+filterwarnings = [
+    'error', # Turn all uncaptured warnings into errors.
+    'ignore::DeprecationWarning',
+    'ignore::FutureWarning',
+    'ignore::UserWarning',
+]
+
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+
+[tool.uv.sources]
+helion = { path = "./helion", editable = true }
+torch-mlir = { index = "torch-mlir" }
+torch = { index = "pytorch" }
+mlir-python-bindings = { index = "eudsl" }
+
+[[tool.uv.index]]
+name = "torch-mlir"
+url = "https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl"
+
+[[tool.uv.index]]
+name = "eudsl"
+url = "https://llvm.github.io/eudsl"
+explicit = true
+format = "flat"
