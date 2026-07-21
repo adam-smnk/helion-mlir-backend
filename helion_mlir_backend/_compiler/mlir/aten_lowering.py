@@ -319,7 +319,7 @@ def _resolve_shape(t: torch.Tensor, block_id_to_size: dict[int, int]) -> list[in
     return result
 
 
-def _tensor_meta(t: torch.Tensor):
+def _tensor_meta(t: torch.Tensor) -> object:
     from torch.fx.passes.shape_prop import TensorMetadata
 
     return TensorMetadata(
@@ -344,7 +344,7 @@ def _node_returns_tensor(node: torch.fx.Node) -> bool:
     return node.meta.get("tensor_meta") is not None
 
 
-def _resolve_fx_literal(node: torch.fx.Node):
+def _resolve_fx_literal(node: torch.fx.Node) -> object:
     """Resolve a non-tensor FX node to a Python literal for subgraph import.
 
     Returns ``_MISSING_LITERAL`` when unresolved.
@@ -395,7 +395,9 @@ def _fake_tensor_from_node_meta(
     return torch.zeros(concrete_shape, dtype=dtype)
 
 
-def _resolve_dims(dims, block_id_to_size: dict[int, int]) -> list[int]:
+def _resolve_dims(
+    dims: tuple[object, ...] | list[object], block_id_to_size: dict[int, int]
+) -> list[int]:
     """Resolve a sequence of dims (possibly SymInt) to concrete integer sizes."""
     result = []
     for d in dims:
@@ -410,7 +412,7 @@ def _resolve_dims(dims, block_id_to_size: dict[int, int]) -> list[int]:
     return result
 
 
-def _infer_node_dtype(node: torch.fx.Node):
+def _infer_node_dtype(node: torch.fx.Node) -> torch.dtype | None:
     """Infer a dtype from FX node metadata if possible."""
     val = node.meta.get("val")
     if isinstance(val, torch.Tensor):
@@ -423,7 +425,7 @@ def _infer_node_dtype(node: torch.fx.Node):
     return None
 
 
-def _normalize_aten_args(node: torch.fx.Node):
+def _normalize_aten_args(node: torch.fx.Node) -> tuple[object, ...]:
     """Return sanitized ATen args for known FX tracing quirks.
 
     In some cast-heavy patterns, FX can encode ``aten.mul.Tensor`` as
@@ -443,7 +445,7 @@ def _normalize_aten_args(node: torch.fx.Node):
     return tuple(args)
 
 
-def _sym_name(op) -> str | None:
+def _sym_name(op: object) -> str | None:
     """Return the ``sym_name`` string of an op, or None if it has none."""
     try:
         import mlir.ir as ir
@@ -453,7 +455,7 @@ def _sym_name(op) -> str | None:
         return None
 
 
-def _find_func(module: ir.Module, func_name: str):
+def _find_func(module: ir.Module, func_name: str) -> ir.Operation | None:
     """Return the op with ``sym_name == func_name``, or None."""
     for op in module.body.operations:
         if _sym_name(op) == func_name:

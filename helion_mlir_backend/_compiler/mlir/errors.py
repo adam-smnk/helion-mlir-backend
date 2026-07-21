@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-from typing import Any
 
 if TYPE_CHECKING:
     import torch.fx
@@ -28,7 +27,7 @@ class UnsupportedOperationError(MLIRBackendError):
         op_name: str,
         reason: str | None = None,
         alternatives: list[str] | None = None,
-    ):
+    ) -> None:
         msg = f"Unsupported operation: {op_name}"
         if reason:
             msg += f"\nReason: {reason}"
@@ -46,10 +45,10 @@ class TypeConversionError(MLIRBackendError):
 
     def __init__(
         self,
-        torch_type: Any,
+        torch_type: object,
         reason: str | None = None,
         supported_types: list[str] | None = None,
-    ):
+    ) -> None:
         msg = f"Cannot convert type: {torch_type}"
         if reason:
             msg += f"\nReason: {reason}"
@@ -66,10 +65,10 @@ class ShapeError(MLIRBackendError):
 
     def __init__(
         self,
-        shape: Any,
+        shape: object,
         reason: str | None = None,
         constraint: str | None = None,
-    ):
+    ) -> None:
         msg = f"Invalid shape: {shape}"
         if reason:
             msg += f"\nReason: {reason}"
@@ -84,7 +83,7 @@ class ShapeError(MLIRBackendError):
 class DynamicShapeError(ShapeError):
     """Raised when dynamic shapes are encountered but not supported."""
 
-    def __init__(self, shape: Any, symbol_name: str | None = None):
+    def __init__(self, shape: object, symbol_name: str | None = None) -> None:
         reason = f"Dynamic shape {symbol_name or 'with SymInt'} not yet supported"
         constraint = "Use static_shapes=True in @helion.kernel decorator"
         super().__init__(shape, reason, constraint)
@@ -94,7 +93,7 @@ class DynamicShapeError(ShapeError):
 class ValueNotFoundError(MLIRBackendError):
     """Raised when a value lookup fails."""
 
-    def __init__(self, node: Any, context: str | None = None):
+    def __init__(self, node: object, context: str | None = None) -> None:
         msg = f"Value not found for node: {node}"
         if context:
             msg += f"\nContext: {context}"
@@ -111,7 +110,7 @@ class NodeLoweringError(MLIRBackendError):
         node: torch.fx.Node,
         reason: str | None = None,
         recovery_hint: str | None = None,
-    ):
+    ) -> None:
         msg = f"Failed to lower FX node: {node.op}[{node.name}]"
         if hasattr(node, "target"):
             msg += f"\nTarget: {node.target}"
@@ -133,7 +132,7 @@ class ModuleBuilderError(MLIRBackendError):
         stage: str,
         reason: str | None = None,
         recovery_hint: str | None = None,
-    ):
+    ) -> None:
         msg = f"Module building failed at stage: {stage}"
         if reason:
             msg += f"\nReason: {reason}"
@@ -151,10 +150,10 @@ class OperandError(MLIRBackendError):
     def __init__(
         self,
         operation: str,
-        actual: Any,
-        expected: Any,
+        actual: object,
+        expected: object,
         operand_name: str | None = None,
-    ):
+    ) -> None:
         msg = f"Operand mismatch for {operation}"
         if operand_name:
             msg += f" ({operand_name})"
@@ -166,7 +165,9 @@ class OperandError(MLIRBackendError):
         self.operand_name = operand_name
 
 
-def validate_tensor_shape(shape: Any, allow_dynamic: bool = False) -> None:
+def validate_tensor_shape(
+    shape: tuple[object, ...] | list[object], allow_dynamic: bool = False
+) -> None:
     """Validate that a tensor shape is valid.
 
     Parameters
@@ -205,7 +206,7 @@ def validate_tensor_shape(shape: Any, allow_dynamic: bool = False) -> None:
             )
 
 
-def safe_int_conversion(val: Any, param_name: str = "value") -> int:
+def safe_int_conversion(val: object, param_name: str = "value") -> int:
     """Safely convert a value to int with helpful error messages.
 
     Parameters
@@ -284,7 +285,7 @@ def diagnose_unsupported_op(op_name: str) -> str:
 def log_diagnostic_info(
     stage: str,
     node: torch.fx.Node | None = None,
-    context: dict[str, Any] | None = None,
+    context: dict[str, object] | None = None,
 ) -> None:
     """Log diagnostic information for debugging.
 

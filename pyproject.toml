@@ -62,10 +62,6 @@ preview = true
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ANN"]
-# External MLIR compiler files are adapted from in-tree prototype code.
-# Keep strict Ruff defaults globally, but relax a few noisy rules here until
-# we do a dedicated annotation/type-style cleanup pass.
-"helion_mlir_backend/_compiler/mlir/*.py" = ["ANN", "B905", "TD002", "RUF015"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]

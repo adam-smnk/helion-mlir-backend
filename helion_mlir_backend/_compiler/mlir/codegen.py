@@ -228,7 +228,7 @@ class MLIRModuleBuilder:
         # or is created inside the kernel (torch.empty).  We detect it as the
         # tensor registered with name "out" (or the last one if none found).
         #
-        # TODO: handle multiple return tensors.
+        # TODO(helion-mlir): handle multiple return tensors.
         out_name, out_tensor = self._find_output_tensor(tensor_params)
         output_types: list[ir.Type] = [torch_tensor_to_mlir_type(out_tensor)]
 
@@ -244,7 +244,7 @@ class MLIRModuleBuilder:
         entry = fn.add_entry_block()
         with ir.InsertionPoint(entry):
             # Register parameter names → MLIR values
-            for (name, _), arg in zip(input_params, entry.arguments):
+            for (name, _), arg in zip(input_params, entry.arguments, strict=True):
                 self._param_to_value[name] = arg
 
             # Block sizes are pre-resolved in build() before this call.
@@ -342,14 +342,14 @@ class MLIRModuleBuilder:
 
         # Register grid block IVs → forall induction variables.
         ivs = list(forall.induction_variables)
-        for bid, iv in zip(grid_block_ids, ivs):
+        for bid, iv in zip(grid_block_ids, ivs, strict=True):
             self._block_id_to_iv[bid] = iv
 
         # Build the forall body.
         body_block = forall.body
         with ir.InsertionPoint(body_block):
             # The last block arg is the iter arg (shared output tile).
-            shared_out_arg = list(forall.inner_iter_args)[0]
+            shared_out_arg = next(iter(forall.inner_iter_args))
 
             # Process all root graphs.
             self._process_root_graphs(shared_out_arg)
@@ -935,7 +935,9 @@ class MLIRModuleBuilder:
             body_graph_info = device_ir.graphs[body_graph_id]
             body_graph = body_graph_info.graph
             placeholders = [n for n in body_graph.nodes if n.op == "placeholder"]
-            for ph_node, body_arg in zip(placeholders, body_block.arguments[1:]):
+            for ph_node, body_arg in zip(
+                placeholders, body_block.arguments[1:], strict=True
+            ):
                 self._node_to_value[ph_node] = body_arg
 
             # Process the body graph.

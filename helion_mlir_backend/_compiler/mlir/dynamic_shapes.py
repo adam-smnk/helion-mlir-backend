@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-from typing import Any
 
 import torch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import mlir.ir as ir
 
 log = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ log = logging.getLogger(__name__)
 class SymbolInfo:
     """Information about a symbolic dimension."""
 
-    def __init__(self, name: str, symbol: Any, block_id: int | None = None):
+    def __init__(self, name: str, symbol: object, block_id: int | None = None) -> None:
         """Initialize symbol info.
 
         Parameters
@@ -77,7 +78,7 @@ class SymbolInfo:
 class SymbolTable:
     """Table of symbolic dimensions encountered during lowering."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize symbol table."""
         self._symbols: dict[str, SymbolInfo] = {}
         self._symbol_to_concrete: dict[str, int] = {}
@@ -85,7 +86,7 @@ class SymbolTable:
     def register_symbol(
         self,
         name: str,
-        symbol: Any,
+        symbol: object,
         block_id: int | None = None,
     ) -> SymbolInfo:
         """Register a new symbol.
@@ -158,7 +159,7 @@ class SymbolTable:
 
 
 def extract_symbol_from_shape(
-    shape_node: Any,
+    shape_node: object,
     index: int,
     symbol_table: SymbolTable,
 ) -> tuple[str | None, int | None]:
@@ -226,8 +227,8 @@ def create_dynamic_shape_indexing(
 
 def generate_shape_dependent_code(
     shape_dims: list[tuple[str | None, int]],
-    callback,
-) -> Any:
+    callback: Callable[[list[int]], object],
+) -> object:
     """Generate code that handles both static and dynamic shape scenarios.
 
     Parameters
@@ -279,7 +280,7 @@ def validate_shape_compatibility(
     if len(shape1) != len(shape2):
         return False
 
-    for (sym1, concrete1), (sym2, concrete2) in zip(shape1, shape2):
+    for (sym1, concrete1), (sym2, concrete2) in zip(shape1, shape2, strict=True):
         # If both are symbolic with same name, OK
         if sym1 is not None and sym2 is not None and sym1 == sym2:
             continue
