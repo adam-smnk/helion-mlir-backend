@@ -15,7 +15,7 @@ pip install helion mlir-python-bindings
 ```python
 import torch
 import helion as hl
-from helion.mlir import generate_mlir
+from helion_mlir_backend import generate_mlir
 
 # Define a kernel
 @hl.kernel(static_shapes=True)
@@ -295,7 +295,7 @@ To use MLIR backend instead of default Triton:
 
 ```python
 # Option 1: Direct API
-from helion.mlir import generate_mlir
+from helion_mlir_backend import generate_mlir
 module = generate_mlir(kernel, args)
 
 # Option 2: Via compilation environment

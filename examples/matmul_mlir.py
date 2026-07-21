@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import helion
 import helion.language as hl
-from helion.mlir import generate_mlir
 import torch
+
+from helion_mlir_backend import generate_mlir
 
 
 @helion.kernel(static_shapes=True)

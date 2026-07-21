@@ -258,7 +258,7 @@ def kernel(x: torch.Tensor) -> torch.Tensor:
 
 ### Print Full IR
 ```python
-from helion.mlir import generate_mlir
+from helion_mlir_backend import generate_mlir
 module = generate_mlir(kernel, args)
 print(module)  # Full MLIR IR
 ```
