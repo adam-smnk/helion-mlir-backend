@@ -7,7 +7,7 @@ import torch
 import mlir.ir as ir
 import helion
 import helion.language as hl
-from helion.mlir import generate_mlir
+from helion_mlir_backend import generate_mlir
 
 
 @pytest.fixture
@@ -24,28 +24,28 @@ class TestTypeConversions:
 
     def test_float32_conversion(self, mlir_context):
         """Test float32 dtype conversion."""
-        from helion._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
         with mlir_context:
             result = torch_dtype_to_mlir(torch.float32)
             assert "f32" in str(result)
 
     def test_float64_conversion(self, mlir_context):
         """Test float64 dtype conversion."""
-        from helion._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
         with mlir_context:
             result = torch_dtype_to_mlir(torch.float64)
             assert "f64" in str(result)
 
     def test_int32_conversion(self, mlir_context):
         """Test int32 dtype conversion."""
-        from helion._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
         with mlir_context:
             result = torch_dtype_to_mlir(torch.int32)
             assert "i32" in str(result)
 
     def test_tensor_type_conversion(self, mlir_context):
         """Test tensor shape + dtype conversion."""
-        from helion._compiler.mlir.type_utils import torch_tensor_to_mlir_type
+        from helion_mlir_backend._compiler.mlir.type_utils import torch_tensor_to_mlir_type
         
         tensor = torch.randn(256, 512, dtype=torch.float32)
         with mlir_context:
@@ -59,7 +59,7 @@ class TestTypeConversions:
 
     def test_unsupported_dtype_raises(self, mlir_context):
         """Test that unsupported dtypes raise error."""
-        from helion._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
         
         with mlir_context:
             with pytest.raises((ValueError, NotImplementedError)):
@@ -336,7 +336,7 @@ class TestExtendedOperations:
 
     def test_unsupported_operation_error(self):
         """Test that unsupported operations raise helpful error."""
-        from helion._compiler.mlir.errors import UnsupportedOperationError
+        from helion_mlir_backend._compiler.mlir.errors import UnsupportedOperationError
         
         # Create a simple test to verify error handling is in place
         @helion.kernel(static_shapes=True)
@@ -357,7 +357,7 @@ class TestExtendedOperations:
 
     def test_error_diagnostics_available(self):
         """Test that error diagnostics module is available."""
-        from helion._compiler.mlir.errors import (
+        from helion_mlir_backend._compiler.mlir.errors import (
             diagnose_unsupported_op,
             validate_tensor_shape,
             safe_int_conversion,
@@ -382,7 +382,7 @@ class TestDynamicShapes:
 
     def test_symbol_table_creation(self):
         """Test that SymbolTable can be created."""
-        from helion._compiler.mlir.dynamic_shapes import SymbolTable
+        from helion_mlir_backend._compiler.mlir.dynamic_shapes import SymbolTable
 
         table = SymbolTable()
         assert table is not None
@@ -390,7 +390,7 @@ class TestDynamicShapes:
 
     def test_symbol_registration(self):
         """Test symbol registration in table."""
-        from helion._compiler.mlir.dynamic_shapes import SymbolTable
+        from helion_mlir_backend._compiler.mlir.dynamic_shapes import SymbolTable
 
         table = SymbolTable()
         info = table.register_symbol("u0", 128, block_id=0)
@@ -401,7 +401,7 @@ class TestDynamicShapes:
 
     def test_symbol_resolution(self):
         """Test SymInt resolution."""
-        from helion._compiler.mlir.dynamic_shapes import SymbolInfo
+        from helion_mlir_backend._compiler.mlir.dynamic_shapes import SymbolInfo
 
         # Create a SymbolInfo with a concrete integer
         info = SymbolInfo("test", 42)

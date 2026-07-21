@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "helion-mlir"
 version = "0.1.0"
@@ -37,8 +41,11 @@ filterwarnings = [
 
 
 [tool.uv]
-package = false
+package = true
 index-strategy = "unsafe-best-match"
+
+[tool.hatch.build.targets.wheel]
+packages = ["helion_mlir_backend"]
 
 [tool.uv.sources]
 helion = { path = "./helion", editable = true }

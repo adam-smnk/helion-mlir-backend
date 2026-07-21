@@ -8,7 +8,7 @@ import pytest
 import torch
 import helion
 import helion.language as hl
-from helion.mlir import generate_mlir
+from helion_mlir_backend import generate_mlir
 
 
 class TestDownstreamIntegration:
