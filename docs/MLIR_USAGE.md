@@ -23,13 +23,13 @@ def matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.shape
     k2, n = y.shape
     out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
-    
+
     return out
 
 # Generate MLIR IR
@@ -132,22 +132,22 @@ For operations with reduction dimensions (like matmul):
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.shape
     k2, n = y.shape
-    
+
     out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
-    
+
     # Outer loop: output dimensions (parallelizable)
     for tile_m, tile_n in hl.tile([m, n]):
         # Accumulator for this tile
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        
+
         # Inner loop: reduction dimension (sequential)
         for tile_k in hl.tile(k):
             # Accumulation
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        
+
         # Store result
         out[tile_m, tile_n] = acc
-    
+
     return out
 ```
 
@@ -160,10 +160,10 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def relu(x: torch.Tensor) -> torch.Tensor:
     m, n = x.shape
     out = torch.zeros_like(x)
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         out[tile_m, tile_n] = torch.relu(x[tile_m, tile_n])
-    
+
     return out
 ```
 
@@ -174,10 +174,10 @@ def relu(x: torch.Tensor) -> torch.Tensor:
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, n = x.shape
     out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
-    
+
     return out
 ```
 
@@ -189,13 +189,13 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.shape
     k2, n = y.shape
     out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
-    
+
     return out
 ```
 
@@ -207,15 +207,15 @@ def matmul_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.shape
     k2, n = y.shape
     out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        
+
         # Fuse ReLU with matmul result
         out[tile_m, tile_n] = torch.relu(acc)
-    
+
     return out
 ```
 

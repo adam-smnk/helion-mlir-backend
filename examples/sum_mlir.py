@@ -7,10 +7,12 @@ Demonstrates reduction over the last dimension of a 2D tensor:
 This example is CPU-focused and uses float32 inputs.
 """
 
-import torch
+from __future__ import annotations
+
 import helion
 import helion.language as hl
 from helion.mlir import generate_mlir
+import torch
 
 
 @helion.kernel(static_shapes=True)

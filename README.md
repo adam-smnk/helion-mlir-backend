@@ -62,3 +62,69 @@ Expected backend module prefix:
 - No Helion source patching is required.
 - No system-wide or user-global Python startup files are modified.
 - No runtime `helion.mlir` module shim is used.
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named "mlir"`
+
+The MLIR Python bindings are missing from your environment.
+
+- If using this repo workflow, run:
+
+```bash
+uv sync
+```
+
+- If using pip-based setup, ensure `mlir-python-bindings` is installed in the
+	same environment as `helion` and `helion-mlir`.
+
+### `torch-mlir`/`torch` compatibility errors
+
+`torch-mlir` wheels are version-sensitive with respect to `torch`.
+
+- Use the pinned versions from `pyproject.toml` in this repository.
+- Recreate or resync your environment if versions drift:
+
+```bash
+uv sync
+```
+
+- Quick check:
+
+```bash
+python - <<'PY'
+import torch
+import torch_mlir
+print('torch:', torch.__version__)
+print('torch_mlir:', getattr(torch_mlir, '__version__', 'unknown'))
+PY
+```
+
+## Development
+
+This repo uses pre-commit + Ruff rules aligned with Helion style.
+
+Install hooks:
+
+```bash
+uv run pre-commit install
+```
+
+Run hooks on all files:
+
+```bash
+uv run pre-commit run -a
+```
+
+Run Ruff directly:
+
+```bash
+uv run ruff check helion_mlir_backend tests
+uv run ruff format helion_mlir_backend tests
+```
+
+Run MLIR test suites:
+
+```bash
+uv run --with pytest pytest tests/test_mlir_backend.py tests/test_mlir_integration.py -q
+```

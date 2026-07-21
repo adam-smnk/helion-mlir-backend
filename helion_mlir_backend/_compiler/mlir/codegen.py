@@ -72,27 +72,28 @@ Prerequisites before Phase 2 can land:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
+import torch.fx
 
-from .errors import (
-    DynamicShapeError,
-    ModuleBuilderError,
-    NodeLoweringError,
-    ShapeError,
-    UnsupportedOperationError,
-    ValueNotFoundError,
-    safe_int_conversion,
-)
 from .dynamic_shapes import SymbolTable
-from .type_utils import get_zero_attr, torch_dtype_to_mlir, torch_tensor_to_mlir_type
+from .errors import DynamicShapeError
+from .errors import ModuleBuilderError
+from .errors import NodeLoweringError
+from .errors import ShapeError
+from .errors import UnsupportedOperationError
+from .errors import ValueNotFoundError
+from .errors import safe_int_conversion
+from .type_utils import get_zero_attr
+from .type_utils import torch_dtype_to_mlir
+from .type_utils import torch_tensor_to_mlir_type
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
     import mlir.ir as ir
-    import torch.fx
 
 log = logging.getLogger(__name__)
 
@@ -164,8 +165,10 @@ class MLIRModuleBuilder:
         try:
             ctx = ir.Context()
             # Register dialects we use
-            from mlir.dialects import func as func_d  # noqa: F401 – side-effect registration
             from mlir.dialects import arith as arith_d  # noqa: F401
+            from mlir.dialects import (
+                func as func_d,  # noqa: F401 – side-effect registration
+            )
             from mlir.dialects import linalg as linalg_d  # noqa: F401
             from mlir.dialects import scf as scf_d  # noqa: F401
             from mlir.dialects import tensor as tensor_d  # noqa: F401
@@ -183,7 +186,12 @@ class MLIRModuleBuilder:
                     # Phase 2: build the main kernel function.
                     self._build_function()
             return module
-        except (ModuleBuilderError, NodeLoweringError, ValueNotFoundError, UnsupportedOperationError):
+        except (
+            ModuleBuilderError,
+            NodeLoweringError,
+            ValueNotFoundError,
+            UnsupportedOperationError,
+        ):
             # Re-raise our custom exceptions
             raise
         except Exception as e:
@@ -198,8 +206,8 @@ class MLIRModuleBuilder:
     # ------------------------------------------------------------------
 
     def _build_function(self) -> None:
-        import mlir.ir as ir
         from mlir.dialects import func as func_d
+        import mlir.ir as ir
 
         hf = self.hf
         # Collect tensor parameters (non-constexpr, non-symbolic)
@@ -309,9 +317,9 @@ class MLIRModuleBuilder:
 
     def _build_kernel_body(self, out_tensor: torch.Tensor) -> ir.Value:
         """Build the kernel body and return the final result value."""
-        import mlir.ir as ir
         from mlir.dialects import scf as scf_d
         from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
 
         device_ir = self.hf.device_ir
         grid_block_ids: list[int] = []
@@ -326,7 +334,9 @@ class MLIRModuleBuilder:
         steps = [self._block_id_to_size[bid] for bid in grid_block_ids]
 
         # Create the output tensor (shared_outs for forall).
-        out_empty = tensor_d.EmptyOp(out_shape, torch_dtype_to_mlir(out_tensor.dtype)).result
+        out_empty = tensor_d.EmptyOp(
+            out_shape, torch_dtype_to_mlir(out_tensor.dtype)
+        ).result
 
         forall = scf_d.ForallOp(lbs, ubs, steps, shared_outs=[out_empty])
 
@@ -350,7 +360,7 @@ class MLIRModuleBuilder:
             # ops (i.e. tensor.parallel_insert_slice), not arith.constant.
             in_parallel = scf_d.InParallelOp()
             with ir.InsertionPoint(in_parallel.block):
-                for (value, offsets) in self._forall_insert_slices:
+                for value, offsets in self._forall_insert_slices:
                     # Sizes and strides are fully static: read from the source
                     # tensor type rather than dynamic SSA values.
                     src_type = ir.RankedTensorType(value.type)
@@ -359,9 +369,9 @@ class MLIRModuleBuilder:
                     tensor_d.ParallelInsertSliceOp(
                         value,
                         shared_out_arg,
-                        offsets,   # dynamic offsets (forall IVs)
-                        [],        # no dynamic sizes — all static from src
-                        [],        # no dynamic strides — all static 1
+                        offsets,  # dynamic offsets (forall IVs)
+                        [],  # no dynamic sizes — all static from src
+                        [],  # no dynamic strides — all static 1
                         static_offsets=[ir.ShapedType.get_dynamic_size()] * ndim,
                         static_sizes=static_sizes,
                         static_strides=[1] * ndim,
@@ -463,12 +473,11 @@ class MLIRModuleBuilder:
                 return self._lower_sym_size(node)
 
             # --- All standard ATen ops → pre-built linalg helper (func.call) ---
-            from .aten_lowering import (
-                is_aten_op,
-                collect_tensor_input_positions,
-                normalized_aten_args,
-            )
             from mlir.dialects import func as func_d
+
+            from .aten_lowering import collect_tensor_input_positions
+            from .aten_lowering import is_aten_op
+            from .aten_lowering import normalized_aten_args
 
             if is_aten_op(node):
                 entry = self._node_to_aten_func.get(id(node))
@@ -529,7 +538,11 @@ class MLIRModuleBuilder:
         if method in ("view", "reshape"):
             base_shape = self._shape_from_node_meta(base)
             result_shape = self._shape_from_node_meta(node)
-            if base_shape is not None and result_shape is not None and base_shape == result_shape:
+            if (
+                base_shape is not None
+                and result_shape is not None
+                and base_shape == result_shape
+            ):
                 return base_val
             raise UnsupportedOperationError(
                 method,
@@ -573,8 +586,8 @@ class MLIRModuleBuilder:
 
     def _get_value(self, node_or_val: object) -> ir.Value | None:
         """Look up an MLIR Value for a node or constant."""
-        import mlir.ir as ir
         from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
 
         if isinstance(node_or_val, torch.fx.Node):
             return self._node_to_value.get(node_or_val)
@@ -582,22 +595,26 @@ class MLIRModuleBuilder:
             # Scalar constant – create an index constant for now.
             if isinstance(node_or_val, int):
                 idx = ir.IndexType.get()
-                return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, node_or_val)).result
+                return arith_d.ConstantOp(
+                    idx, ir.IntegerAttr.get(idx, node_or_val)
+                ).result
             f32 = ir.F32Type.get()
-            return arith_d.ConstantOp(f32, ir.FloatAttr.get(f32, float(node_or_val))).result
+            return arith_d.ConstantOp(
+                f32, ir.FloatAttr.get(f32, float(node_or_val))
+            ).result
         return None
 
     def _get_index_const(self, val: int) -> ir.Value:
-        import mlir.ir as ir
         from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
 
         idx = ir.IndexType.get()
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, val)).result
 
     def _cast_to_index(self, val: ir.Value) -> ir.Value:
         """Cast an integer value to index type if needed."""
-        import mlir.ir as ir
         from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
 
         if isinstance(val.type, ir.IndexType):
             return val
@@ -632,12 +649,19 @@ class MLIRModuleBuilder:
             sym_name, concrete = extract_symbol_from_shape(s, i, self._symbol_table)
             if sym_name is not None and concrete is None:
                 # Symbol couldn't be resolved, use default
-                log.debug("Dynamic dim %d in %s: symbol=%s (using default)", i, operation_name, sym_name)
+                log.debug(
+                    "Dynamic dim %d in %s: symbol=%s (using default)",
+                    i,
+                    operation_name,
+                    sym_name,
+                )
                 concrete = 1  # Safe default
             shape.append(max(1, concrete or 0))
         return shape
 
-    def _shape_from_nodes(self, shape_nodes: list, operation_name: str = "op") -> list[int]:
+    def _shape_from_nodes(
+        self, shape_nodes: list, operation_name: str = "op"
+    ) -> list[int]:
         """Return a concrete integer shape list from a list of FX shape nodes.
 
         For ``_get_symnode("block_size_N")`` nodes the concrete block size is
@@ -725,8 +749,8 @@ class MLIRModuleBuilder:
         Currently supports flatten-style aliases by emitting
         ``tensor.collapse_shape``.
         """
-        import mlir.ir as ir
         from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
 
         base_shape = None
         try:
@@ -754,8 +778,8 @@ class MLIRModuleBuilder:
 
     def _lower_get_symnode(self, node: torch.fx.Node) -> ir.Value:
         """``_get_symnode('block_size_N')`` → integer index constant."""
-        import mlir.ir as ir
         from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
 
         key: str = node.args[0]
         # Parse "block_size_N" to get block_id N.
@@ -769,8 +793,8 @@ class MLIRModuleBuilder:
 
         Tolerates dynamic shapes (SymInt) by attempting resolution.
         """
-        import mlir.ir as ir
         from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
 
         # For static shapes the dimension is a concrete integer.
         val = node.meta.get("val")
@@ -801,10 +825,10 @@ class MLIRModuleBuilder:
         DynamicShapeError
             If dynamic shapes are encountered
         """
-        import mlir.ir as ir
         from mlir.dialects import arith as arith_d
         from mlir.dialects import linalg as linalg_d
         from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
 
         # args: shape (list/tuple of symnodes), fill_value, dtype, device
         try:
@@ -819,9 +843,11 @@ class MLIRModuleBuilder:
 
             mlir_dtype = torch_dtype_to_mlir(dtype)
             empty = tensor_d.EmptyOp(shape, mlir_dtype).result
-            fill_attr = ir.FloatAttr.get(mlir_dtype, float(fill_val)) \
-                if isinstance(mlir_dtype, ir.FloatType) \
+            fill_attr = (
+                ir.FloatAttr.get(mlir_dtype, float(fill_val))
+                if isinstance(mlir_dtype, ir.FloatType)
                 else ir.IntegerAttr.get(mlir_dtype, int(fill_val))
+            )
             fill_const = arith_d.ConstantOp(mlir_dtype, fill_attr).result
             return linalg_d.fill(fill_const, outs=[empty])
         except (ShapeError, DynamicShapeError):
@@ -848,7 +874,7 @@ class MLIRModuleBuilder:
         try:
             shape_nodes = node.args[0]
             dtype = node.args[1] if len(node.args) > 1 else torch.float32
-            
+
             # Extract concrete shape from shape nodes.
             shape = self._shape_from_nodes(shape_nodes, "zeros")
 
@@ -868,8 +894,8 @@ class MLIRModuleBuilder:
 
     def _lower_for_loop(self, node: torch.fx.Node) -> ir.Value:
         """``_for_loop(body_id, block_ids, upper_bounds, iter_args)`` → ``scf.for``."""
-        import mlir.ir as ir
         from mlir.dialects import scf as scf_d
+        import mlir.ir as ir
 
         body_graph_id: int = node.args[0]
         block_ids: list[int] = list(node.args[1])
@@ -954,8 +980,8 @@ class MLIRModuleBuilder:
 
     def _lower_load(self, node: torch.fx.Node) -> ir.Value:
         """``load(tensor, index_list)`` → ``tensor.extract_slice``."""
-        import mlir.ir as ir
         from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
 
         tensor_node = node.args[0]
         index_nodes = node.args[1]  # list of symnode values (tile sizes)
@@ -989,7 +1015,9 @@ class MLIRModuleBuilder:
                 offsets.append(self._get_index_const(0))
             # Size = concrete block size.
             if block_id is not None:
-                sizes.append(self._block_id_to_size.get(block_id, int(tensor_type.shape[dim])))
+                sizes.append(
+                    self._block_id_to_size.get(block_id, int(tensor_type.shape[dim]))
+                )
             else:
                 sizes.append(int(tensor_type.shape[dim]))
             strides.append(1)
@@ -1040,13 +1068,14 @@ class MLIRModuleBuilder:
     # ATen pre-pass: lower all ATen nodes before codegen starts
     # ------------------------------------------------------------------
 
-    def _prebuild_aten_helpers(self, module: "ir.Module") -> None:
+    def _prebuild_aten_helpers(self, module: ir.Module) -> None:
         """Scan device IR for ATen nodes, lower them all via one torch-mlir pass.
 
         Results are stored in ``self._node_to_aten_func`` and the helper
         ``func.func`` operations are inserted at the module's top level.
         """
-        from .aten_lowering import is_aten_op, preprocess_aten_nodes
+        from .aten_lowering import is_aten_op
+        from .aten_lowering import preprocess_aten_nodes
 
         aten_nodes: list[torch.fx.Node] = []
         for graph_info in self.hf.device_ir.graphs:
@@ -1109,7 +1138,11 @@ class MLIRModuleBuilder:
             if tname in ("sym_size.int", "sym_size_int"):
                 tensor_node = idx_node.args[0]
                 dim_idx = int(idx_node.args[1])
-                tensor_val = tensor_node.meta.get("val") if isinstance(tensor_node, torch.fx.Node) else None
+                tensor_val = (
+                    tensor_node.meta.get("val")
+                    if isinstance(tensor_node, torch.fx.Node)
+                    else None
+                )
                 if isinstance(tensor_val, torch.Tensor):
                     shape_val = tensor_val.shape[dim_idx]
                     if isinstance(shape_val, torch.SymInt):

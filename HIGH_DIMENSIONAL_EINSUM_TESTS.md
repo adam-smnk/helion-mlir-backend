@@ -13,7 +13,7 @@ Successfully added three comprehensive test cases for high-dimensional torch.ein
 
 **Purpose**: Tests a complex 4D tensor contraction where:
 - Input 1: `(2, 3, 4, 5)` - 4D tensor
-- Input 2: `(4, 5, 6)` - 3D tensor  
+- Input 2: `(4, 5, 6)` - 3D tensor
 - Output: `(2, 3, 6)` - 3D result
 
 **Verification**:
@@ -106,7 +106,7 @@ All tests include graceful exception handling for:
 ### Assertions
 Each test verifies:
 1. **Module generation**: `"func.func" in ir_str` - Valid MLIR function syntax
-2. **Linalg operations**: 
+2. **Linalg operations**:
    - 4D contraction: Explicitly checks for `.contract`, `.generic`, or `.matmul`
    - 5D operation: Verifies any `linalg` dialect operation present
    - 4D reduction: Basic IR validity check

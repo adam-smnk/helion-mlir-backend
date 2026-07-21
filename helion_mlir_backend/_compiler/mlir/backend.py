@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING
 from helion._compiler.triton.backend import TritonBackend
 
 if TYPE_CHECKING:
-    from helion._compiler.host_function import HostFunction
     from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.host_function import HostFunction
 
 
 class MLIRBackend(TritonBackend):

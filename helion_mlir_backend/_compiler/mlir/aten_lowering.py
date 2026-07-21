@@ -76,9 +76,9 @@ def normalized_aten_args(node: torch.fx.Node) -> tuple:
 
 def preprocess_aten_nodes(
     aten_nodes: list[torch.fx.Node],
-    mlir_module: "ir.Module",
+    mlir_module: ir.Module,
     block_id_to_size: dict[int, int] | None = None,
-) -> dict[int, tuple[str, list["ir.Type"]]]:
+) -> dict[int, tuple[str, list[ir.Type]]]:
     """Lower *all* ATen nodes in a single torch-mlir pipeline pass.
 
     Parameters
@@ -120,6 +120,7 @@ def preprocess_aten_nodes(
     # the implicit coupling to the caller's build() context manager.
     # ``op.clone()`` with an active IP auto-inserts at that point.
     import mlir.ir as ir
+
     with ir.InsertionPoint.at_block_begin(mlir_module.body):
         for op in helper_mod.body.operations:
             sym_name = _sym_name(op)
@@ -134,9 +135,7 @@ def preprocess_aten_nodes(
         if func_op is None:
             log.warning("Helper '%s' not found in lowered module", func_name)
             continue
-        ftype = ir.FunctionType(
-            ir.TypeAttr(func_op.attributes["function_type"]).value
-        )
+        ftype = ir.FunctionType(ir.TypeAttr(func_op.attributes["function_type"]).value)
         node_to_func[node_id] = (func_name, list(ftype.results))
 
     return node_to_func
@@ -152,14 +151,12 @@ def _batch_import_and_lower(
     block_id_to_size: dict[int, int],
 ) -> tuple[str, dict[int, str]]:
     """Build and lower all ATen subgraphs in one torch-mlir pipeline pass."""
-    import torch_mlir.ir as tm_ir
+    from torch_mlir.compiler_utils import OutputType
+    from torch_mlir.compiler_utils import lower_mlir_module
+    from torch_mlir.compiler_utils import run_pipeline_with_repro_report
     from torch_mlir.dialects import torch as torch_d
     from torch_mlir.extras.fx_importer import FxImporter
-    from torch_mlir.compiler_utils import (
-        OutputType,
-        lower_mlir_module,
-        run_pipeline_with_repro_report,
-    )
+    import torch_mlir.ir as tm_ir
 
     tm_ctx = tm_ir.Context()
     torch_d.register_dialect(tm_ctx)
@@ -450,12 +447,13 @@ def _sym_name(op) -> str | None:
     """Return the ``sym_name`` string of an op, or None if it has none."""
     try:
         import mlir.ir as ir
+
         return ir.StringAttr(op.attributes["sym_name"]).value
     except (KeyError, Exception):
         return None
 
 
-def _find_func(module: "ir.Module", func_name: str):
+def _find_func(module: ir.Module, func_name: str):
     """Return the op with ``sym_name == func_name``, or None."""
     for op in module.body.operations:
         if _sym_name(op) == func_name:

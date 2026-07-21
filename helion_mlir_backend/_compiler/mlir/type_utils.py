@@ -71,9 +71,9 @@ def get_zero_attr(dtype: torch.dtype) -> ir.Attribute:
     if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
         mlir_ty = torch_dtype_to_mlir(dtype)
         return ir.FloatAttr.get(mlir_ty, 0.0)
-    elif dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+    if dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
         mlir_ty = torch_dtype_to_mlir(dtype)
         return ir.IntegerAttr.get(mlir_ty, 0)
-    elif dtype == torch.bool:
+    if dtype == torch.bool:
         return ir.IntegerAttr.get(ir.IntegerType.get_signless(1), 0)
     raise NotImplementedError(f"No zero attr for dtype {dtype}")

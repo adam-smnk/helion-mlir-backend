@@ -85,18 +85,18 @@ def _lower_sub(self, node: torch.fx.Node) -> ir.Value:
     """Element-wise subtraction → linalg.generic"""
     lhs = self._get_value(node.args[0])
     rhs = self._get_value(node.args[1])
-    
+
     # Create output tensor
     out = tensor_d.EmptyOp([...], element_type).result
-    
+
     # Build linalg.generic with subtraction block
     generic = linalg_d.GenericOp([ty, ty], [lhs, rhs], [out], ...)
-    
+
     # Add block: compute arith.SubFOp or arith.SubIOp
     with ir.InsertionPoint(block):
         result = arith_d.SubFOp(a, b)
         linalg_d.YieldOp([result])
-    
+
     return generic.results[0]  # Note: Multi-result access
 ```
 
@@ -122,8 +122,8 @@ Output: MLIR matmul operation
 ## 🐛 Bug Fixes Applied
 
 ### Issue: Multi-Result linalg Operations
-**Problem**: `linalg.generic` with 2 inputs returns 2 results  
-**Solution**: Changed `.result` to `.results[0]` for proper indexing  
+**Problem**: `linalg.generic` with 2 inputs returns 2 results
+**Solution**: Changed `.result` to `.results[0]` for proper indexing
 **Files Modified**: `_lower_sub`, `_lower_div` methods
 
 ---

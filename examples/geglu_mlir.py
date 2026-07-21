@@ -19,10 +19,12 @@ Notes on current backend limits:
     and simplify incrementally around casts to isolate unsupported nodes.
 """
 
-import torch
+from __future__ import annotations
+
 import helion
 import helion.language as hl
 from helion.mlir import generate_mlir
+import torch
 
 
 @helion.kernel(static_shapes=True)

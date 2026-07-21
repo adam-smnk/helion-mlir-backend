@@ -14,6 +14,7 @@ def install() -> bool:
     """
     try:
         from helion._compiler.backend_registry import register_compiler_backend
+
         from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
     except Exception as exc:
         log.debug("External MLIR backend registration unavailable: %s", exc)

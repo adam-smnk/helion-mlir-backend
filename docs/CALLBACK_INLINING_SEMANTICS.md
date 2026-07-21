@@ -86,7 +86,7 @@ epilogue_lambda = lambda acc, tile: torch.relu(acc + bias[tile[1]])
 def visit_Call(self, node: ast.Call) -> object:
     args = [self.visit(arg) for arg in node.args]
     func = self.visit(node.func)
-    
+
     # KEY: Direct call, NOT an FX node
     return _CheckForIndexCalls.retry_call(func, args, kwargs)
 ```
@@ -148,25 +148,25 @@ def _helion_matmul(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    
+
     # Block iteration...
     for tile_k_start in range(0, k, 32):  # BLOCK_K is literal 32
         # Load, compute
         acc += compute_tile()
-    
+
     # Inlined epilogue (NO function call):
     # Instead of: acc = epilogue(acc, (tile_m_idx, tile_n_idx))
-    
+
     tile_m_idx = pid_m * 128 + tl.arange(0, 128)  # BLOCK_M is literal 128
     tile_n_idx = pid_n * 128 + tl.arange(0, 128)  # BLOCK_N is literal 128
-    
+
     # Load bias[tile_n_idx]
     bias_val = tl.load(bias_ptr + tile_n_idx)
-    
+
     # Compute: relu(acc + bias)
     acc_plus_bias = acc + bias_val
     acc_relu = tl.where(acc_plus_bias > 0, acc_plus_bias, 0.0)
-    
+
     # Store
     out_offset = (pid_m * 128 + tl.arange(0, 128)) * stride_m + \
                  (pid_n * 128 + tl.arange(0, 128)) * stride_n
@@ -202,7 +202,7 @@ def _helion_matmul(
 class CallableType(LiteralType):
     """Type representation for callable values."""
     value: Callable[..., object]  # The actual function object
-    
+
     def propagate_call(self, args, kwargs, origin):
         """When called in device code: trace execution and infer return type."""
 ```
@@ -233,10 +233,10 @@ class CallableType(LiteralType):
 @dataclasses.dataclass
 class ClosureOrigin(WrappedOrigin):
     key: int  # Index in __closure__ tuple
-    
+
     def needs_rename(self) -> bool:
         return True  # Must be renamed in generated code
-    
+
     def host_str(self) -> str:
         # E.g., "epilogue.__closure__[0].cell_contents"
         return f"{self.value.host_str()}.__closure__[{self.key}].cell_contents"
@@ -250,7 +250,7 @@ def kernel(x, y, epilogue):
         value=ArgumentOrigin("epilogue"),  # The parameter
         key=0                               # First closure cell
     )
-    
+
     # Codegen uses this to emit:
     # bias_ptr = epilogue.__closure__[0].cell_contents._data_ptr()
 ```
@@ -268,12 +268,12 @@ x_scaled = x * 2.0
 def complex_matmul(x, y, epilogue=None):
     if epilogue is None:
         epilogue = lambda acc, tile: acc
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         acc = torch.zeros(...)
         for tile_k in hl.tile(k):
             acc += torch.matmul(x[...], y[...])
-        
+
         # Dynamic epilogue with closures
         out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
 

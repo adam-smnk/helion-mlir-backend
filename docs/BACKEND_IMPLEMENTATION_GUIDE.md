@@ -34,19 +34,19 @@ class MyBackend(Backend):
     def name(self) -> str:
         """Unique backend name for registry."""
         return "mybackend"
-    
+
     @property
     def experimental(self) -> bool:
         """Whether to warn about experimental status."""
         return False
-    
+
     def validate_environment(self) -> None:
         """Raise helion.exc.* if backend unavailable."""
         # Check for required libraries, CUDA versions, etc.
         pass
-    
+
     # ============ TYPE MAPPING (Required) ============
-    
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Map torch.dtype to backend type string."""
         dtype_map = {
@@ -59,7 +59,7 @@ class MyBackend(Backend):
         if dtype not in dtype_map:
             raise exc.UnsupportedDtype(self.name, dtype)
         return dtype_map[dtype]
-    
+
     def acc_type(self, dtype: torch.dtype) -> str:
         """Accumulator type for reductions (may differ from dtype)."""
         # Common pattern: upcast fp16 to fp32 for numerical stability
@@ -70,28 +70,28 @@ class MyBackend(Backend):
             torch.int64: "my_i64",
         }
         return acc_map.get(dtype, self.dtype_str(dtype))
-    
+
     def index_type_str(self, index_dtype: torch.dtype) -> str:
         """Index type (offsets, counts). Override if different from dtype_str."""
         return self.dtype_str(index_dtype)
-    
+
     # ============ CODE GENERATION SETUP (Required) ============
-    
+
     @property
     def function_decorator(self) -> str:
         """Decorator applied to kernel function."""
         return "@my_backend.jit"
-    
+
     @property
     def constexpr_type(self) -> str:
         """Annotation for compile-time constants."""
         return "my_backend.constexpr"
-    
+
     @property
     def default_launcher_name(self) -> str:
         """Default name for host-side kernel launcher."""
         return "my_backend_launch"
-    
+
     @property
     def library_imports(self) -> dict[str, str]:
         """Map short names to import statements."""
@@ -99,15 +99,15 @@ class MyBackend(Backend):
             "my_backend": "import my_backend",
             "torch": "import torch",
         }
-    
+
     # ============ OPTIONAL CUSTOMIZATIONS ============
-    
+
     def customize_ast(self, hf: "HostFunction") -> None:
         """Backend-specific AST rewrites before type propagation."""
         # Example: Rewrite patterns for better code gen on this backend
         # Called after static loop unrolling, before type propagation
         pass
-    
+
     def pre_codegen(
         self,
         graphs: list["GraphInfo"],
@@ -117,60 +117,60 @@ class MyBackend(Backend):
         """Analyze/transform graphs before code generation."""
         # Called right before GenerateAST, after tiling is finalized
         pass
-    
+
     def config_value_priors(self, config_spec: "ConfigSpec") -> dict[str, "ValuePrior"]:
         """Bias autotuning search toward good configs."""
         return {}
-    
+
     def supports_config_key(self, key: str) -> bool:
         """Which tuning knobs does this backend support?"""
         supported = {"num_warps", "block_m", "block_n", "block_k"}
         return key in supported
-    
+
     # ============ EXPRESSION GENERATION ============
-    
+
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         """Generate cast expression: my_backend.cast(expr, dtype)"""
         return f"my_backend.cast({expr_str}, {dtype_str})"
-    
+
     def cdiv_expr(self, numel: str, block_size: str, *, is_device: bool) -> str:
         """Ceiling division: (numel + block_size - 1) // block_size"""
         return f"(({numel}) + ({block_size}) - 1) // ({block_size})"
-    
+
     def range_str(self, begin: str | None, end: str, step: str | None) -> str | None:
         """Custom range() syntax, or None for Python default."""
         return None
-    
+
     # ============ DEVICE OPERATIONS (Optional) ============
-    
+
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         """Get program/block ID for dimension."""
         raise exc.BackendUnsupported(self.name, "program IDs")
-    
+
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Compute grid index from offset and block size."""
         raise exc.BackendUnsupported(self.name, "grid index")
-    
+
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         """Compute loop index from offset and block size."""
         raise exc.BackendUnsupported(self.name, "loop index")
-    
+
     def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
         """Load scalar value from tensor argument."""
         raise exc.BackendUnsupported(self.name, "scalar load")
-    
+
     def thread_in_tile_mask_expr(self, block_size_var: str, *, axis: int = 0) -> str | None:
         """Optional mask restricting active threads to tile width."""
         return None
-    
+
     def max_reduction_threads(self) -> int | None:
         """Max threads for warp-level reduction, or None if unlimited."""
         return None
-    
+
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:
         """Names reserved by launcher (can't be used as kernel args)."""
@@ -227,20 +227,20 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)       # List of indices
     value = state.ast_arg(2)             # Value to store
     extra_mask = state.ast_args[3]       # Optional mask
-    
+
     if not isinstance(tensor, torch.Tensor):
         raise ValueError("Only tensor stores supported")
-    
+
     # Get indexing strategy (different per backend)
     indexing_idx = state.device_function.allocate_store_index()
     strategy = state.device_function.get_indexing_strategy(indexing_idx)
-    
+
     # Use strategy to generate store code
     return strategy.codegen_store(
-        state, 
-        tensor, 
-        list(subscript), 
-        value, 
+        state,
+        tensor,
+        list(subscript),
+        value,
         extra_mask,
         cache_modifier=None
     )
@@ -252,13 +252,13 @@ def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)          # The tensor being loaded from
     subscript = state.proxy_arg(1)       # List of indices
     extra_mask = state.ast_args[2]       # Optional mask
-    
+
     if not isinstance(tensor, torch.Tensor):
         raise ValueError("Only tensor loads supported")
-    
+
     indexing_idx = state.device_function.allocate_load_index()
     strategy = state.device_function.get_indexing_strategy(indexing_idx)
-    
+
     return strategy.codegen_load(
         state,
         tensor,
@@ -294,7 +294,7 @@ def _(state: CodegenState) -> ast.AST:
     input_tensor = state.proxy_arg(0)
     reduction_type = state.const_arg(1)  # "sum", "max", "min", etc.
     output_dtype = state.proxy_arg(2)
-    
+
     # Example: generate a sum reduction
     if reduction_type == "sum":
         # MyBackend-specific sum reduction syntax
@@ -303,7 +303,7 @@ def _(state: CodegenState) -> ast.AST:
             input=state.ast_arg(0),
             dtype=expr_from_string(state.backend.dtype_str(output_dtype))
         )
-    
+
     raise NotImplementedError(f"Reduction {reduction_type} not implemented")
 ```
 
@@ -333,18 +333,18 @@ class CodegenState:
     proxy_arg(i: int)          # Get i-th arg as proxy (for analysis)
     ast_arg(i: int)            # Get i-th arg as AST expression (for codegen)
     const_arg(i: int)          # Get i-th arg as constant value
-    
+
     # Configuration
     config: Config             # Current tuning config
     backend: Backend           # Active backend
-    
+
     # Device context
     device_function: DeviceFunction  # Kernel state/temporary allocation
-    
+
     # Code generation
     add_statement(stmt: ast.AST)  # Add statement to output
     tmpvar(prefix="v")         # Generate temporary variable name
-    
+
     # Tracking
     fx_node: torch.fx.Node     # Source FX node
 ```
@@ -354,7 +354,7 @@ class CodegenState:
 ### 1. Backend-Specific Tile Layout
 Each backend handles tiling differently:
 - **Triton**: Block-based grid with program_id
-- **Pallas**: Sequential loops with scalar tile sizes  
+- **Pallas**: Sequential loops with scalar tile sizes
 - **CuTe**: Thread-based with layout expressions
 
 Your backend's `TileStrategy` handles this.

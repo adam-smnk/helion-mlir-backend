@@ -4,10 +4,13 @@ Tests that the generated MLIR is valid and suitable for downstream
 compilation pipelines (e.g., Triton, LLVM).
 """
 
-import pytest
-import torch
+from __future__ import annotations
+
 import helion
 import helion.language as hl
+import pytest
+import torch
+
 from helion_mlir_backend import generate_mlir
 
 
@@ -16,6 +19,7 @@ class TestDownstreamIntegration:
 
     def test_matmul_mlir_structure(self):
         """Test that matmul MLIR has expected structure for Triton."""
+
         @helion.kernel(static_shapes=True)
         def matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.shape
@@ -45,6 +49,7 @@ class TestDownstreamIntegration:
 
     def test_mlir_module_validity(self):
         """Test that generated MLIR is a valid module."""
+
         @helion.kernel(static_shapes=True)
         def simple_kernel(x: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
@@ -66,6 +71,7 @@ class TestDownstreamIntegration:
 
     def test_elementwise_ops_linalg_generic(self):
         """Test that elementwise ops use linalg.generic."""
+
         @helion.kernel(static_shapes=True)
         def elementwise_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
@@ -82,11 +88,13 @@ class TestDownstreamIntegration:
         ir_str = str(module)
 
         # Elementwise operations should use linalg.generic
-        assert "linalg.generic" in ir_str or "arith." in ir_str, \
+        assert "linalg.generic" in ir_str or "arith." in ir_str, (
             "Should use linalg.generic or arith ops for elementwise"
+        )
 
     def test_different_dtypes_in_module(self):
         """Test that multiple dtypes are properly handled."""
+
         @helion.kernel(static_shapes=True)
         def mixed_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
@@ -97,7 +105,7 @@ class TestDownstreamIntegration:
             return out
 
         device = torch.device("cpu")
-        
+
         # Test with float64
         x = torch.randn(32, 64, dtype=torch.float64, device=device)
         module = generate_mlir(mixed_dtype_kernel, [x])
@@ -106,6 +114,7 @@ class TestDownstreamIntegration:
 
     def test_non_square_matrices(self):
         """Test MLIR generation with non-square matrix dimensions."""
+
         @helion.kernel(static_shapes=True)
         def tall_matrix(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.shape  # Tall matrix
@@ -120,7 +129,7 @@ class TestDownstreamIntegration:
 
         device = torch.device("cpu")
         x = torch.randn(256, 128, dtype=torch.float32, device=device)  # Tall
-        y = torch.randn(128, 64, dtype=torch.float32, device=device)   # Wide
+        y = torch.randn(128, 64, dtype=torch.float32, device=device)  # Wide
 
         module = generate_mlir(tall_matrix, [x, y])
         ir_str = str(module)
@@ -131,6 +140,7 @@ class TestDownstreamIntegration:
 
     def test_fused_operations(self):
         """Test MLIR generation for fused operations."""
+
         @helion.kernel(static_shapes=True)
         def fused_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.shape
@@ -158,6 +168,7 @@ class TestDownstreamIntegration:
 
     def test_multiple_tiles(self):
         """Test MLIR with multiple tiling levels."""
+
         @helion.kernel(static_shapes=True)
         def multi_tile_kernel(x: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
@@ -180,6 +191,7 @@ class TestDownstreamIntegration:
 
     def test_mlir_ir_printable(self):
         """Test that MLIR can be printed without errors."""
+
         @helion.kernel(static_shapes=True)
         def printable_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
@@ -201,6 +213,7 @@ class TestDownstreamIntegration:
 
     def test_module_has_proper_function_signature(self):
         """Test that generated module has proper function signature."""
+
         @helion.kernel(static_shapes=True)
         def signature_test(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
@@ -220,7 +233,9 @@ class TestDownstreamIntegration:
         assert "func.func" in ir_str
         assert "tensor<" in ir_str, "Should have tensor types"
         assert "x32" in ir_str or "f32" in ir_str, "Should have float type"
-        assert "func.return" in ir_str or "return" in ir_str, "Should have return statement"
+        assert "func.return" in ir_str or "return" in ir_str, (
+            "Should have return statement"
+        )
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ while still generating valid MLIR.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 
@@ -21,7 +22,7 @@ log = logging.getLogger(__name__)
 class SymbolInfo:
     """Information about a symbolic dimension."""
 
-    def __init__(self, name: str, symbol: Any, block_id: Optional[int] = None):
+    def __init__(self, name: str, symbol: Any, block_id: int | None = None):
         """Initialize symbol info.
 
         Parameters
@@ -36,9 +37,9 @@ class SymbolInfo:
         self.name = name
         self.symbol = symbol
         self.block_id = block_id
-        self.concrete_value: Optional[int] = None
+        self.concrete_value: int | None = None
 
-    def try_resolve(self) -> Optional[int]:
+    def try_resolve(self) -> int | None:
         """Try to resolve the symbol to a concrete value.
 
         Returns
@@ -78,14 +79,14 @@ class SymbolTable:
 
     def __init__(self):
         """Initialize symbol table."""
-        self._symbols: Dict[str, SymbolInfo] = {}
-        self._symbol_to_concrete: Dict[str, int] = {}
+        self._symbols: dict[str, SymbolInfo] = {}
+        self._symbol_to_concrete: dict[str, int] = {}
 
     def register_symbol(
         self,
         name: str,
         symbol: Any,
-        block_id: Optional[int] = None,
+        block_id: int | None = None,
     ) -> SymbolInfo:
         """Register a new symbol.
 
@@ -117,7 +118,7 @@ class SymbolTable:
 
         return info
 
-    def get_symbol(self, name: str) -> Optional[SymbolInfo]:
+    def get_symbol(self, name: str) -> SymbolInfo | None:
         """Get symbol info by name."""
         return self._symbols.get(name)
 
@@ -148,7 +149,7 @@ class SymbolTable:
 
         return default
 
-    def all_symbols(self) -> List[SymbolInfo]:
+    def all_symbols(self) -> list[SymbolInfo]:
         """Get all registered symbols."""
         return list(self._symbols.values())
 
@@ -160,7 +161,7 @@ def extract_symbol_from_shape(
     shape_node: Any,
     index: int,
     symbol_table: SymbolTable,
-) -> Tuple[Optional[str], Optional[int]]:
+) -> tuple[str | None, int | None]:
     """Extract symbol name and try to resolve shape dimension.
 
     Parameters
@@ -200,8 +201,8 @@ def extract_symbol_from_shape(
 
 
 def create_dynamic_shape_indexing(
-    shape: List[int],
-    symbol_names: Dict[int, Optional[str]],
+    shape: list[int],
+    symbol_names: dict[int, str | None],
 ) -> ir.Attribute:
     """Create MLIR indexing for a shape with dynamic dimensions.
 
@@ -224,7 +225,7 @@ def create_dynamic_shape_indexing(
 
 
 def generate_shape_dependent_code(
-    shape_dims: List[Tuple[Optional[str], int]],
+    shape_dims: list[tuple[str | None, int]],
     callback,
 ) -> Any:
     """Generate code that handles both static and dynamic shape scenarios.
@@ -248,7 +249,9 @@ def generate_shape_dependent_code(
     result = callback(concrete_shape)
 
     # Log which dimensions were dynamic
-    dynamic_dims = [i for i, (sym_name, _) in enumerate(shape_dims) if sym_name is not None]
+    dynamic_dims = [
+        i for i, (sym_name, _) in enumerate(shape_dims) if sym_name is not None
+    ]
     if dynamic_dims:
         log.debug("Generated code with dynamic dimensions: %s", dynamic_dims)
 
@@ -256,8 +259,8 @@ def generate_shape_dependent_code(
 
 
 def validate_shape_compatibility(
-    shape1: List[Tuple[Optional[str], int]],
-    shape2: List[Tuple[Optional[str], int]],
+    shape1: list[tuple[str | None, int]],
+    shape2: list[tuple[str | None, int]],
 ) -> bool:
     """Check if two shapes are compatible (same symbolic/concrete structure).
 
@@ -290,7 +293,7 @@ def validate_shape_compatibility(
 
 
 def create_symbolic_shape_annotation(
-    shape_dims: List[Tuple[Optional[str], int]],
+    shape_dims: list[tuple[str | None, int]],
 ) -> str:
     """Create a human-readable annotation for a shape.
 

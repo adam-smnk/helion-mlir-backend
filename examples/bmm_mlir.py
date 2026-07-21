@@ -7,10 +7,12 @@ Demonstrates a tiled batch matrix multiplication kernel:
 This example is CPU-focused and uses float32 inputs for portability.
 """
 
-import torch
+from __future__ import annotations
+
 import helion
 import helion.language as hl
 from helion.mlir import generate_mlir
+import torch
 
 
 @helion.kernel(static_shapes=True)
@@ -26,7 +28,9 @@ def bmm_kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     for tile_b, tile_m, tile_n in hl.tile([batch, m, n]):
         acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
-            acc = torch.baddbmm(acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n])
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
         out[tile_b, tile_m, tile_n] = acc
 
     return out

@@ -7,7 +7,8 @@ and debugging support.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
+from typing import Any
 
 if TYPE_CHECKING:
     import torch.fx
@@ -18,8 +19,6 @@ log = logging.getLogger(__name__)
 class MLIRBackendError(Exception):
     """Base exception for all MLIR backend errors."""
 
-    pass
-
 
 class UnsupportedOperationError(MLIRBackendError):
     """Raised when an unsupported operation is encountered."""
@@ -27,8 +26,8 @@ class UnsupportedOperationError(MLIRBackendError):
     def __init__(
         self,
         op_name: str,
-        reason: Optional[str] = None,
-        alternatives: Optional[list[str]] = None,
+        reason: str | None = None,
+        alternatives: list[str] | None = None,
     ):
         msg = f"Unsupported operation: {op_name}"
         if reason:
@@ -48,8 +47,8 @@ class TypeConversionError(MLIRBackendError):
     def __init__(
         self,
         torch_type: Any,
-        reason: Optional[str] = None,
-        supported_types: Optional[list[str]] = None,
+        reason: str | None = None,
+        supported_types: list[str] | None = None,
     ):
         msg = f"Cannot convert type: {torch_type}"
         if reason:
@@ -68,8 +67,8 @@ class ShapeError(MLIRBackendError):
     def __init__(
         self,
         shape: Any,
-        reason: Optional[str] = None,
-        constraint: Optional[str] = None,
+        reason: str | None = None,
+        constraint: str | None = None,
     ):
         msg = f"Invalid shape: {shape}"
         if reason:
@@ -85,7 +84,7 @@ class ShapeError(MLIRBackendError):
 class DynamicShapeError(ShapeError):
     """Raised when dynamic shapes are encountered but not supported."""
 
-    def __init__(self, shape: Any, symbol_name: Optional[str] = None):
+    def __init__(self, shape: Any, symbol_name: str | None = None):
         reason = f"Dynamic shape {symbol_name or 'with SymInt'} not yet supported"
         constraint = "Use static_shapes=True in @helion.kernel decorator"
         super().__init__(shape, reason, constraint)
@@ -95,7 +94,7 @@ class DynamicShapeError(ShapeError):
 class ValueNotFoundError(MLIRBackendError):
     """Raised when a value lookup fails."""
 
-    def __init__(self, node: Any, context: Optional[str] = None):
+    def __init__(self, node: Any, context: str | None = None):
         msg = f"Value not found for node: {node}"
         if context:
             msg += f"\nContext: {context}"
@@ -110,8 +109,8 @@ class NodeLoweringError(MLIRBackendError):
     def __init__(
         self,
         node: torch.fx.Node,
-        reason: Optional[str] = None,
-        recovery_hint: Optional[str] = None,
+        reason: str | None = None,
+        recovery_hint: str | None = None,
     ):
         msg = f"Failed to lower FX node: {node.op}[{node.name}]"
         if hasattr(node, "target"):
@@ -132,8 +131,8 @@ class ModuleBuilderError(MLIRBackendError):
     def __init__(
         self,
         stage: str,
-        reason: Optional[str] = None,
-        recovery_hint: Optional[str] = None,
+        reason: str | None = None,
+        recovery_hint: str | None = None,
     ):
         msg = f"Module building failed at stage: {stage}"
         if reason:
@@ -154,7 +153,7 @@ class OperandError(MLIRBackendError):
         operation: str,
         actual: Any,
         expected: Any,
-        operand_name: Optional[str] = None,
+        operand_name: str | None = None,
     ):
         msg = f"Operand mismatch for {operation}"
         if operand_name:
@@ -195,9 +194,15 @@ def validate_tensor_shape(shape: Any, allow_dynamic: bool = False) -> None:
         # Check for valid integers
         elif isinstance(dim, int):
             if dim <= 0:
-                raise ShapeError(shape, f"Dimension {i} is non-positive", "All dimensions must be > 0")
+                raise ShapeError(
+                    shape,
+                    f"Dimension {i} is non-positive",
+                    "All dimensions must be > 0",
+                )
         else:
-            raise ShapeError(shape, f"Dimension {i} is not an integer", f"Got {type(dim)}")
+            raise ShapeError(
+                shape, f"Dimension {i} is not an integer", f"Got {type(dim)}"
+            )
 
 
 def safe_int_conversion(val: Any, param_name: str = "value") -> int:
@@ -278,8 +283,8 @@ def diagnose_unsupported_op(op_name: str) -> str:
 
 def log_diagnostic_info(
     stage: str,
-    node: Optional[torch.fx.Node] = None,
-    context: Optional[dict[str, Any]] = None,
+    node: torch.fx.Node | None = None,
+    context: dict[str, Any] | None = None,
 ) -> None:
     """Log diagnostic information for debugging.
 

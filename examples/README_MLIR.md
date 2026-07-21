@@ -210,11 +210,11 @@ All tensor operations **must** be inside `hl.tile()` loops:
 def kernel(x: torch.Tensor) -> torch.Tensor:
     m, n = x.shape
     out = torch.zeros((m, n), device=x.device)
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         # Operations here are tiled
         out[tile_m, tile_n] = operation(x[tile_m, tile_n])
-    
+
     return out
 ```
 

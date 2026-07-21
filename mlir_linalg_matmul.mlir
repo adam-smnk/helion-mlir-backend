@@ -4,10 +4,10 @@ func.func @matmul(%arg0: tensor<128x1024xf32>, %arg1: tensor<1024x512xf32>) -> t
     %extracted_slice = tensor.extract_slice %arg0[%tile_m_idx, 0] [32, 1024] [1, 1] : tensor<128x1024xf32> to tensor<32x1024xf32>
     %extracted_slice_1 = tensor.extract_slice %arg1[0, %tile_n_idx] [1024, 32] [1, 1] : tensor<1024x512xf32> to tensor<1024x32xf32>
     %acc_tile = tensor.extract_slice %arg3[%tile_m_idx, %tile_n_idx] [32, 32] [1, 1] : tensor<128x512xf32> to tensor<32x32xf32>
-    
+
     %zero = arith.constant 0.0 : f32
     %acc = linalg.fill ins(%zero : f32) outs(%acc_tile : tensor<32x32xf32>) -> tensor<32x32xf32>
-    
+
     %c0 = arith.constant 0 : index
     %c1024 = arith.constant 1024 : index
     %c64 = arith.constant 64 : index

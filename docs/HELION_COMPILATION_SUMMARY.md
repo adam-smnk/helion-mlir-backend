@@ -235,27 +235,27 @@ class MyBackend(Backend):
     @property
     def name(self) -> str:
         return "mybackend"
-    
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         # Map torch.float32 → "my_f32", etc.
         return {...}[dtype]
-    
+
     def acc_type(self, dtype: torch.dtype) -> str:
         # Accumulator for reductions (may upcast fp16→fp32)
         return {...}[dtype]
-    
+
     @property
     def function_decorator(self) -> str:
         return "@my_backend.jit"
-    
+
     @property
     def constexpr_type(self) -> str:
         return "my_constexpr"
-    
+
     @property
     def default_launcher_name(self) -> str:
         return "my_kernel_launch"
-    
+
     @property
     def library_imports(self) -> dict[str, str]:
         return {"my_backend": "import my_backend as my_backend"}
@@ -269,7 +269,7 @@ def _(state: CodegenState) -> ast.AST:
     # Generate backend-specific store statement
     ...
 
-# helion/_compiler/mybackend/reduce_ops.py  
+# helion/_compiler/mybackend/reduce_ops.py
 @_decorators.codegen(reduce, "mybackend")
 def _(state: CodegenState) -> ast.AST:
     # Generate backend-specific reduction

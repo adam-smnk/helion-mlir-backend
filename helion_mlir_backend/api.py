@@ -32,8 +32,7 @@ def generate_mlir(
     fn = getattr(kernel, "_fn", None) or getattr(kernel, "fn", None)
     if fn is None:
         raise ValueError(
-            "Expected a @helion.kernel-decorated function; "
-            f"got {type(kernel).__name__}"
+            f"Expected a @helion.kernel-decorated function; got {type(kernel).__name__}"
         )
 
     settings: Settings = getattr(kernel, "_settings", None) or getattr(
@@ -69,6 +68,4 @@ def generate_mlir(
             config = env.config_spec.default_config()
 
         backend = get_backend_class("mlir")()
-        module = backend.generate_mlir(host_function, config, env)
-
-    return module
+        return backend.generate_mlir(host_function, config, env)
