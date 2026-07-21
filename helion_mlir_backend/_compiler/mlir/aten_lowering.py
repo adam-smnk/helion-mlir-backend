@@ -150,7 +150,11 @@ def _batch_import_and_lower(
     aten_nodes: list[torch.fx.Node],
     block_id_to_size: dict[int, int],
 ) -> tuple[str, dict[int, str]]:
-    """Build and lower all ATen subgraphs in one torch-mlir pipeline pass."""
+    """Build and lower all ATen subgraphs in one torch-mlir pipeline pass.
+
+    Semantically-identical ATen nodes are deduplicated *before* import/lowering
+    so we only materialize one helper function per canonical ATen signature.
+    """
     from torch_mlir.compiler_utils import OutputType
     from torch_mlir.compiler_utils import lower_mlir_module
     from torch_mlir.compiler_utils import run_pipeline_with_repro_report
@@ -163,13 +167,23 @@ def _batch_import_and_lower(
     imp = FxImporter(context=tm_ctx)
 
     name_map: dict[int, str] = {}
+    fp_to_func_name: dict[tuple[object, ...], str] = {}
+    next_func_idx = 0
 
-    for idx, node in enumerate(aten_nodes):
-        func_name = f"_aten_{idx}"
+    for node in aten_nodes:
+        fingerprint = _aten_node_fingerprint(node, block_id_to_size)
+        if fingerprint is not None and fingerprint in fp_to_func_name:
+            name_map[id(node)] = fp_to_func_name[fingerprint]
+            continue
+
+        func_name = f"_aten_{next_func_idx}"
+        next_func_idx += 1
         try:
             graph, _ = _build_aten_subgraph(node, block_id_to_size)
             imp.import_stateless_graph(graph, func_name=func_name)
             name_map[id(node)] = func_name
+            if fingerprint is not None:
+                fp_to_func_name[fingerprint] = func_name
         except Exception as exc:
             arg_info = []
             for a in node.args:
@@ -296,6 +310,136 @@ def _build_aten_subgraph(
 
     g.output((aten_node,))
     return g, tensor_positions
+
+
+def _aten_node_fingerprint(
+    node: torch.fx.Node,
+    block_id_to_size: dict[int, int],
+) -> tuple[object, ...] | None:
+    """Return a canonical key for ATen-node semantic deduplication.
+
+    Returns ``None`` when we cannot safely canonicalize all inputs; callers
+    should then skip deduplication for that node.
+    """
+    target_name = str(node.target)
+    norm_args = _normalize_aten_args(node)
+
+    arg_keys: list[object] = []
+    for arg in norm_args:
+        key = _fingerprint_arg(arg, block_id_to_size)
+        if key is None:
+            return None
+        arg_keys.append(key)
+
+    kwarg_keys: list[tuple[str, object]] = []
+    for key, val in sorted(node.kwargs.items()):
+        val_key = _fingerprint_arg(val, block_id_to_size)
+        if val_key is None:
+            return None
+        kwarg_keys.append((key, val_key))
+
+    result_sig = _tensor_signature_from_meta(node, block_id_to_size)
+
+    return (
+        "target",
+        target_name,
+        "args",
+        tuple(arg_keys),
+        "kwargs",
+        tuple(kwarg_keys),
+        "result",
+        result_sig,
+    )
+
+
+def _fingerprint_arg(
+    arg: object,
+    block_id_to_size: dict[int, int],
+) -> object | None:
+    """Canonicalize one ATen argument for deduplication."""
+    if isinstance(arg, torch.fx.Node):
+        if _node_returns_tensor(arg):
+            sig = _tensor_signature_from_meta(arg, block_id_to_size)
+            if sig is None:
+                return None
+            return ("tensor", sig)
+
+        literal = _resolve_fx_literal(arg)
+        if literal is _MISSING_LITERAL:
+            return None
+        lit_key = _fingerprint_literal(literal)
+        if lit_key is None:
+            return None
+        return ("literal", lit_key)
+
+    lit_key = _fingerprint_literal(arg)
+    if lit_key is None:
+        return None
+    return ("literal", lit_key)
+
+
+def _tensor_signature_from_meta(
+    node: torch.fx.Node,
+    block_id_to_size: dict[int, int],
+) -> tuple[tuple[int, ...], str] | None:
+    """Return a stable ``(shape, dtype)`` signature for a tensor FX node."""
+    fake = _fake_tensor_from_node_meta(node, block_id_to_size)
+    if fake is not None:
+        return (tuple(int(d) for d in fake.shape), str(fake.dtype))
+
+    val = node.meta.get("val")
+    if isinstance(val, torch.Tensor):
+        shape = tuple(_resolve_shape(val, block_id_to_size))
+        return (shape, str(val.dtype))
+
+    tmeta = node.meta.get("tensor_meta")
+    if tmeta is None:
+        return None
+
+    dtype = getattr(tmeta, "dtype", None)
+    shape = getattr(tmeta, "shape", None)
+    if dtype is None or shape is None:
+        return None
+
+    return (tuple(_resolve_dims(shape, block_id_to_size)), str(dtype))
+
+
+def _fingerprint_literal(value: object) -> object | None:
+    """Return a stable literal fingerprint or ``None`` if unsupported."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    if isinstance(value, torch.dtype):
+        return ("dtype", str(value))
+    if isinstance(value, torch.device):
+        return ("device", str(value))
+    if isinstance(value, slice):
+        start = _fingerprint_literal(value.start)
+        stop = _fingerprint_literal(value.stop)
+        step = _fingerprint_literal(value.step)
+        if start is None or stop is None or step is None:
+            return None
+        return ("slice", start, stop, step)
+
+    if isinstance(value, tuple):
+        parts: list[object] = []
+        for part in value:
+            fp = _fingerprint_literal(part)
+            if fp is None:
+                return None
+            parts.append(fp)
+        return ("tuple", tuple(parts))
+
+    if isinstance(value, list):
+        parts = []
+        for part in value:
+            fp = _fingerprint_literal(part)
+            if fp is None:
+                return None
+            parts.append(fp)
+        return ("list", tuple(parts))
+
+    return None
 
 
 def _resolve_shape(t: torch.Tensor, block_id_to_size: dict[int, int]) -> list[int]:
