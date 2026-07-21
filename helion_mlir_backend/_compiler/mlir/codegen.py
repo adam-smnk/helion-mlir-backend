@@ -72,7 +72,7 @@ Prerequisites before Phase 2 can land:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -80,21 +80,16 @@ from .errors import (
     DynamicShapeError,
     ModuleBuilderError,
     NodeLoweringError,
-    OperandError,
     ShapeError,
     UnsupportedOperationError,
     ValueNotFoundError,
-    diagnose_unsupported_op,
-    log_diagnostic_info,
     safe_int_conversion,
-    validate_tensor_shape,
 )
 from .dynamic_shapes import SymbolTable
 from .type_utils import get_zero_attr, torch_dtype_to_mlir, torch_tensor_to_mlir_type
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
-    from helion._compiler.device_ir import ForLoopGraphInfo, GraphInfo
     from helion._compiler.host_function import HostFunction
     import mlir.ir as ir
     import torch.fx
@@ -265,8 +260,6 @@ class MLIRModuleBuilder:
         ``_host_tensor`` nodes in the device IR that reference tensors NOT
         passed as inputs.
         """
-        from helion._compiler.device_ir import RootGraphInfo
-        from helion.language import _tracing_ops
 
         # Collect tensor_param names that are genuine INPUTS (referenced in
         # the original kernel signature ``hf.args``).
@@ -317,7 +310,6 @@ class MLIRModuleBuilder:
     def _build_kernel_body(self, out_tensor: torch.Tensor) -> ir.Value:
         """Build the kernel body and return the final result value."""
         import mlir.ir as ir
-        from mlir.dialects import arith as arith_d
         from mlir.dialects import scf as scf_d
         from mlir.dialects import tensor as tensor_d
 
@@ -334,7 +326,6 @@ class MLIRModuleBuilder:
         steps = [self._block_id_to_size[bid] for bid in grid_block_ids]
 
         # Create the output tensor (shared_outs for forall).
-        out_type = torch_tensor_to_mlir_type(out_tensor)
         out_empty = tensor_d.EmptyOp(out_shape, torch_dtype_to_mlir(out_tensor.dtype)).result
 
         forall = scf_d.ForallOp(lbs, ubs, steps, shared_outs=[out_empty])
@@ -351,7 +342,7 @@ class MLIRModuleBuilder:
             shared_out_arg = list(forall.inner_iter_args)[0]
 
             # Process all root graphs.
-            result_value = self._process_root_graphs(shared_out_arg)
+            self._process_root_graphs(shared_out_arg)
 
             # in_parallel terminator with parallel_insert_slice ops.
             # Hoist all arith.constant ops BEFORE the in_parallel region —
@@ -850,7 +841,6 @@ class MLIRModuleBuilder:
         ShapeError
             If shape is invalid
         """
-        import mlir.ir as ir
         from mlir.dialects import arith as arith_d
         from mlir.dialects import linalg as linalg_d
         from mlir.dialects import tensor as tensor_d
@@ -879,7 +869,6 @@ class MLIRModuleBuilder:
     def _lower_for_loop(self, node: torch.fx.Node) -> ir.Value:
         """``_for_loop(body_id, block_ids, upper_bounds, iter_args)`` → ``scf.for``."""
         import mlir.ir as ir
-        from mlir.dialects import arith as arith_d
         from mlir.dialects import scf as scf_d
 
         body_graph_id: int = node.args[0]
@@ -1023,13 +1012,10 @@ class MLIRModuleBuilder:
     def _lower_store(self, node: torch.fx.Node) -> None:
         """``store(tensor, index_list, value)`` → record for forall.in_parallel."""
         import mlir.ir as ir
-        from mlir.dialects import arith as arith_d
 
-        tensor_node = node.args[0]
         index_nodes = node.args[1]
         value_node = node.args[2]
 
-        tensor_val = self._get_value(tensor_node)
         value = self._get_value(value_node)
         assert value is not None, f"No value for store value node {value_node}"
 

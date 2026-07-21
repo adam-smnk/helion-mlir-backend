@@ -1,4 +1,4 @@
-"""Runtime registration for external Helion MLIR backend."""
+"""Runtime backend registration helpers for external Helion MLIR backend."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def install() -> bool:
         from helion._compiler.backend_registry import register_compiler_backend
         from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
     except Exception as exc:
-        log.debug("External MLIR backend injection unavailable: %s", exc)
+        log.debug("External MLIR backend registration unavailable: %s", exc)
         return False
 
     register_compiler_backend(MLIRBackend)

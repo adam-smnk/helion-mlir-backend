@@ -1,8 +1,4 @@
-"""Public MLIR API exposed via ``helion.mlir`` shim.
-
-This mirrors the historical ``helion.mlir.generate_mlir`` entrypoint while
-keeping implementation out-of-tree.
-"""
+"""Public MLIR API for the external Helion MLIR backend package."""
 
 from __future__ import annotations
 
