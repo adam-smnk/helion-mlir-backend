@@ -1,5 +1,7 @@
 """Pytest tests for MLIR backend."""
 
+import re
+
 import pytest
 import torch
 import mlir.ir as ir
@@ -487,6 +489,53 @@ class TestAdvancedOperations:
         assert "func.func" in ir_str
         assert "linalg.generic" in ir_str
 
+    def test_call_method_alias_ops_supported(self):
+        """contiguous and same-shape view should lower as pure aliases."""
+        @helion.kernel(static_shapes=True)
+        def alias_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            y = x.contiguous()
+            z = y.view(m, n)
+            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = z[tile_m, tile_n] + 1.0
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def direct_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
+            return out
+
+        device = torch.device("cpu")
+        x = torch.randn(32, 64, dtype=torch.float32, device=device)
+
+        alias_module = generate_mlir(alias_kernel, [x])
+        direct_module = generate_mlir(direct_kernel, [x])
+        alias_module.operation.verify()
+        direct_module.operation.verify()
+
+        alias_ir = str(alias_module)
+        direct_ir = str(direct_module)
+
+        assert "func.func" in alias_ir
+        assert "linalg.generic" in alias_ir
+
+        # Same-shape alias ops should not introduce reshape/collapse artifacts.
+        assert "tensor.collapse_shape" not in alias_ir
+        assert "tensor.expand_shape" not in alias_ir
+
+        # Alias and direct forms should have the same structural core.
+        for op_name in ["scf.forall", "tensor.extract_slice", "tensor.parallel_insert_slice", "linalg.generic"]:
+            assert alias_ir.count(op_name) == direct_ir.count(op_name)
+
+        # Alias ops should not create extra ATen helper functions.
+        alias_helpers = re.findall(r'sym_name\s*=\s*"_aten_\d+"', alias_ir)
+        direct_helpers = re.findall(r'sym_name\s*=\s*"_aten_\d+"', direct_ir)
+        assert len(alias_helpers) == len(direct_helpers)
+
     def test_division_operation(self):
         """Test element-wise division lowering."""
         @helion.kernel(static_shapes=True)
@@ -566,6 +615,91 @@ class TestAdvancedOperations:
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "linalg.generic" in ir_str
+
+    def test_geglu_polynomial_cast_path(self):
+        """Test GEGLU-like tanh polynomial lowering with explicit casts."""
+        @helion.kernel(static_shapes=True)
+        def geglu_like(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            assert a.shape == b.shape
+            out = torch.empty_like(a, dtype=torch.float32)
+
+            sqrt_2_over_pi = 0.7978845608028654
+            for tile in hl.tile(a.size()):
+                a_vals = a[tile].to(torch.float32)
+                b_vals = b[tile].to(torch.float32)
+
+                a_cubed = a_vals * a_vals * a_vals
+                tanh_arg = sqrt_2_over_pi * (a_vals + 0.044715 * a_cubed)
+                tanh_result = torch.tanh(tanh_arg)
+                gelu_a = 0.5 * a_vals * (1.0 + tanh_result)
+
+                out[tile] = gelu_a * b_vals
+
+            return out
+
+        device = torch.device("cpu")
+        a = torch.randn(8, 16, dtype=torch.float16, device=device)
+        b = torch.randn(8, 16, dtype=torch.float16, device=device)
+
+        module = generate_mlir(geglu_like, [a, b])
+        module.operation.verify()
+        ir_str = str(module)
+        assert "func.func" in ir_str
+        assert "linalg.generic" in ir_str
+
+    def test_dynamic_dtype_cast_from_tensor_attr(self):
+        """Cast target via tensor.dtype should lower for this traced pattern."""
+        @helion.kernel(static_shapes=True)
+        def cast_from_tensor_dtype(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            assert a.shape == b.shape
+            out = torch.empty_like(a, dtype=torch.float32)
+
+            for tile in hl.tile(a.size()):
+                a_vals = a[tile].to(torch.float32)
+                b_vals = b[tile]
+                out[tile] = a_vals.to(b_vals.dtype) * b_vals.to(torch.float32)
+
+            return out
+
+        device = torch.device("cpu")
+        a = torch.randn(8, 16, dtype=torch.float16, device=device)
+        b = torch.randn(8, 16, dtype=torch.float16, device=device)
+
+        module = generate_mlir(cast_from_tensor_dtype, [a, b])
+        module.operation.verify()
+        ir_str = str(module)
+        assert "func.func" in ir_str
+        assert "linalg.generic" in ir_str
+
+    def test_flatten_view_alias_in_1d_geglu_style(self):
+        """Document current verify-time limitation for 1-D flatten/view GEGLU style."""
+        @helion.kernel(static_shapes=True)
+        def geglu_flatten_style(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            assert a.shape == b.shape
+            out = torch.empty_like(a, dtype=torch.float32)
+
+            a_flat = a.view(-1)
+            b_flat = b.view(-1)
+            out_flat = out.view(-1)
+
+            c = 0.7978845608028654
+            for tile_idx in hl.tile(a.numel()):
+                a_vals = a_flat[tile_idx].to(torch.float32)
+                b_vals = b_flat[tile_idx].to(torch.float32)
+                a_cubed = a_vals * a_vals * a_vals
+                tanh_arg = c * (a_vals + 0.044715 * a_cubed)
+                gelu_a = 0.5 * a_vals * (1.0 + torch.tanh(tanh_arg))
+                out_flat[tile_idx] = gelu_a * b_vals
+
+            return out
+
+        device = torch.device("cpu")
+        a = torch.randn(8, 16, dtype=torch.float16, device=device)
+        b = torch.randn(8, 16, dtype=torch.float16, device=device)
+
+        module = generate_mlir(geglu_flatten_style, [a, b])
+        with pytest.raises(ir.MLIRError):
+            module.operation.verify()
 
 
 class TestEinsumDecomposition:
@@ -648,6 +782,39 @@ class TestEinsumDecomposition:
         assert "func.func" in ir_str
         assert "scf.forall" in ir_str
         assert "linalg" in ir_str
+
+
+class TestAtenHelperVisibility:
+    """Tests for visibility of generated ATen helper functions."""
+
+    def test_generated_aten_helpers_are_private(self):
+        """Generated _aten_* helper funcs should always have private visibility."""
+        @helion.kernel(static_shapes=True)
+        def relu_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = torch.relu(x[tile_m, tile_n])
+            return out
+
+        x = torch.randn(32, 64, dtype=torch.float32)
+        module = generate_mlir(relu_kernel, [x])
+        module.operation.verify()
+
+        aten_helper_count = 0
+        for op in module.body.operations:
+            try:
+                sym_name = ir.StringAttr(op.attributes["sym_name"]).value
+            except Exception:
+                continue
+
+            if sym_name.startswith("_aten_"):
+                aten_helper_count += 1
+                assert "sym_visibility" in op.attributes
+                visibility = ir.StringAttr(op.attributes["sym_visibility"]).value
+                assert visibility == "private"
+
+        assert aten_helper_count > 0
 
 
 if __name__ =="__main__":

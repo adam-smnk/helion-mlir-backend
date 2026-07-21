@@ -76,6 +76,65 @@ python examples/fused_ops_mlir.py
 
 ---
 
+### 4. bmm_mlir.py
+**Batch Matrix Multiplication**
+
+Demonstrates tiled dense batch matrix multiplication:
+- `out[B, M, N] = A[B, M, K] @ B[B, K, N]`
+- Uses `torch.baddbmm` in tiled loops
+- Emits batched matmul-oriented MLIR structure
+
+**Run:**
+```bash
+python examples/bmm_mlir.py
+```
+
+---
+
+### 5. broadcast_matmul_mlir.py
+**Broadcast Batch Matmul (Host-Materialized Broadcast)**
+
+Demonstrates broadcasted batch matmul semantics for:
+- `X[B, M, K] @ W[K, N] -> Out[B, M, N]`
+
+For backend compatibility, the broadcasted weight is materialized on host as
+`Wb[B, K, N]`, then lowered through a tiled `torch.baddbmm` kernel.
+
+**Run:**
+```bash
+python examples/broadcast_matmul_mlir.py
+```
+
+---
+
+### 6. geglu_mlir.py
+**GEGLU-Inspired Gated Activation**
+
+Demonstrates a gated element-wise pattern inspired by GEGLU using supported ops:
+- `out = tanh(a) * b`
+- N-D tiled loops over `a.size()`
+
+**Run:**
+```bash
+python examples/geglu_mlir.py
+```
+
+---
+
+### 7. sum_mlir.py
+**Row-Wise Sum Reduction**
+
+Demonstrates reduction over the last dimension:
+- `out[m] = sum_n x[m, n]`
+- Uses tiled row slices and `sum(-1)` reduction
+
+**Run:**
+```bash
+python examples/sum_mlir.py
+```
+
+---
+
 ## Running the Examples
 
 ### Prerequisites
@@ -89,6 +148,10 @@ cd /home/asiemien/helion-mlir
 python examples/matmul_mlir.py
 python examples/elementwise_mlir.py
 python examples/fused_ops_mlir.py
+python examples/bmm_mlir.py
+python examples/broadcast_matmul_mlir.py
+python examples/geglu_mlir.py
+python examples/sum_mlir.py
 ```
 
 ### Run Specific Example
