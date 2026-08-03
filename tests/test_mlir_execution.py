@@ -157,6 +157,65 @@ class TestExecuteMlir:
         assert torch.isfinite(c).all()
         assert _allclose(c, ref)
 
+    def test_concat2d_dim1_simple_generate_mlir_regression(self):
+        """Regression: concat2d_dim1_simple pattern lowers and emits kernel symbol."""
+
+        @helion.kernel(static_shapes=True)
+        def concat2d_dim1_simple_kernel(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            assert x.size(0) == y.size(0)
+            out = torch.empty(
+                [x.size(0), x.size(1) + y.size(1)],
+                dtype=x.dtype,
+                device=x.device,
+            )
+            n1 = x.size(1)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :n1] = x[tile_m, :]
+                out[tile_m, n1:] = y[tile_m, :]
+            return out
+
+        torch.manual_seed(29)
+        x = torch.randn(64, 40)
+        y = torch.randn(64, 24)
+
+        mlir_module = generate_mlir(concat2d_dim1_simple_kernel, [x, y])
+        assert "concat2d_dim1_simple_kernel" in str(mlir_module)
+        # TODO(helion-mlir): Runtime broken
+
+    def test_broadcast_matmul_generate_mlir_regression(self):
+        """Regression: broadcasted batch matmul kernel lowers and emits the kernel symbol."""
+
+        @helion.kernel(static_shapes=True)
+        def broadcast_matmul_kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            b, m, k = x.size()
+            k2, n = w.size()
+            assert k == k2
+
+            x_2d = x.reshape([b * m, k])
+            out_2d = torch.empty(
+                [b * m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, w.dtype),
+            )
+            for tile_bm, tile_n in hl.tile([b * m, n]):
+                acc = hl.zeros([tile_bm, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x_2d[tile_bm, tile_k], w[tile_k, tile_n])
+                out_2d[tile_bm, tile_n] = acc
+
+            return out_2d.view(b, m, n)
+
+        torch.manual_seed(41)
+        x = torch.randn(4, 8, 16)
+        w = torch.randn(16, 12)
+
+        mlir_module = generate_mlir(broadcast_matmul_kernel, [x, w])
+        assert "broadcast_matmul_kernel" in str(mlir_module)
+        # TODO(helion-mlir): Runtime broken
+
     def test_flat_gather_row_sum_indexing_compile(self):
         """Regression: flattened gather + reduction with standard hl.tile matches reference."""
 
