@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+import uuid
 
 import torch
 import torch.fx
@@ -81,6 +82,7 @@ def preprocess_aten_nodes(
     block_hint_to_id: dict[int, int] | None = None,
     block_symint_to_id: dict[int, int] | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
+    arg_position_overrides: dict[int, dict[int, torch.Tensor]] | None = None,
 ) -> dict[int, tuple[str, list[ir.Type]]]:
     """Lower *all* ATen nodes in a single torch-mlir pipeline pass.
 
@@ -117,6 +119,7 @@ def preprocess_aten_nodes(
         block_hint_to_id or {},
         block_symint_to_id or {},
         block_id_to_upper_bound or {},
+        arg_position_overrides or {},
     )
 
     # --- Phase 2: parse into our mlir.ir context ----------------------------
@@ -161,11 +164,16 @@ def _batch_import_and_lower(
     block_hint_to_id: dict[int, int] | None = None,
     block_symint_to_id: dict[int, int] | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
+    arg_position_overrides: dict[int, dict[int, torch.Tensor]] | None = None,
 ) -> tuple[str, dict[int, str]]:
     """Build and lower all ATen subgraphs in one torch-mlir pipeline pass.
 
-    Semantically-identical ATen nodes are deduplicated *before* import/lowering
-    so we only materialize one helper function per canonical ATen signature.
+    Each ATen node is materialized as its own helper function.
+
+    Note: We intentionally do not deduplicate helpers across nodes because
+    jagged/tiled kernels can carry subtly different shape bounds at different
+    call sites even for semantically similar ops. Sharing helpers can then
+    produce invalid func.call operand type mismatches during MLIR inlining.
     """
     from torch_mlir.compiler_utils import OutputType
     from torch_mlir.compiler_utils import lower_mlir_module
@@ -179,17 +187,11 @@ def _batch_import_and_lower(
     imp = FxImporter(context=tm_ctx)
 
     name_map: dict[int, str] = {}
-    fp_to_func_name: dict[tuple[object, ...], str] = {}
-    next_func_idx = 0
 
-    for node in aten_nodes:
-        fingerprint = _aten_node_fingerprint(node, block_id_to_size)
-        if fingerprint is not None and fingerprint in fp_to_func_name:
-            name_map[id(node)] = fp_to_func_name[fingerprint]
-            continue
-
-        func_name = f"_aten_{next_func_idx}"
-        next_func_idx += 1
+    for next_func_idx, node in enumerate(aten_nodes):
+        # Include node identity and a nonce so repeated preprocess passes can
+        # add variants without symbol collisions.
+        func_name = f"_aten_{next_func_idx}_{id(node)}_{uuid.uuid4().hex[:8]}"
         try:
             graph, _ = _build_aten_subgraph(
                 node,
@@ -197,11 +199,10 @@ def _batch_import_and_lower(
                 block_hint_to_id or {},
                 block_symint_to_id or {},
                 block_id_to_upper_bound or {},
+                (arg_position_overrides or {}).get(id(node)),
             )
             imp.import_stateless_graph(graph, func_name=func_name)
             name_map[id(node)] = func_name
-            if fingerprint is not None:
-                fp_to_func_name[fingerprint] = func_name
         except Exception as exc:
             arg_info = []
             for a in node.args:
@@ -248,6 +249,7 @@ def _build_aten_subgraph(
     block_hint_to_id: dict[int, int] | None = None,
     block_symint_to_id: dict[int, int] | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
+    arg_position_override: dict[int, torch.Tensor] | None = None,
 ) -> tuple[torch.fx.Graph, list[int]]:
     """Build a minimal ``torch.fx.Graph`` for a single ATen node.
 
@@ -264,13 +266,17 @@ def _build_aten_subgraph(
 
     for i, arg in enumerate(node_args):
         if isinstance(arg, torch.fx.Node):
-            concrete_val = _fake_tensor_from_node_meta(
-                arg,
-                block_id_to_size or {},
-                block_hint_to_id or {},
-                block_symint_to_id or {},
-                block_id_to_upper_bound or {},
-            )
+            concrete_val = None
+            if arg_position_override is not None and i in arg_position_override:
+                concrete_val = arg_position_override[i]
+            else:
+                concrete_val = _fake_tensor_from_node_meta(
+                    arg,
+                    block_id_to_size or {},
+                    block_hint_to_id or {},
+                    block_symint_to_id or {},
+                    block_id_to_upper_bound or {},
+                )
             if concrete_val is not None:
                 # Keep helper placeholders bounded by traced tensor metadata
                 # so helper signatures match boundary tiles (e.g. 8x16 vs 16x16).
@@ -812,6 +818,28 @@ def _fake_tensor_from_node_meta(
             )
             if source is not None:
                 import sympy
+
+                # Advanced indexing with a single tensor index should preserve
+                # the full rank of the index tensor (e.g. x_flat[flat_indices]).
+                if len(index_nodes) == 1 and isinstance(index_nodes[0], torch.fx.Node):
+                    idx_fake = _fake_tensor_from_node_meta(
+                        index_nodes[0],
+                        block_id_to_size,
+                        block_hint_to_id,
+                        block_symint_to_id,
+                        block_id_to_upper_bound,
+                    )
+                    if isinstance(idx_fake, torch.Tensor):
+                        return torch.zeros(
+                            _resolve_shape(
+                                idx_fake,
+                                block_id_to_size,
+                                block_hint_to_id,
+                                block_symint_to_id,
+                                block_id_to_upper_bound,
+                            ),
+                            dtype=source.dtype,
+                        )
 
                 src_shape = [int(d) for d in source.shape]
                 out_shape: list[int] = []

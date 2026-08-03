@@ -140,6 +140,8 @@ class MLIRModuleBuilder:
         self._forall_insert_slices: list[tuple] = []  # (value, offsets)
         # Active synthetic inner-loop store contexts.
         self._for_store_ctx_stack: list[dict[str, Any]] = []
+        # Stack of active scf.for block ids (innermost last).
+        self._for_block_id_stack: list[int] = []
 
         # Symbol table for tracking dynamic shapes (SymInt values)
         self._symbol_table = SymbolTable()
@@ -241,9 +243,14 @@ class MLIRModuleBuilder:
         out_name, out_tensor = self._find_output_tensor(tensor_params)
         output_types: list[ir.Type] = [torch_tensor_to_mlir_type(out_tensor)]
 
-        # Filter tensor_params to INPUTS only (exclude the output tensor which
-        # is created inside the kernel body, not passed as an argument).
-        input_params = [(n, t) for n, t in tensor_params if n != out_name]
+        # Filter tensor_params to INPUTS only (exclude the selected output tensor
+        # which is created inside the kernel body, not passed as an argument).
+        # When output selection comes from store-target or metadata fallbacks,
+        # out_name can be synthetic and not present in tensor_params.
+        if any(name == out_name for name, _ in tensor_params):
+            input_params = [(n, t) for n, t in tensor_params if n != out_name]
+        else:
+            input_params = [(n, t) for n, t in tensor_params if t is not out_tensor]
         input_types = [torch_tensor_to_mlir_type(t) for _, t in input_params]
 
         func_type = ir.FunctionType.get(input_types, output_types)
@@ -279,14 +286,117 @@ class MLIRModuleBuilder:
         passed as inputs.
         """
 
+        output_meta_tensor: torch.Tensor | None = None
+
+        # Prefer the tensor that actually appears in graph output metadata.
+        for graph_info in self.hf.device_ir.graphs:
+            output_node = next(
+                (n for n in graph_info.graph.nodes if n.op == "output"), None
+            )
+            if output_node is None or not output_node.args:
+                continue
+            out_arg = output_node.args[0]
+            if isinstance(out_arg, (list, tuple)) and out_arg:
+                out_arg = out_arg[0]
+            if not isinstance(out_arg, torch.fx.Node):
+                continue
+            out_val = out_arg.meta.get("val")
+            if not isinstance(out_val, torch.Tensor):
+                continue
+            output_meta_tensor = out_val
+            for name, tensor in tensor_params:
+                if tensor is out_val:
+                    return name, tensor
+
+        # Fallback: match by output metadata shape/dtype when identity differs.
+        # This avoids selecting aliases like flattened views as the function output.
+        if output_meta_tensor is not None:
+            same_meta = [
+                (name, tensor)
+                for name, tensor in tensor_params
+                if tuple(tensor.shape) == tuple(output_meta_tensor.shape)
+                and tensor.dtype == output_meta_tensor.dtype
+            ]
+            if len(same_meta) == 1:
+                return same_meta[0]
+
         # Collect tensor_param names that are genuine INPUTS (referenced in
         # the original kernel signature ``hf.args``).
         input_names = {arg.arg for arg in self.hf.args.args}
 
-        # Find any tensor param NOT in the input list - that's our output.
+        # Common-case preference: explicit output name used in kernels.
         for name, tensor in tensor_params:
-            if name not in input_names:
+            if name == "out" and name not in input_names:
                 return name, tensor
+
+        # Prefer tensors that are explicit store destinations before alias/
+        # metadata fallbacks. This avoids selecting flattened aliases (e.g.
+        # x_flat) as function outputs when stores target a higher-rank tensor.
+        # This is more reliable than output metadata for alias-heavy kernels
+        # where the graph output may reference a flattened/viewed tensor.
+        input_tensor_ids = {id(t) for _, t in tensor_params}
+        store_targets: list[torch.Tensor] = []
+        for g in self.hf.device_ir.graphs:
+            for node in g.graph.nodes:
+                if (
+                    node.op == "call_function"
+                    and getattr(node.target, "__name__", "") == "store"
+                    and len(node.args) >= 1
+                    and isinstance(node.args[0], torch.fx.Node)
+                ):
+                    dst = node.args[0]
+                    dst_val = dst.meta.get("val")
+                    if (
+                        isinstance(dst_val, torch.Tensor)
+                        and id(dst_val) not in input_tensor_ids
+                    ):
+                        store_targets.append(dst_val)
+
+        if store_targets:
+            unique_targets: list[torch.Tensor] = []
+            seen_ids: set[int] = set()
+            for t in store_targets:
+                if id(t) in seen_ids:
+                    continue
+                seen_ids.add(id(t))
+                unique_targets.append(t)
+
+            if len(unique_targets) == 1:
+                return "__store_target__", unique_targets[0]
+
+            if output_meta_tensor is not None:
+                matching_store_targets = [
+                    t
+                    for t in unique_targets
+                    if tuple(t.shape) == tuple(output_meta_tensor.shape)
+                    and t.dtype == output_meta_tensor.dtype
+                ]
+                if len(matching_store_targets) == 1:
+                    return "__store_target__", matching_store_targets[0]
+
+            ranked_store_targets = sorted(
+                unique_targets,
+                key=lambda t: (len(t.shape), t.numel()),
+                reverse=True,
+            )
+            if ranked_store_targets:
+                return "__store_target__", ranked_store_targets[0]
+
+        non_input_tensors = [
+            (name, tensor) for name, tensor in tensor_params if name not in input_names
+        ]
+        if len(non_input_tensors) == 1:
+            return non_input_tensors[0]
+
+        if output_meta_tensor is not None:
+            same_non_input_meta = [
+                (name, tensor)
+                for name, tensor in non_input_tensors
+                if tuple(tensor.shape) == tuple(output_meta_tensor.shape)
+                and tensor.dtype == output_meta_tensor.dtype
+            ]
+            if len(same_non_input_meta) == 1:
+                return same_non_input_meta[0]
 
         # Fallback: look through device IR for _host_tensor calls on tensors
         # not in input_names.
@@ -301,6 +411,21 @@ class MLIRModuleBuilder:
                         val = node.meta.get("val")
                         if isinstance(val, torch.Tensor):
                             return tname, val
+
+        # If multiple non-input tensors exist (e.g. flattened aliases), prefer
+        # higher-rank candidates before falling back to metadata-only output.
+        if non_input_tensors:
+            ranked = sorted(
+                non_input_tensors,
+                key=lambda kv: (len(kv[1].shape), kv[1].numel()),
+                reverse=True,
+            )
+            return ranked[0]
+
+        # Final fallback for alias-heavy kernels where output does not map to a
+        # registered tensor parameter.
+        if output_meta_tensor is not None:
+            return "__output_meta__", output_meta_tensor
 
         # Last resort: use the last tensor param.
         return tensor_params[-1]
@@ -593,6 +718,23 @@ class MLIRModuleBuilder:
                     if lowered_relu is not None:
                         return lowered_relu
 
+            if tname == "tile_index":
+                lowered_tile_index = self._lower_tile_index(node)
+                if lowered_tile_index is not None:
+                    return lowered_tile_index
+            if tname == "subscript":
+                lowered_subscript = self._lower_subscript(node)
+                if lowered_subscript is not None:
+                    return lowered_subscript
+                raise UnsupportedOperationError(
+                    tname,
+                    reason=f"Unsupported subscript form with args={node.args!r}",
+                )
+            if tname == "_mask_to":
+                lowered_mask_to = self._lower_mask_to(node)
+                if lowered_mask_to is not None:
+                    return lowered_mask_to
+
             # --- All standard ATen ops → pre-built linalg helper (func.call) ---
             from mlir.dialects import func as func_d
 
@@ -601,6 +743,14 @@ class MLIRModuleBuilder:
             from .aten_lowering import normalized_aten_args
 
             if is_aten_op(node):
+                passthrough = self._lower_aten_passthrough(node)
+                if passthrough is not None:
+                    return passthrough
+
+                reduce_max = self._lower_aten_reduce_max_1d(node)
+                if reduce_max is not None:
+                    return reduce_max
+
                 entry = self._node_to_aten_func.get(id(node))
                 if entry is None:
                     log.warning(
@@ -621,6 +771,31 @@ class MLIRModuleBuilder:
                     if isinstance(norm_args[i], torch.fx.Node)
                     and self._get_value(norm_args[i]) is not None
                 ]
+
+                if not self._helper_signature_matches(func_name, input_mlir_vals):
+                    rebuilt = self._rebuild_aten_helper_for_call(
+                        node,
+                        input_mlir_vals,
+                    )
+                    if rebuilt is not None:
+                        func_name, return_types = rebuilt
+                    else:
+                        passthrough = self._lower_aten_passthrough(node)
+                        if passthrough is not None:
+                            return passthrough
+
+                if not self._helper_signature_matches(func_name, input_mlir_vals):
+                    if len(input_mlir_vals) == 1 and self._helper_is_identity(
+                        func_name
+                    ):
+                        return input_mlir_vals[0]
+                    if len(input_mlir_vals) == 1 and len(return_types) == 1:
+                        reduced = self._lower_max_reduce_from_tensor(input_mlir_vals[0])
+                        if reduced is not None and str(reduced.type) == str(
+                            return_types[0]
+                        ):
+                            return reduced
+
                 call = func_d.CallOp(return_types, func_name, input_mlir_vals)
                 return call.results[0] if call.results else None
 
@@ -720,8 +895,10 @@ class MLIRModuleBuilder:
 
     def _lower_aten_add_tensor(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower elementwise ``aten.add.Tensor`` directly to ``linalg.generic``."""
+        from mlir.dialects import arith as arith_d
         from mlir.dialects import linalg as linalg_d
         from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
 
         from .aten_lowering import normalized_aten_args
 
@@ -735,21 +912,151 @@ class MLIRModuleBuilder:
 
         lhs = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
         rhs = self._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
+
+        # Tensor + scalar (or scalar + tensor): materialize a filled tensor and add.
+        if lhs is not None and rhs is None and isinstance(args[1], (int, float)):
+            lhs_ty = ir.RankedTensorType(lhs.type)
+            elem_ty = lhs_ty.element_type
+            if isinstance(elem_ty, ir.FloatType):
+                scalar_attr = ir.FloatAttr.get(elem_ty, float(args[1]))
+            elif isinstance(elem_ty, ir.IntegerType):
+                scalar_attr = ir.IntegerAttr.get(elem_ty, int(args[1]))
+            else:
+                return None
+
+            scalar_val = arith_d.ConstantOp(elem_ty, scalar_attr).result
+            rhs_empty = tensor_d.EmptyOp(list(lhs_ty.shape), elem_ty).result
+            rhs_tensor = linalg_d.fill(scalar_val, outs=[rhs_empty])
+            out = tensor_d.EmptyOp(list(lhs_ty.shape), elem_ty).result
+            return linalg_d.add(lhs, rhs_tensor, outs=[out])
+
+        if rhs is not None and lhs is None and isinstance(args[0], (int, float)):
+            rhs_ty = ir.RankedTensorType(rhs.type)
+            elem_ty = rhs_ty.element_type
+            if isinstance(elem_ty, ir.FloatType):
+                scalar_attr = ir.FloatAttr.get(elem_ty, float(args[0]))
+            elif isinstance(elem_ty, ir.IntegerType):
+                scalar_attr = ir.IntegerAttr.get(elem_ty, int(args[0]))
+            else:
+                return None
+
+            scalar_val = arith_d.ConstantOp(elem_ty, scalar_attr).result
+            lhs_empty = tensor_d.EmptyOp(list(rhs_ty.shape), elem_ty).result
+            lhs_tensor = linalg_d.fill(scalar_val, outs=[lhs_empty])
+            out = tensor_d.EmptyOp(list(rhs_ty.shape), elem_ty).result
+            return linalg_d.add(lhs_tensor, rhs, outs=[out])
+
         if lhs is None or rhs is None:
             return None
 
-        import mlir.ir as ir
-
         lhs_ty = ir.RankedTensorType(lhs.type)
         rhs_ty = ir.RankedTensorType(rhs.type)
-        if len(lhs_ty.shape) != len(rhs_ty.shape):
-            return None
-        if list(lhs_ty.shape) != list(rhs_ty.shape):
-            return None
-        if lhs_ty.element_type != rhs_ty.element_type:
+        lhs_shape = [int(d) for d in lhs_ty.shape]
+        rhs_shape = [int(d) for d in rhs_ty.shape]
+        out_rank = max(len(lhs_shape), len(rhs_shape))
+        out_shape_rev: list[int] = []
+        for i in range(out_rank):
+            ld = lhs_shape[-1 - i] if i < len(lhs_shape) else 1
+            rd = rhs_shape[-1 - i] if i < len(rhs_shape) else 1
+            if ld != rd and ld != 1 and rd != 1:
+                return None
+            out_shape_rev.append(max(ld, rd))
+        out_shape = list(reversed(out_shape_rev))
+
+        lhs_elem = lhs_ty.element_type
+        rhs_elem = rhs_ty.element_type
+
+        def _promoted_elem_type() -> ir.Type | None:
+            if str(lhs_elem) == str(rhs_elem):
+                return lhs_elem
+            if isinstance(lhs_elem, ir.IntegerType) and isinstance(
+                rhs_elem, ir.IntegerType
+            ):
+                return lhs_elem if lhs_elem.width >= rhs_elem.width else rhs_elem
+            if isinstance(lhs_elem, ir.FloatType) and isinstance(
+                rhs_elem, ir.FloatType
+            ):
+                return lhs_elem if lhs_elem.width >= rhs_elem.width else rhs_elem
+            if isinstance(lhs_elem, ir.FloatType) and isinstance(
+                rhs_elem, ir.IntegerType
+            ):
+                return lhs_elem
+            if isinstance(lhs_elem, ir.IntegerType) and isinstance(
+                rhs_elem, ir.FloatType
+            ):
+                return rhs_elem
             return None
 
-        out = tensor_d.EmptyOp(list(lhs_ty.shape), lhs_ty.element_type).result
+        out_elem = _promoted_elem_type()
+        if out_elem is None:
+            return None
+
+        def _cast_scalar(val: ir.Value, src: ir.Type, dst: ir.Type) -> ir.Value | None:
+            if str(src) == str(dst):
+                return val
+            if isinstance(src, ir.IntegerType) and isinstance(dst, ir.IntegerType):
+                if src.width < dst.width:
+                    return arith_d.ExtSIOp(dst, val).result
+                return arith_d.TruncIOp(dst, val).result
+            if isinstance(src, ir.IntegerType) and isinstance(dst, ir.FloatType):
+                return arith_d.SIToFPOp(dst, val).result
+            if isinstance(src, ir.FloatType) and isinstance(dst, ir.FloatType):
+                if src.width < dst.width:
+                    return arith_d.ExtFOp(dst, val).result
+                return arith_d.TruncFOp(dst, val).result
+            return None
+
+        # General broadcast-compatible tensor + tensor lowering.
+        if list(lhs_ty.shape) != list(rhs_ty.shape) or str(lhs_elem) != str(rhs_elem):
+            out_ty = ir.RankedTensorType.get(out_shape, out_elem)
+            out = tensor_d.GenerateOp(out_ty, [])
+            body = out.operation.regions[0].blocks.append(
+                *([ir.IndexType.get()] * len(out_shape))
+            )
+            with ir.InsertionPoint(body):
+                ivs = list(body.arguments)
+
+                def _indices_for_operand(op_shape: list[int]) -> list[ir.Value]:
+                    idxs: list[ir.Value] = []
+                    rank_delta = len(out_shape) - len(op_shape)
+                    for dim, size in enumerate(op_shape):
+                        if size == 1:
+                            idxs.append(self._get_index_const(0))
+                        else:
+                            idxs.append(ivs[rank_delta + dim])
+                    return idxs
+
+                lhs_val = tensor_d.ExtractOp(
+                    lhs,
+                    _indices_for_operand(lhs_shape),
+                    results=[lhs_elem],
+                ).result
+                rhs_val = tensor_d.ExtractOp(
+                    rhs,
+                    _indices_for_operand(rhs_shape),
+                    results=[rhs_elem],
+                ).result
+
+                lhs_cast = _cast_scalar(lhs_val, lhs_elem, out_elem)
+                rhs_cast = _cast_scalar(rhs_val, rhs_elem, out_elem)
+                if lhs_cast is None or rhs_cast is None:
+                    return None
+
+                if isinstance(out_elem, ir.FloatType):
+                    summed = arith_d.AddFOp(lhs_cast, rhs_cast).result
+                elif isinstance(out_elem, ir.IntegerType):
+                    summed = arith_d.AddIOp(lhs_cast, rhs_cast).result
+                else:
+                    return None
+
+                tensor_d.YieldOp(summed)
+
+            return out.result
+
+        if len(lhs_ty.shape) != len(rhs_ty.shape):
+            return None
+
+        out = tensor_d.EmptyOp(list(lhs_ty.shape), lhs_elem).result
         return linalg_d.add(lhs, rhs, outs=[out])
 
     def _emit_matmul_like(
@@ -881,6 +1188,97 @@ class MLIRModuleBuilder:
 
         return linalg_d.max(inp, zero_tensor, outs=[out])
 
+    def _lower_aten_passthrough(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower shape-preserving unary ATen ops as direct pass-through."""
+        from .aten_lowering import normalized_aten_args
+
+        target_name = str(node.target)
+        tname = getattr(node.target, "__name__", "")
+        passthrough_ops = (
+            "aten.alias",
+            "aten.detach",
+            "aten.clone",
+            "aten.contiguous",
+        )
+        passthrough_overloads = {
+            "alias.default",
+            "detach.default",
+            "clone.default",
+            "contiguous.default",
+        }
+
+        if (
+            not any(op in target_name for op in passthrough_ops)
+            and tname not in passthrough_overloads
+        ):
+            return None
+
+        args = list(normalized_aten_args(node))
+        if not args:
+            return None
+
+        if isinstance(args[0], torch.fx.Node):
+            return self._get_value(args[0])
+
+        return None
+
+    def _lower_aten_reduce_max_1d(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower 1D integer `aten.max` reductions to a scalar tensor."""
+
+        target_name = str(node.target)
+        tname = getattr(node.target, "__name__", "")
+        is_max = "aten.max" in target_name or tname == "max.default"
+        if not is_max:
+            return None
+
+        from .aten_lowering import normalized_aten_args
+
+        args = list(normalized_aten_args(node))
+        if not args or not isinstance(args[0], torch.fx.Node):
+            return None
+
+        inp = self._get_value(args[0])
+        if inp is None:
+            return None
+
+        return self._lower_max_reduce_from_tensor(inp)
+
+    def _lower_max_reduce_from_tensor(self, inp: ir.Value) -> ir.Value | None:
+        """Lower max reduction for a rank-1 integer tensor to rank-0 integer tensor."""
+        from mlir.dialects import arith as arith_d
+        from mlir.dialects import scf as scf_d
+        from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
+
+        inp_ty = ir.RankedTensorType(inp.type)
+        if inp_ty.rank != 1 or not isinstance(inp_ty.element_type, ir.IntegerType):
+            return None
+
+        elem_ty = inp_ty.element_type
+        n = int(inp_ty.shape[0])
+
+        if n <= 0:
+            return None
+
+        bitwidth = elem_ty.width
+        min_val = -(1 << (bitwidth - 1))
+        init = arith_d.ConstantOp(elem_ty, ir.IntegerAttr.get(elem_ty, min_val)).result
+
+        lb = self._get_index_const(0)
+        ub = self._get_index_const(n)
+        step = self._get_index_const(1)
+
+        loop = scf_d.ForOp(lb, ub, step, iter_args=[init])
+        with ir.InsertionPoint(loop.body):
+            iv = loop.body.arguments[0]
+            acc = loop.body.arguments[1]
+            cur = tensor_d.ExtractOp(inp, [iv], results=[elem_ty]).result
+            nxt = arith_d.MaxSIOp(cur, acc).result
+            scf_d.YieldOp([nxt])
+
+        scalar_empty = tensor_d.EmptyOp([], elem_ty).result
+        return tensor_d.InsertOp(loop.results[0], scalar_empty, []).result
+
     def _lower_call_method(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower selected Tensor call-method ops.
 
@@ -983,10 +1381,17 @@ class MLIRModuleBuilder:
     def _cast_to_index(self, val: ir.Value) -> ir.Value:
         """Cast an integer value to index type if needed."""
         from mlir.dialects import arith as arith_d
+        from mlir.dialects import tensor as tensor_d
         import mlir.ir as ir
 
         if isinstance(val.type, ir.IndexType):
             return val
+        if isinstance(val.type, ir.RankedTensorType) and val.type.rank == 0:
+            elem = val.type.element_type
+            if isinstance(elem, (ir.IntegerType, ir.IndexType)):
+                val = tensor_d.ExtractOp(val, []).result
+                if isinstance(val.type, ir.IndexType):
+                    return val
         return arith_d.IndexCastOp(ir.IndexType.get(), val).result
 
     def _extract_concrete_shape(
@@ -1196,6 +1601,215 @@ class MLIRModuleBuilder:
         idx = ir.IndexType.get()
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
 
+    def _lower_tile_index(self, node: torch.fx.Node) -> ir.Value | None:
+        """``tile.index`` → 1D tensor of global offsets for the tile."""
+        from mlir.dialects import arith as arith_d
+        from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
+
+        if not node.args:
+            return None
+
+        tile_arg = node.args[0]
+        sym_to_block_id = self._build_sym_to_block_id()
+        block_id = self._infer_block_id_from_index(tile_arg, sym_to_block_id)
+        if block_id is None and self._for_block_id_stack:
+            # In nested loops, symbolic metadata can be lost for tile.index.
+            # Fall back to the innermost active scf.for block id.
+            block_id = self._for_block_id_stack[-1]
+
+        shape = self._shape_from_node_meta(node)
+        if shape is None:
+            shape = []
+        if not shape:
+            if block_id is not None and block_id in self._block_id_to_size:
+                shape = [self._block_id_to_size[block_id]]
+            else:
+                return None
+
+        # Prefer configured tile size over stale metadata for tile.index.
+        # In nested loops, symbolic metadata can point to the wrong block and
+        # inflate extents (e.g. 64 instead of 32), which then poisons helper
+        # signatures and gather shapes.
+        if block_id is not None and block_id in self._block_id_to_size and shape:
+            shape[0] = int(self._block_id_to_size[block_id])
+
+        if (
+            block_id is not None
+            and block_id in self._block_id_to_upper_bound
+            and self._block_id_to_upper_bound[block_id] > 0
+        ):
+            shape[0] = min(shape[0], int(self._block_id_to_upper_bound[block_id]))
+
+        if len(shape) != 1:
+            raise UnsupportedOperationError(
+                "tile_index",
+                reason="Only 1D tile.index lowering is implemented",
+            )
+
+        elem_ty: ir.Type = ir.IndexType.get()
+        meta_val = node.meta.get("val")
+        if isinstance(meta_val, torch.Tensor):
+            try:
+                meta_ty = torch_dtype_to_mlir(meta_val.dtype)
+                if isinstance(meta_ty, (ir.IntegerType, ir.IndexType)):
+                    elem_ty = meta_ty
+            except Exception:
+                pass
+
+        index_ty = ir.IndexType.get()
+        result_ty = ir.RankedTensorType.get(shape, elem_ty)
+        op = tensor_d.GenerateOp(result_ty, [])
+        body = op.operation.regions[0].blocks.append(index_ty)
+
+        if block_id is not None and block_id in self._block_id_to_iv:
+            base = self._block_id_to_iv[block_id]
+        else:
+            base = self._get_index_const(0)
+
+        with ir.InsertionPoint(body):
+            iv = body.arguments[0]
+            if isinstance(elem_ty, ir.IndexType):
+                value = arith_d.AddIOp(base, iv).result
+                tensor_d.YieldOp(value)
+            else:
+                base_int = arith_d.IndexCastOp(elem_ty, base).result
+                iv_int = arith_d.IndexCastOp(elem_ty, iv).result
+                value = arith_d.AddIOp(base_int, iv_int).result
+                tensor_d.YieldOp(value)
+
+        return op.result
+
+    def _lower_mask_to(self, node: torch.fx.Node) -> ir.Value | None:
+        """Conservatively forward masked tensors when the backend has no mask IR."""
+        if not node.args:
+            return None
+        return self._get_value(node.args[0])
+
+    def _lower_subscript(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower tensor-style subscripting as a gather when the index is tensor-valued."""
+        from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
+
+        if len(node.args) < 2:
+            return None
+
+        source_val = self._get_value(node.args[0])
+        index_candidates: list[object] = []
+        for arg in node.args[1:]:
+            if isinstance(arg, (list, tuple)):
+                index_candidates.extend(arg)
+            else:
+                index_candidates.append(arg)
+
+        index_val = None
+        for candidate in index_candidates:
+            index_val = self._get_value(candidate)
+            if index_val is not None:
+                break
+        if source_val is None:
+            return None
+
+        try:
+            source_ty = ir.RankedTensorType(source_val.type)
+        except Exception:
+            return None
+
+        elem_ty = source_ty.element_type
+
+        def _is_full_slice(spec: object) -> bool:
+            return (
+                isinstance(spec, slice)
+                and spec.start is None
+                and spec.stop is None
+                and spec.step is None
+            )
+
+        if (
+            index_val is not None
+            and source_ty.rank == 1
+            and any(
+                not isinstance(spec, (None.__class__, slice))
+                for spec in index_candidates
+            )
+        ):
+            index_ty = ir.RankedTensorType(index_val.type)
+            result_shape = [int(d) for d in index_ty.shape]
+            if not result_shape:
+                if isinstance(index_val.type, ir.IndexType):
+                    idx = index_val
+                else:
+                    idx = tensor_d.ExtractOp(
+                        index_val, [], results=[ir.IndexType.get()]
+                    ).result
+                return tensor_d.ExtractOp(source_val, [idx], results=[elem_ty]).result
+
+            result_ty = ir.RankedTensorType.get(result_shape, elem_ty)
+            generate = tensor_d.GenerateOp(result_ty, [])
+            body = generate.operation.regions[0].blocks.append(
+                *([ir.IndexType.get()] * len(result_shape))
+            )
+
+            with ir.InsertionPoint(body):
+                ivs = list(body.arguments)
+                extracted_idx = tensor_d.ExtractOp(
+                    index_val, ivs, results=[ir.IndexType.get()]
+                ).result
+                if not isinstance(extracted_idx.type, ir.IndexType):
+                    extracted_idx = self._cast_to_index(extracted_idx)
+                gathered = tensor_d.ExtractOp(
+                    source_val, [extracted_idx], results=[elem_ty]
+                ).result
+                tensor_d.YieldOp(gathered)
+
+            return generate.result
+
+        if any(isinstance(spec, (int, float)) for spec in index_candidates):
+            return None
+
+        result_shape = self._shape_from_node_meta(node)
+        if result_shape is None:
+            result_shape = [int(d) for d in source_ty.shape]
+            for spec in index_candidates:
+                if spec is None:
+                    result_shape.append(1)
+
+        if not result_shape:
+            return None
+
+        source_indices: list[ir.Value] = []
+        result_ty = ir.RankedTensorType.get(result_shape, elem_ty)
+        generate = tensor_d.GenerateOp(result_ty, [])
+        body = generate.operation.regions[0].blocks.append(
+            *([ir.IndexType.get()] * len(result_shape))
+        )
+
+        out_dim = 0
+        source_dim = 0
+        with ir.InsertionPoint(body):
+            ivs = list(body.arguments)
+            for spec in index_candidates:
+                if spec is None:
+                    continue
+                if _is_full_slice(spec):
+                    if source_dim >= source_ty.rank or out_dim >= len(ivs):
+                        return None
+                    source_indices.append(ivs[out_dim])
+                    source_dim += 1
+                    out_dim += 1
+                    continue
+                return None
+
+            if source_dim != source_ty.rank:
+                return None
+
+            gathered = tensor_d.ExtractOp(
+                source_val, source_indices, results=[elem_ty]
+            ).result
+            tensor_d.YieldOp(gathered)
+
+        return generate.result
+
     def _lower_sym_size(self, node: torch.fx.Node) -> ir.Value:
         """``sym_size.int(tensor, dim)`` → constant for the tensor dimension.
 
@@ -1310,7 +1924,7 @@ class MLIRModuleBuilder:
 
         body_graph_id: int = node.args[0]
         block_ids: list[int] = list(node.args[1])
-        upper_bounds: list[int] = list(node.args[2])
+        upper_bounds: list[object] = list(node.args[2])
         iter_arg_nodes = list(node.args[3])
 
         # We expect a single reduction dimension for now.
@@ -1318,7 +1932,38 @@ class MLIRModuleBuilder:
             f"Only single-dim reduction loops supported; got block_ids={block_ids}"
         )
         block_id = block_ids[0]
-        ub = int(upper_bounds[0])
+        ub_src = upper_bounds[0]
+
+        ub_static: int | None = None
+        ub_val: ir.Value | None = None
+
+        if isinstance(ub_src, int):
+            ub_static = int(ub_src)
+        elif isinstance(ub_src, torch.fx.Node):
+            ub_val = self._get_value(ub_src)
+            if ub_val is None:
+                meta_val = ub_src.meta.get("val")
+                if isinstance(meta_val, torch.Tensor) and meta_val.numel() == 1:
+                    try:
+                        ub_static = int(meta_val.item())
+                    except Exception:
+                        ub_static = None
+                elif isinstance(meta_val, (int, float)):
+                    ub_static = int(meta_val)
+        elif isinstance(ub_src, ir.Value):
+            ub_val = ub_src
+
+        if ub_static is None and ub_val is None:
+            raise NodeLoweringError(
+                node,
+                reason=f"Unsupported loop upper bound type: {type(ub_src).__name__}",
+                recovery_hint="Ensure loop bounds are integer constants or scalar tensor values",
+            )
+
+        if ub_val is not None:
+            ub_val = self._cast_to_index(ub_val)
+
+        ub_for_match = ub_static if ub_static is not None else None
         # Nested loops can sometimes reuse an outer block_id in FX metadata.
         # If that happens, pick a non-active block whose configured size best
         # matches this loop upper bound.
@@ -1326,141 +1971,172 @@ class MLIRModuleBuilder:
             candidates = [
                 bid
                 for bid, size in self._block_id_to_size.items()
-                if bid not in self._block_id_to_iv and size > 0 and ub % size == 0
+                if bid not in self._block_id_to_iv
+                and size > 0
+                and ub_for_match is not None
+                and ub_for_match % size == 0
             ]
             if candidates:
                 block_id = max(candidates, key=lambda bid: self._block_id_to_size[bid])
 
-        step = self._block_id_to_size.get(block_id, ub)
-
-        # Build iter_args list.
-        iter_init_vals = [self._get_value(a) for a in iter_arg_nodes]
-        iter_init_vals = [v for v in iter_init_vals if v is not None]
+        step = self._block_id_to_size.get(
+            block_id,
+            ub_static if ub_static is not None else 1,
+        )
 
         device_ir = self.hf.device_ir
         body_graph_info = device_ir.graphs[body_graph_id]
         body_graph = body_graph_info.graph
+
+        output_node = next(n for n in body_graph.nodes if n.op == "output")
+        out_args = output_node.args[0]
+        if not isinstance(out_args, (list, tuple)):
+            out_args = [out_args]
+
+        # Build iter args from loop arguments. Some traced loops pass invariant
+        # values (e.g. jagged row start/end tensors) in iter_arg_nodes even
+        # though only a trailing subset is truly loop-carried.
+        iter_pairs = [(a, self._get_value(a)) for a in iter_arg_nodes]
+        iter_pairs = [(a, v) for a, v in iter_pairs if v is not None]
+
+        carried_count = len(iter_pairs)
+        if 0 < len(out_args) <= len(iter_pairs):
+            carried_count = len(out_args)
+
+        invariant_pairs = iter_pairs[: len(iter_pairs) - carried_count]
+        carried_pairs = iter_pairs[len(iter_pairs) - carried_count :]
+        iter_init_vals = [v for _, v in carried_pairs]
+
         active_outer_block_ids = set(self._block_id_to_iv.keys())
 
         synthetic_store_ctx: dict[str, Any] | None = None
         synthetic_iter_index: int | None = None
 
-        # If this loop body directly stores tiles and has no loop-carried
-        # tensors, synthesize one tile tensor iter_arg so values produced
-        # in the loop body dominate their later use in forall.in_parallel.
-        if not iter_init_vals:
-            store_nodes = [
-                n
-                for n in body_graph.nodes
-                if n.op == "call_function"
-                and getattr(n.target, "__name__", "") == "store"
-            ]
-            if len(store_nodes) == 1:
-                store_node = store_nodes[0]
-                target_node = store_node.args[0]
-                index_nodes = store_node.args[1]
-                value_node = store_node.args[2]
+        # If this loop body directly stores tiles, synthesize one tile tensor
+        # iter_arg so values produced in the loop body dominate their later use
+        # in forall.in_parallel. This is needed even when other iter args are
+        # already carried through the loop.
+        store_nodes = [
+            n
+            for n in body_graph.nodes
+            if n.op == "call_function" and getattr(n.target, "__name__", "") == "store"
+        ]
+        if len(store_nodes) == 1:
+            store_node = store_nodes[0]
+            target_node = store_node.args[0]
+            index_nodes = store_node.args[1]
+            value_node = store_node.args[2]
 
-                target_val = self._get_value(target_node)
-                value_meta = (
-                    value_node.meta.get("val")
-                    if isinstance(value_node, torch.fx.Node)
-                    else None
-                )
+            target_val = self._get_value(target_node)
+            value_meta = (
+                value_node.meta.get("val")
+                if isinstance(value_node, torch.fx.Node)
+                else None
+            )
 
-                if isinstance(index_nodes, (list, tuple)):
-                    if target_val is not None:
-                        target_type = ir.RankedTensorType(target_val.type)
-                        full_shape = list(target_type.shape)
-                        elem_ty = target_type.element_type
+            target_type: ir.RankedTensorType | None = None
+            target_rank_matches = True
+            if target_val is not None:
+                target_type = ir.RankedTensorType(target_val.type)
+                target_rank_matches = target_type.rank == len(index_nodes)
+
+            if isinstance(index_nodes, (list, tuple)) and target_rank_matches:
+                if target_val is not None:
+                    assert target_type is not None
+                    full_shape = list(target_type.shape)
+                    elem_ty = target_type.element_type
+                else:
+                    if isinstance(value_meta, torch.Tensor):
+                        value_shape = [int(d) for d in value_meta.shape]
+                        elem_ty = torch_dtype_to_mlir(value_meta.dtype)
                     else:
-                        if isinstance(value_meta, torch.Tensor):
-                            value_shape = [int(d) for d in value_meta.shape]
-                            elem_ty = torch_dtype_to_mlir(value_meta.dtype)
+                        value_shape = [1 for _ in index_nodes]
+                        elem_ty = torch_dtype_to_mlir(torch.float32)
+                    full_shape = list(value_shape)
+                rank = len(full_shape)
+                sym_to_block_id = self._build_sym_to_block_id()
+                dim_block_ids: list[int | None] = []
+                inner_dim: int | None = None
+
+                for dim, idx_node in enumerate(index_nodes):
+                    if dim >= rank:
+                        break
+                    dim_bid = self._infer_block_id_from_index(idx_node, sym_to_block_id)
+                    dim_block_ids.append(dim_bid)
+                    # If metadata aliases both dims to the same block_id,
+                    # prefer the last occurrence (inner-most index dim).
+                    if dim_bid == block_id:
+                        inner_dim = dim
+
+                # Fallback when metadata doesn't preserve exact block-id
+                # mapping for every dimension in nested loops.
+                while len(dim_block_ids) < rank:
+                    dim_block_ids.append(None)
+                if inner_dim is None:
+                    inner_dim = min(rank - 1, max(0, len(index_nodes) - 1))
+
+                if inner_dim is not None:
+                    tile_shape: list[int] = []
+                    flush_offsets: list[ir.Value] = []
+                    outer_bids = [
+                        bid for bid in active_outer_block_ids if bid != block_id
+                    ]
+                    fallback_outer_bid = outer_bids[0] if outer_bids else None
+                    for dim, dim_size in enumerate(full_shape):
+                        dim_bid = dim_block_ids[dim]
+                        if dim == inner_dim or dim_bid == block_id:
+                            tile_shape.append(
+                                ub_static if ub_static is not None else step
+                            )
+                            flush_offsets.append(self._get_index_const(0))
+                        elif (
+                            isinstance(dim_bid, int)
+                            and dim_bid in active_outer_block_ids
+                            and dim_bid in self._block_id_to_size
+                        ):
+                            tile_shape.append(self._block_id_to_size[dim_bid])
+                            flush_offsets.append(self._block_id_to_iv[dim_bid])
+                        elif (
+                            fallback_outer_bid is not None
+                            and fallback_outer_bid in self._block_id_to_size
+                        ):
+                            tile_shape.append(
+                                self._block_id_to_size[fallback_outer_bid]
+                            )
+                            flush_offsets.append(
+                                self._block_id_to_iv[fallback_outer_bid]
+                            )
                         else:
-                            value_shape = [1 for _ in index_nodes]
-                            elem_ty = torch_dtype_to_mlir(torch.float32)
-                        full_shape = list(value_shape)
-                    rank = len(full_shape)
-                    sym_to_block_id = self._build_sym_to_block_id()
-                    dim_block_ids: list[int | None] = []
-                    inner_dim: int | None = None
+                            tile_shape.append(int(dim_size))
+                            flush_offsets.append(self._get_index_const(0))
 
-                    for dim, idx_node in enumerate(index_nodes):
-                        if dim >= rank:
-                            break
-                        dim_bid = self._infer_block_id_from_index(
-                            idx_node, sym_to_block_id
-                        )
-                        dim_block_ids.append(dim_bid)
-                        # If metadata aliases both dims to the same block_id,
-                        # prefer the last occurrence (inner-most index dim).
-                        if dim_bid == block_id:
-                            inner_dim = dim
+                    tile_empty = tensor_d.EmptyOp(
+                        tile_shape,
+                        elem_ty,
+                    ).result
+                    if isinstance(elem_ty, ir.FloatType):
+                        zero_attr = ir.FloatAttr.get(elem_ty, 0.0)
+                    else:
+                        zero_attr = ir.IntegerAttr.get(elem_ty, 0)
+                    zero = arith_d.ConstantOp(elem_ty, zero_attr).result
+                    tile_init = linalg_d.fill(zero, outs=[tile_empty])
 
-                    # Fallback when metadata doesn't preserve exact block-id
-                    # mapping for every dimension in nested loops.
-                    while len(dim_block_ids) < rank:
-                        dim_block_ids.append(None)
-                    if inner_dim is None:
-                        inner_dim = min(rank - 1, max(0, len(index_nodes) - 1))
-
-                    if inner_dim is not None:
-                        tile_shape: list[int] = []
-                        flush_offsets: list[ir.Value] = []
-                        outer_bids = [
-                            bid for bid in active_outer_block_ids if bid != block_id
-                        ]
-                        fallback_outer_bid = outer_bids[0] if outer_bids else None
-                        for dim, dim_size in enumerate(full_shape):
-                            dim_bid = dim_block_ids[dim]
-                            if dim == inner_dim or dim_bid == block_id:
-                                tile_shape.append(ub)
-                                flush_offsets.append(self._get_index_const(0))
-                            elif (
-                                isinstance(dim_bid, int)
-                                and dim_bid in active_outer_block_ids
-                                and dim_bid in self._block_id_to_size
-                            ):
-                                tile_shape.append(self._block_id_to_size[dim_bid])
-                                flush_offsets.append(self._block_id_to_iv[dim_bid])
-                            elif (
-                                fallback_outer_bid is not None
-                                and fallback_outer_bid in self._block_id_to_size
-                            ):
-                                tile_shape.append(
-                                    self._block_id_to_size[fallback_outer_bid]
-                                )
-                                flush_offsets.append(
-                                    self._block_id_to_iv[fallback_outer_bid]
-                                )
-                            else:
-                                tile_shape.append(int(dim_size))
-                                flush_offsets.append(self._get_index_const(0))
-
-                        tile_empty = tensor_d.EmptyOp(
-                            tile_shape,
-                            elem_ty,
-                        ).result
-                        if isinstance(elem_ty, ir.FloatType):
-                            zero_attr = ir.FloatAttr.get(elem_ty, 0.0)
-                        else:
-                            zero_attr = ir.IntegerAttr.get(elem_ty, 0)
-                        zero = arith_d.ConstantOp(elem_ty, zero_attr).result
-                        tile_init = linalg_d.fill(zero, outs=[tile_empty])
-
-                        synthetic_iter_index = len(iter_init_vals)
-                        iter_init_vals.append(tile_init)
-                        synthetic_store_ctx = {
-                            "block_id": block_id,
-                            "inner_dim": inner_dim,
-                            "rank": rank,
-                            "flush_offsets": flush_offsets,
-                            "current": None,
-                        }
+                    synthetic_iter_index = len(iter_init_vals)
+                    iter_init_vals.append(tile_init)
+                    synthetic_store_ctx = {
+                        "block_id": block_id,
+                        "inner_dim": inner_dim,
+                        "rank": rank,
+                        "flush_offsets": flush_offsets,
+                        "current": None,
+                    }
 
         lb_val = self._get_index_const(0)
-        ub_val = self._get_index_const(ub)
+        ub_val = (
+            ub_val
+            if ub_val is not None
+            else self._get_index_const(ub_static if ub_static is not None else step)
+        )
         step_val = self._get_index_const(step)
 
         for_op = scf_d.ForOp(lb_val, ub_val, step_val, iter_args=iter_init_vals)
@@ -1474,11 +2150,22 @@ class MLIRModuleBuilder:
             previous_iv = self._block_id_to_iv.get(block_id)
             for_iv = body_block.arguments[0]
             self._block_id_to_iv[block_id] = for_iv
+            self._for_block_id_stack.append(block_id)
 
             # Map iter_arg placeholder nodes to the for body's iter args.
             placeholders = [n for n in body_graph.nodes if n.op == "placeholder"]
+            if len(placeholders) > len(iter_pairs):
+                placeholders = placeholders[-len(iter_pairs) :]
+
+            invariant_placeholders = placeholders[: len(invariant_pairs)]
+            for ph_node, (_, inv_val) in zip(
+                invariant_placeholders, invariant_pairs, strict=False
+            ):
+                self._node_to_value[ph_node] = inv_val
+
+            carried_placeholders = placeholders[len(invariant_pairs) :]
             for ph_node, body_arg in zip(
-                placeholders, body_block.arguments[1:], strict=False
+                carried_placeholders, body_block.arguments[1:], strict=False
             ):
                 self._node_to_value[ph_node] = body_arg
 
@@ -1492,10 +2179,6 @@ class MLIRModuleBuilder:
             self._process_graph(body_graph)
 
             # Collect the output values for scf.yield.
-            output_node = next(n for n in body_graph.nodes if n.op == "output")
-            out_args = output_node.args[0]
-            if not isinstance(out_args, (list, tuple)):
-                out_args = [out_args]
             yield_vals = []
             for a in out_args:
                 v = self._get_value(a) if isinstance(a, torch.fx.Node) else None
@@ -1505,7 +2188,29 @@ class MLIRModuleBuilder:
             if synthetic_store_ctx is not None:
                 current = synthetic_store_ctx.get("current")
                 if current is not None:
-                    yield_vals.append(current)
+                    insert_at = (
+                        synthetic_iter_index
+                        if synthetic_iter_index is not None
+                        else len(yield_vals)
+                    )
+                    if insert_at <= len(yield_vals):
+                        yield_vals.insert(insert_at, current)
+                    else:
+                        yield_vals.append(current)
+
+            if len(yield_vals) != len(iter_init_vals):
+                if len(yield_vals) > len(iter_init_vals):
+                    raise NodeLoweringError(
+                        node,
+                        reason=(
+                            "Loop body yielded more values than iter_args: "
+                            f"{len(yield_vals)} > {len(iter_init_vals)}"
+                        ),
+                        recovery_hint="Ensure loop-carried values match loop iter_args",
+                    )
+                passthrough_count = len(iter_init_vals) - len(yield_vals)
+                passthrough_vals = list(body_block.arguments[1 : 1 + passthrough_count])
+                yield_vals = yield_vals + passthrough_vals
 
             scf_d.YieldOp(yield_vals)
 
@@ -1515,6 +2220,9 @@ class MLIRModuleBuilder:
                 and self._for_store_ctx_stack[-1] is synthetic_store_ctx
             ):
                 self._for_store_ctx_stack.pop()
+
+            if self._for_block_id_stack and self._for_block_id_stack[-1] == block_id:
+                self._for_block_id_stack.pop()
 
         # Restore the outer IV for block_id so subsequent store offsets (which
         # use the outer forall IVs) resolve to the correct values.
@@ -1548,6 +2256,7 @@ class MLIRModuleBuilder:
 
     def _lower_load(self, node: torch.fx.Node) -> ir.Value:
         """``load(tensor, index_list)`` → ``tensor.extract_slice``."""
+        from mlir.dialects import arith as arith_d
         from mlir.dialects import tensor as tensor_d
         import mlir.ir as ir
 
@@ -1562,6 +2271,102 @@ class MLIRModuleBuilder:
         # dimension.
         tensor_type = ir.RankedTensorType(tensor_val.type)
         ndim = len(tensor_type.shape)
+
+        # Advanced indexing fast-path: gather from a 1D source tensor using
+        # an N-D integer index tensor. This is required for jagged flatten-
+        # then-gather patterns where hl.load(x_flat, [flat_indices]) should
+        # produce a tensor with the same shape as flat_indices.
+        if ndim == 1 and len(index_nodes) == 1:
+            gather_index_val = self._get_value(index_nodes[0])
+            if gather_index_val is not None:
+                try:
+                    gather_index_ty = ir.RankedTensorType(gather_index_val.type)
+                except Exception:
+                    gather_index_ty = None
+                if gather_index_ty is not None and gather_index_ty.rank >= 1:
+                    elem_ty = tensor_type.element_type
+                    gather_shape = [int(d) for d in gather_index_ty.shape]
+
+                    # When loading from a flattened 2D tensor view (x.view(-1))
+                    # with broadcasted jagged indices, preserve the original
+                    # innermost extent on the trailing gather dimension.
+                    # This prevents oversized tile_m extents from leaking
+                    # through ambiguous symbolic metadata in nested loops.
+                    if isinstance(tensor_node, torch.fx.Node) and gather_shape:
+                        trailing_extent: int | None = None
+
+                        # Case 1: flattened view node (x.view(-1)).
+                        src_node = tensor_node
+                        src_target_name = str(getattr(src_node, "target", ""))
+                        src_tname = getattr(src_node.target, "__name__", "")
+                        is_view = src_node.op in ("call_function", "call_method") and (
+                            "aten.view" in src_target_name
+                            or src_tname in ("view", "view.default")
+                        )
+                        if is_view and src_node.args:
+                            base_node = src_node.args[0]
+                            base_meta = (
+                                base_node.meta.get("val")
+                                if isinstance(base_node, torch.fx.Node)
+                                else None
+                            )
+                            if (
+                                isinstance(base_meta, torch.Tensor)
+                                and base_meta.ndim >= 2
+                            ):
+                                trailing_extent = int(base_meta.shape[-1])
+
+                        # Case 2: flattened host-tensor alias (e.g. x_flat)
+                        # mapped alongside its base tensor argument (e.g. x_data).
+                        if (
+                            trailing_extent is None
+                            and src_tname == "_host_tensor"
+                            and src_node.args
+                        ):
+                            alias_name = src_node.args[0]
+                            if isinstance(alias_name, str) and alias_name.endswith(
+                                "_flat"
+                            ):
+                                base_name = alias_name[: -len("_flat")]
+                                alias_val = self.hf.params.arguments.get(alias_name)
+                                base_val = self.hf.params.arguments.get(base_name)
+                                if (
+                                    isinstance(alias_val, torch.Tensor)
+                                    and isinstance(base_val, torch.Tensor)
+                                    and base_val.ndim >= 2
+                                    and alias_val.numel() == base_val.numel()
+                                ):
+                                    trailing_extent = int(base_val.shape[-1])
+
+                        if (
+                            trailing_extent is not None
+                            and trailing_extent > 0
+                            and gather_shape[-1] > trailing_extent
+                        ):
+                            gather_shape[-1] = trailing_extent
+
+                    gather_result_ty = ir.RankedTensorType.get(gather_shape, elem_ty)
+                    generate = tensor_d.GenerateOp(gather_result_ty, [])
+                    body = generate.operation.regions[0].blocks.append(
+                        *([ir.IndexType.get()] * len(gather_shape))
+                    )
+
+                    with ir.InsertionPoint(body):
+                        ivs = list(body.arguments)
+                        extracted_idx = tensor_d.ExtractOp(
+                            gather_index_val,
+                            ivs,
+                            results=[gather_index_ty.element_type],
+                        ).result
+                        extracted_idx = self._cast_to_index(extracted_idx)
+                        gathered = tensor_d.ExtractOp(
+                            tensor_val,
+                            [extracted_idx],
+                            results=[elem_ty],
+                        ).result
+                        tensor_d.YieldOp(gathered)
+
+                    return generate.result
 
         # The load index list tells us which block dims map to which tensor dim.
         # We use the sympy symbol of each index to find the block_id.
@@ -1610,11 +2415,24 @@ class MLIRModuleBuilder:
         for dim, idx_node in enumerate(index_nodes):
             if dim >= ndim:
                 break
+            index_extent: int | None = None
+            if isinstance(idx_node, torch.fx.Node):
+                idx_val = self._get_value(idx_node)
+                if idx_val is not None:
+                    try:
+                        idx_ty = ir.RankedTensorType(idx_val.type)
+                        if idx_ty.rank == 1:
+                            index_extent = int(idx_ty.shape[0])
+                    except Exception:
+                        pass
             forced = dim in forced_dim_block_id
-            block_id = self._infer_block_id_from_index(idx_node, sym_to_block_id)
+            block_id, index_bias = self._infer_index_block_and_bias(
+                idx_node, sym_to_block_id
+            )
             allow_fallback_inference = isinstance(idx_node, torch.fx.Node)
             if forced:
                 block_id = forced_dim_block_id[dim]
+                index_bias = 0
             if (
                 allow_fallback_inference
                 and block_id is None
@@ -1643,7 +2461,13 @@ class MLIRModuleBuilder:
                 if len(candidates) == 1:
                     block_id = candidates[0]
             if block_id is not None and block_id in self._block_id_to_iv:
-                offsets.append(self._block_id_to_iv[block_id])
+                offset_val = self._block_id_to_iv[block_id]
+                if index_bias != 0:
+                    offset_val = arith_d.AddIOp(
+                        offset_val,
+                        self._get_index_const(index_bias),
+                    ).result
+                offsets.append(offset_val)
                 used_block_ids.add(block_id)
             else:
                 # No IV registered → offset is 0.
@@ -1666,7 +2490,12 @@ class MLIRModuleBuilder:
                 else:
                     sizes.append(min(configured, dim_extent))
             else:
-                sizes.append(dim_extent)
+                if index_extent is not None:
+                    sizes.append(min(index_extent, dim_extent))
+                elif result_sizes is not None and dim < len(result_sizes):
+                    sizes.append(min(result_sizes[dim], dim_extent))
+                else:
+                    sizes.append(dim_extent)
             strides.append(1)
 
         # Result type.
@@ -1797,6 +2626,154 @@ class MLIRModuleBuilder:
             self._block_symint_to_id,
             self._block_id_to_upper_bound,
         )
+
+    def _helper_signature_matches(
+        self,
+        func_name: str,
+        input_mlir_vals: list[ir.Value],
+    ) -> bool:
+        """Return True when helper function arg types match provided MLIR values."""
+        import mlir.ir as ir
+
+        if self._mlir_module is None:
+            return False
+
+        for op in self._mlir_module.body.operations:
+            name_attr = op.attributes.get("sym_name")
+            if name_attr is None:
+                continue
+            name = name_attr.value if hasattr(name_attr, "value") else str(name_attr)
+            if name != func_name:
+                continue
+            ftype = ir.FunctionType(ir.TypeAttr(op.attributes["function_type"]).value)
+            if len(ftype.inputs) != len(input_mlir_vals):
+                return False
+            return all(
+                str(expected) == str(actual.type)
+                for expected, actual in zip(ftype.inputs, input_mlir_vals, strict=True)
+            )
+
+        return False
+
+    def _helper_is_identity(self, func_name: str) -> bool:
+        """Return True if helper body is `return arg0` with no intermediate ops."""
+        if self._mlir_module is None:
+            return False
+
+        for op in self._mlir_module.body.operations:
+            name_attr = op.attributes.get("sym_name")
+            if name_attr is None:
+                continue
+            name = name_attr.value if hasattr(name_attr, "value") else str(name_attr)
+            if name != func_name:
+                continue
+
+            try:
+                block = op.regions[0].blocks[0]
+                ops = list(block.operations)
+                if len(ops) != 1:
+                    return False
+                ret = ops[0]
+                if ret.operation.name != "func.return":
+                    return False
+                if len(ret.operands) != 1 or len(block.arguments) != 1:
+                    return False
+                return ret.operands[0] == block.arguments[0]
+            except Exception:
+                return False
+
+        return False
+
+    def _rebuild_aten_helper_for_call(
+        self,
+        node: torch.fx.Node,
+        input_mlir_vals: list[ir.Value],
+    ) -> tuple[str, list[ir.Type]] | None:
+        """Build a call-site-specific ATen helper variant using current operand types."""
+        from .aten_lowering import collect_tensor_input_positions
+        from .aten_lowering import normalized_aten_args
+        from .aten_lowering import preprocess_aten_nodes
+
+        if self._mlir_module is None:
+            return None
+
+        import mlir.ir as ir
+
+        norm_args = normalized_aten_args(node)
+        tensor_positions = collect_tensor_input_positions(node)
+        if len(tensor_positions) != len(input_mlir_vals):
+            return None
+
+        mlir_to_torch: dict[str, torch.dtype] = {
+            "f32": torch.float32,
+            "f64": torch.float64,
+            "f16": torch.float16,
+            "bf16": torch.bfloat16,
+            "i64": torch.int64,
+            "i32": torch.int32,
+            "i16": torch.int16,
+            "i8": torch.int8,
+            "i1": torch.bool,
+            "index": torch.int64,
+        }
+
+        backups: list[tuple[torch.fx.Node, object, object]] = []
+        override_by_position: dict[int, torch.Tensor] = {}
+        try:
+            for arg_idx, mlir_val in zip(
+                tensor_positions, input_mlir_vals, strict=True
+            ):
+                arg_node = norm_args[arg_idx]
+                if not isinstance(arg_node, torch.fx.Node):
+                    continue
+
+                rty = ir.RankedTensorType(mlir_val.type)
+                shape = [int(d) for d in rty.shape]
+                elem_key = str(rty.element_type)
+                dtype = mlir_to_torch.get(elem_key)
+                if dtype is None:
+                    return None
+
+                old_val = arg_node.meta.get("val")
+                old_tm = arg_node.meta.get("tensor_meta")
+                backups.append((arg_node, old_val, old_tm))
+
+                concrete = torch.zeros(shape, dtype=dtype)
+                arg_node.meta["val"] = concrete
+                override_by_position[arg_idx] = concrete
+
+            try:
+                rebuilt_map = preprocess_aten_nodes(
+                    [node],
+                    self._mlir_module,
+                    self._block_id_to_size,
+                    self._block_hint_to_id,
+                    self._block_symint_to_id,
+                    self._block_id_to_upper_bound,
+                    {id(node): override_by_position},
+                )
+            except Exception as exc:
+                log.warning(
+                    "On-demand helper rebuild failed for node %s (%s): %s",
+                    node.name,
+                    node.target,
+                    exc,
+                )
+                return None
+            rebuilt = rebuilt_map.get(id(node))
+            if rebuilt is not None:
+                self._node_to_aten_func[id(node)] = rebuilt
+            return rebuilt
+        finally:
+            for arg_node, old_val, old_tm in backups:
+                if old_val is None:
+                    arg_node.meta.pop("val", None)
+                else:
+                    arg_node.meta["val"] = old_val
+                if old_tm is None:
+                    arg_node.meta.pop("tensor_meta", None)
+                else:
+                    arg_node.meta["tensor_meta"] = old_tm
 
     def _refresh_aten_tensor_meta(self) -> None:
         """Refresh tensor-valued ATen node metadata from current input metadata.
@@ -2098,6 +3075,94 @@ class MLIRModuleBuilder:
         return mapping
 
     def _infer_block_id_from_index(
+        self,
+        idx_node: object,
+        sym_to_block_id: dict[str, int],
+    ) -> int | None:
+        block_id, _ = self._infer_index_block_and_bias(idx_node, sym_to_block_id)
+        return block_id
+
+    def _infer_index_block_and_bias(
+        self,
+        idx_node: object,
+        sym_to_block_id: dict[str, int],
+    ) -> tuple[int | None, int]:
+        """Infer ``(block_id, additive_bias)`` for simple tile-index expressions."""
+
+        block_id = self._infer_block_id_from_index_symbolic(idx_node, sym_to_block_id)
+        if block_id is not None:
+            return block_id, 0
+
+        if isinstance(idx_node, int):
+            return None, int(idx_node)
+
+        if not isinstance(idx_node, torch.fx.Node):
+            return None, 0
+
+        target_name = str(idx_node.target)
+        tname = getattr(idx_node.target, "__name__", "")
+        is_add = "aten.add" in target_name or tname in ("add.Tensor", "add.default")
+        if is_add and len(idx_node.args) >= 2:
+            left_block, left_bias = self._infer_index_block_and_bias(
+                idx_node.args[0], sym_to_block_id
+            )
+            right_block, right_bias = self._infer_index_block_and_bias(
+                idx_node.args[1], sym_to_block_id
+            )
+
+            if left_block is not None and right_block is None:
+                return left_block, left_bias + right_bias
+            if right_block is not None and left_block is None:
+                return right_block, right_bias + left_bias
+
+            # Shape-based fallback when symbolic provenance is lost through
+            # arithmetic wrappers (common for tile.index + constant patterns).
+            if left_block is None and right_block is None:
+                left_shape_block = self._infer_block_id_from_value_shape(
+                    idx_node.args[0]
+                )
+                right_shape_block = self._infer_block_id_from_value_shape(
+                    idx_node.args[1]
+                )
+                if left_shape_block is not None and right_shape_block is None:
+                    return left_shape_block, left_bias + right_bias
+                if right_shape_block is not None and left_shape_block is None:
+                    return right_shape_block, right_bias + left_bias
+
+        return None, 0
+
+    def _infer_block_id_from_value_shape(self, idx_node: object) -> int | None:
+        """Infer block_id from a 1D tensor index extent when symbolic info is unavailable."""
+        if not isinstance(idx_node, torch.fx.Node):
+            return None
+        val = self._get_value(idx_node)
+        if val is None:
+            return None
+
+        import mlir.ir as ir
+
+        try:
+            val_ty = ir.RankedTensorType(val.type)
+        except Exception:
+            return None
+
+        if val_ty.rank != 1:
+            return None
+
+        extent = int(val_ty.shape[0])
+        candidates = [
+            bid
+            for bid in self._block_id_to_iv
+            if (
+                self._block_id_to_upper_bound.get(bid) == extent
+                or self._block_id_to_size.get(bid) == extent
+            )
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _infer_block_id_from_index_symbolic(
         self,
         idx_node: object,
         sym_to_block_id: dict[str, int],

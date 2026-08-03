@@ -707,7 +707,7 @@ class TestAdvancedOperations:
         assert "linalg.generic" in ir_str
 
     def test_flatten_view_alias_in_1d_geglu_style(self):
-        """Document current verify-time limitation for 1-D flatten/view GEGLU style."""
+        """Flatten/view alias in 1-D GEGLU style verifies successfully."""
 
         @helion.kernel(static_shapes=True)
         def geglu_flatten_style(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -734,8 +734,10 @@ class TestAdvancedOperations:
         b = torch.randn(8, 16, dtype=torch.float16, device=device)
 
         module = generate_mlir(geglu_flatten_style, [a, b])
-        with pytest.raises(ir.MLIRError):
-            module.operation.verify()
+        module.operation.verify()
+        ir_str = str(module)
+        assert "func.func" in ir_str
+        assert "linalg.generic" in ir_str
 
 
 class TestEinsumDecomposition:
