@@ -15,8 +15,11 @@ dependencies = [
 	"helion",
 	"torch-mlir==20260529.826",
   "torch==2.12.1+cu130",
-  "mlir-python-bindings==20260708+478bbbeb0",
   "ml-dtypes",
+  "lighthouse",
+]
+override-dependencies = [
+  "mlir-python-bindings==20260728+5e91f5d57",
 ]
 
 [dependency-groups]
@@ -95,6 +98,7 @@ helion = { path = "./helion", editable = true }
 torch-mlir = { index = "torch-mlir" }
 torch = { index = "pytorch" }
 mlir-python-bindings = { index = "eudsl" }
+lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "53acfa0" }
 
 [[tool.uv.index]]
 name = "torch-mlir"
