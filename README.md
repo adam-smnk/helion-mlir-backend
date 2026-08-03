@@ -100,6 +100,17 @@ print('torch_mlir:', getattr(torch_mlir, '__version__', 'unknown'))
 PY
 ```
 
+## Debug Environment Variables
+
+Set any of these to a truthy value (`1`, `true`, `yes`) to dump MLIR IR to
+stdout at the corresponding pipeline stage.
+
+| Variable | Dump point |
+|---|---|
+| `HELION_MLIR_DUMP_IR` | Raw generated IR before inlining (shows `@_aten_*` helpers and tile loops) |
+| `HELION_MLIR_DUMP_PRE_LOWERING` | After inlining / all pre-passes, immediately before the lighthouse lowering schedule |
+| `HELION_MLIR_DUMP_LOWERED` | After lighthouse lowering (LLVM dialect, expanded memref descriptors) |
+
 ## Development
 
 This repo uses pre-commit + Ruff rules aligned with Helion style.

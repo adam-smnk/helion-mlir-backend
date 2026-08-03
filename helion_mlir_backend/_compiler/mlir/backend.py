@@ -46,6 +46,17 @@ class MLIRBackend(TritonBackend):
         # before all MLIR op lowerings are implemented.
         return "triton"
 
+    def autotune(
+        self,
+        bound_kernel: object,
+        args: object,
+        *,
+        force: bool = False,
+        **kwargs: object,
+    ) -> object:
+        # CPU has no hardware cache key; skip autotuning and use default config.
+        return bound_kernel.env.config_spec.default_config()
+
     # ------------------------------------------------------------------
     # MLIR generation entry point
     # ------------------------------------------------------------------
@@ -80,3 +91,57 @@ class MLIRBackend(TritonBackend):
 
         builder = MLIRModuleBuilder(host_function, config, env)
         return builder.build()
+
+    # ------------------------------------------------------------------
+    # MLIR execution entry point (experimental)
+    # ------------------------------------------------------------------
+
+    def execute_mlir(
+        self,
+        mlir_module: object,
+        *input_tensors: object,
+        kernel_name: str = "kernel",
+    ) -> object:
+        """Execute a Helion-generated MLIR kernel via lighthouse.
+
+        Preprocesses the module to move results to arguments (following
+        lighthouse calling convention), then inlines, lowers, JIT-compiles,
+        and executes the kernel.
+
+        Parameters
+        ----------
+        mlir_module : ir.Module
+            Generated MLIR module from :meth:`generate_mlir`.
+        *input_tensors : torch.Tensor
+            Input tensors matching the kernel signature.
+        kernel_name : str
+            Name of the public kernel function (default: "kernel").
+
+        Returns
+        -------
+        torch.Tensor or list[torch.Tensor]
+            Computed result(s).
+
+        Raises
+        ------
+        RuntimeError
+            If preprocessing, inlining, lowering, compilation, or execution fails.
+        NotImplementedError
+            If device is not CPU.
+        """
+        import torch
+
+        if not isinstance(input_tensors[0], torch.Tensor):
+            raise TypeError("input_tensors must be torch.Tensor instances")
+
+        device = input_tensors[0].device
+        if device.type != "cpu":
+            raise NotImplementedError(
+                f"Only CPU device supported for execution; got {device.type}"
+            )
+
+        # Execute via lighthouse; result_to_args is handled inside the executor.
+        from helion_mlir_backend._compiler.execution import HelionMLIRExecutor
+
+        executor = HelionMLIRExecutor(kernel_name=kernel_name, device=device)
+        return executor.prepare_and_execute(mlir_module, *input_tensors)
