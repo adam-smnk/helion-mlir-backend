@@ -11,6 +11,14 @@
 
 The key innovation is **backend-agnostic lowering**: Helion compiles user kernels into a common Device IR (FX graphs), then each backend generates its own code from that IR.
 
+## MLIR Backend Reading Guide
+
+If you are working on the MLIR backend specifically, start with these docs:
+
+- `docs/MLIR_USAGE.md` for current execution workflow and supported kernel patterns.
+- `docs/MLIR_LIMITATIONS.md` for current constraints and known boundaries.
+- `docs/BACKEND_SHAPE_INFERENCE_AND_PROPAGATION.md` for shape resolution details across codegen and ATen helper preprocessing.
+
 ## Compilation Pipeline: 10-Stage Journey
 
 ```
