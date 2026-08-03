@@ -120,6 +120,43 @@ class TestExecuteMlir:
         assert C.shape == A.shape
         assert C.dtype == torch.float32
 
+    def test_matmul_full_rhs_slice_execute_mlir_regression(self):
+        """Regression: full RHS slice in tiled matmul compiles and runs correctly.
+
+        Mirrors the example pattern where B is loaded with full slices inside
+        an outer tile loop and multiplied with a tiled slice of A.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def matmul_full_rhs_slice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            assert k == k2
+
+            out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                a_tile = hl.load(x, [tile_m, slice(None)])
+                b_full = hl.load(y, [slice(None), slice(None)])
+                c_tile = a_tile @ b_full
+                hl.store(out, [tile_m, slice(None)], c_tile)
+            return out
+
+        torch.manual_seed(123)
+        a = torch.randn(128, 128)
+        b = torch.randn(128, 128)
+        ref = a @ b
+
+        mlir_module = generate_mlir(matmul_full_rhs_slice, [a, b])
+        c = _backend().execute_mlir(
+            mlir_module,
+            a,
+            b,
+            kernel_name="matmul_full_rhs_slice",
+        )
+
+        assert torch.isfinite(c).all()
+        assert _allclose(c, ref)
+
     def test_cpu_only_guard(self, ab_32x32):
         """execute_mlir raises NotImplementedError for non-CPU tensors."""
         A, B = ab_32x32
@@ -226,6 +263,32 @@ class TestDirectCall:
         C_explicit = _backend().execute_mlir(mlir_module, A, B, kernel_name="add_both")
         C_direct = add_both(A, B)
         assert torch.equal(C_explicit, C_direct)
+
+    def test_matmul_full_rhs_slice_direct_regression(self):
+        """Regression: direct MLIR backend call handles full RHS slice matmul."""
+
+        @helion.kernel(static_shapes=True, backend="mlir")
+        def matmul_full_rhs_slice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            assert k == k2
+
+            out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                a_tile = hl.load(x, [tile_m, slice(None)])
+                b_full = hl.load(y, [slice(None), slice(None)])
+                c_tile = a_tile @ b_full
+                hl.store(out, [tile_m, slice(None)], c_tile)
+            return out
+
+        torch.manual_seed(321)
+        a = torch.randn(128, 128)
+        b = torch.randn(128, 128)
+        ref = a @ b
+
+        c = matmul_full_rhs_slice(a, b)
+        assert torch.isfinite(c).all()
+        assert _allclose(c, ref)
 
 
 # ---------------------------------------------------------------------------

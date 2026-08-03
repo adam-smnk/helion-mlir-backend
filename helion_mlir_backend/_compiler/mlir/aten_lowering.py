@@ -323,19 +323,26 @@ def _build_aten_subgraph(
         or "aten.sub.Tensor" in target_name
         or "aten.div.Tensor" in target_name
     ):
-        tensors = list(concrete_tensor_args.values())
-        ranks = {len(t.shape) for t in tensors}
-        if len(ranks) == 1:
-            rank = next(iter(ranks))
-            common_shape = [min(int(t.shape[d]) for t in tensors) for d in range(rank)]
+        target_shape = _compute_broadcast_target_shape(
+            [t for t in concrete_tensor_args.values() if isinstance(t, torch.Tensor)]
+        )
+        if target_shape is None:
+            target_shape = _compute_conservative_common_shape(
+                [
+                    t
+                    for t in concrete_tensor_args.values()
+                    if isinstance(t, torch.Tensor)
+                ]
+            )
+        if target_shape is not None:
             for fx_node, t in list(concrete_tensor_args.items()):
-                if tuple(int(s) for s in t.shape) != tuple(common_shape):
-                    narrowed = torch.zeros(common_shape, dtype=t.dtype)
-                    concrete_tensor_args[fx_node] = narrowed
+                if tuple(int(s) for s in t.shape) != tuple(target_shape):
+                    broadcasted = torch.zeros(target_shape, dtype=t.dtype)
+                    concrete_tensor_args[fx_node] = broadcasted
                     ph = placeholder_map.get(fx_node)
                     if ph is not None:
-                        ph.meta["val"] = narrowed
-                        ph.meta["tensor_meta"] = _tensor_meta(narrowed)
+                        ph.meta["val"] = broadcasted
+                        ph.meta["tensor_meta"] = _tensor_meta(broadcasted)
 
     new_args = []
     for arg in node_args:
@@ -596,6 +603,57 @@ def _fingerprint_literal(value: object) -> object | None:
         return ("list", tuple(parts))
 
     return None
+
+
+def _compute_broadcast_target_shape(tensors: list[torch.Tensor]) -> list[int] | None:
+    """Return the common broadcast shape for tensors, or None if incompatible."""
+    if not tensors:
+        return None
+
+    max_rank = max(len(t.shape) for t in tensors)
+    result_rev: list[int] = []
+
+    for rev_dim in range(max_rank):
+        sizes = []
+        for t in tensors:
+            idx = len(t.shape) - 1 - rev_dim
+            sizes.append(int(t.shape[idx]) if idx >= 0 else 1)
+
+        dim_size = max(sizes)
+        if any(s not in (1, dim_size) for s in sizes):
+            return None
+        result_rev.append(dim_size)
+
+    return list(reversed(result_rev))
+
+
+def _compute_conservative_common_shape(
+    tensors: list[torch.Tensor],
+) -> list[int] | None:
+    """Return a conservative shape by taking per-dimension minimum non-one sizes.
+
+    This is a fallback for stale tile metadata where strict broadcast checks can
+    fail even though runtime tile extents are compatible.
+    """
+    if not tensors:
+        return None
+
+    max_rank = max(len(t.shape) for t in tensors)
+    result_rev: list[int] = []
+
+    for rev_dim in range(max_rank):
+        sizes = []
+        for t in tensors:
+            idx = len(t.shape) - 1 - rev_dim
+            sizes.append(int(t.shape[idx]) if idx >= 0 else 1)
+
+        non_ones = [s for s in sizes if s != 1]
+        if non_ones:
+            result_rev.append(min(non_ones))
+        else:
+            result_rev.append(1)
+
+    return list(reversed(result_rev))
 
 
 def _resolve_shape(
@@ -868,23 +926,28 @@ def _fake_tensor_from_node_meta(
                     i for i, a in enumerate(eval_args) if isinstance(a, torch.Tensor)
                 ]
                 if len(tensor_arg_idxs) >= 2:
-                    ranks = {
-                        len(eval_args[i].shape)
-                        for i in tensor_arg_idxs
-                        if isinstance(eval_args[i], torch.Tensor)
-                    }
-                    if len(ranks) == 1:
-                        rank = next(iter(ranks))
-                        common_shape = [
-                            min(int(eval_args[i].shape[d]) for i in tensor_arg_idxs)
-                            for d in range(rank)
+                    target_shape = _compute_broadcast_target_shape(
+                        [
+                            eval_args[i]
+                            for i in tensor_arg_idxs
+                            if isinstance(eval_args[i], torch.Tensor)
                         ]
+                    )
+                    if target_shape is None:
+                        target_shape = _compute_conservative_common_shape(
+                            [
+                                eval_args[i]
+                                for i in tensor_arg_idxs
+                                if isinstance(eval_args[i], torch.Tensor)
+                            ]
+                        )
+                    if target_shape is not None:
                         for i in tensor_arg_idxs:
                             t = eval_args[i]
                             if isinstance(t, torch.Tensor) and tuple(
                                 int(s) for s in t.shape
-                            ) != tuple(common_shape):
-                                eval_args[i] = torch.zeros(common_shape, dtype=t.dtype)
+                            ) != tuple(target_shape):
+                                eval_args[i] = torch.zeros(target_shape, dtype=t.dtype)
 
         if can_eval:
             try:

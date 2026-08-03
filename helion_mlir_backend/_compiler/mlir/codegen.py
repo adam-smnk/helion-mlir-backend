@@ -550,18 +550,32 @@ class MLIRModuleBuilder:
             # linalg.matmul with the accumulator as the `outs` tensor preserves
             # loop-carried equivalence required by downstream lighthouse passes.
             target_name = str(node.target)
-            if "aten.addmm" in target_name:
+            is_addmm = "aten.addmm" in target_name or tname == "addmm.default"
+            is_add_tensor = "aten.add.Tensor" in target_name or tname == "add.Tensor"
+            is_mm_like = (
+                "aten.mm" in target_name
+                or "aten.matmul" in target_name
+                or tname in ("mm.default", "matmul.default")
+            )
+            is_bmm_like = "aten.bmm" in target_name or tname == "bmm.default"
+            is_baddbmm = "aten.baddbmm" in target_name or tname == "baddbmm.default"
+
+            if is_addmm:
                 lowered_addmm = self._lower_aten_addmm(node)
                 if lowered_addmm is not None:
                     return lowered_addmm
-            if "aten.add.Tensor" in target_name:
+            if is_baddbmm:
+                lowered_baddbmm = self._lower_aten_baddbmm(node)
+                if lowered_baddbmm is not None:
+                    return lowered_baddbmm
+            if is_add_tensor:
                 lowered_add_matmul = self._lower_aten_add_matmul_accumulate(node)
                 if lowered_add_matmul is not None:
                     return lowered_add_matmul
                 lowered_add_tensor = self._lower_aten_add_tensor(node)
                 if lowered_add_tensor is not None:
                     return lowered_add_tensor
-            if "aten.mm" in target_name or "aten.matmul" in target_name:
+            if is_mm_like or is_bmm_like:
                 lowered_matmul = self._lower_aten_matmul(node)
                 if lowered_matmul is not None:
                     return lowered_matmul
@@ -648,8 +662,6 @@ class MLIRModuleBuilder:
         This keeps the reduction update anchored on the loop-carried accumulator,
         which is required by downstream scf.for iter-arg equivalence checks.
         """
-        from mlir.dialects import linalg as linalg_d
-
         from .aten_lowering import normalized_aten_args
 
         args = list(normalized_aten_args(node))
@@ -669,7 +681,13 @@ class MLIRModuleBuilder:
             ):
                 continue
             second_name = str(second.target)
-            if "aten.mm" in second_name or "aten.matmul" in second_name:
+            second_tname = getattr(second.target, "__name__", "")
+            if (
+                "aten.mm" in second_name
+                or "aten.matmul" in second_name
+                or "aten.bmm" in second_name
+                or second_tname in ("mm.default", "matmul.default", "bmm.default")
+            ):
                 acc_node = first
                 matmul_node = second
                 break
@@ -698,7 +716,7 @@ class MLIRModuleBuilder:
         if lhs is None or rhs is None:
             return None
 
-        return linalg_d.matmul(lhs, rhs, outs=[acc])
+        return self._emit_matmul_like(lhs, rhs, out=acc)
 
     def _lower_aten_add_tensor(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower elementwise ``aten.add.Tensor`` directly to ``linalg.generic``."""
@@ -734,11 +752,69 @@ class MLIRModuleBuilder:
         out = tensor_d.EmptyOp(list(lhs_ty.shape), lhs_ty.element_type).result
         return linalg_d.add(lhs, rhs, outs=[out])
 
-    def _lower_aten_matmul(self, node: torch.fx.Node) -> ir.Value | None:
-        """Lower rank-2 ``aten.mm``/``aten.matmul`` directly to ``linalg.matmul``."""
+    def _emit_matmul_like(
+        self,
+        lhs: ir.Value,
+        rhs: ir.Value,
+        out: ir.Value | None = None,
+    ) -> ir.Value | None:
+        """Emit ``linalg.matmul``/``linalg.batch_matmul`` for rank-2/rank-3 operands."""
+        from mlir.dialects import arith as arith_d
         from mlir.dialects import linalg as linalg_d
         from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
 
+        lhs_ty = ir.RankedTensorType(lhs.type)
+        rhs_ty = ir.RankedTensorType(rhs.type)
+        if lhs_ty.element_type != rhs_ty.element_type:
+            return None
+
+        rank_lhs = len(lhs_ty.shape)
+        rank_rhs = len(rhs_ty.shape)
+
+        if rank_lhs == 2 and rank_rhs == 2:
+            if lhs_ty.shape[1] != rhs_ty.shape[0]:
+                return None
+            out_shape = [int(lhs_ty.shape[0]), int(rhs_ty.shape[1])]
+            out_rank = 2
+            op = "matmul"
+        elif rank_lhs == 3 and rank_rhs == 3:
+            if lhs_ty.shape[0] != rhs_ty.shape[0] or lhs_ty.shape[2] != rhs_ty.shape[1]:
+                return None
+            out_shape = [
+                int(lhs_ty.shape[0]),
+                int(lhs_ty.shape[1]),
+                int(rhs_ty.shape[2]),
+            ]
+            out_rank = 3
+            op = "batch_matmul"
+        else:
+            return None
+
+        if out is None:
+            out = tensor_d.EmptyOp(out_shape, lhs_ty.element_type).result
+            elem_ty = lhs_ty.element_type
+            if isinstance(elem_ty, ir.FloatType):
+                zero_attr = ir.FloatAttr.get(elem_ty, 0.0)
+            elif isinstance(elem_ty, ir.IntegerType):
+                zero_attr = ir.IntegerAttr.get(elem_ty, 0)
+            else:
+                return None
+            zero_val = arith_d.ConstantOp(elem_ty, zero_attr).result
+            out = linalg_d.fill(zero_val, outs=[out])
+        else:
+            out_ty = ir.RankedTensorType(out.type)
+            if out_ty.element_type != lhs_ty.element_type:
+                return None
+            if len(out_ty.shape) != out_rank or list(out_ty.shape) != out_shape:
+                return None
+
+        if op == "matmul":
+            return linalg_d.matmul(lhs, rhs, outs=[out])
+        return linalg_d.batch_matmul(lhs, rhs, outs=[out])
+
+    def _lower_aten_matmul(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower ``aten.mm``/``aten.matmul``/``aten.bmm`` directly to linalg matmul ops."""
         from .aten_lowering import normalized_aten_args
 
         args = list(normalized_aten_args(node))
@@ -750,20 +826,28 @@ class MLIRModuleBuilder:
         if lhs is None or rhs is None:
             return None
 
-        import mlir.ir as ir
+        return self._emit_matmul_like(lhs, rhs)
 
-        lhs_ty = ir.RankedTensorType(lhs.type)
-        rhs_ty = ir.RankedTensorType(rhs.type)
-        if len(lhs_ty.shape) != 2 or len(rhs_ty.shape) != 2:
-            return None
-        if lhs_ty.shape[1] != rhs_ty.shape[0]:
-            return None
-        if lhs_ty.element_type != rhs_ty.element_type:
+    def _lower_aten_baddbmm(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower ``aten.baddbmm`` to ``linalg.batch_matmul`` when compatible."""
+        from .aten_lowering import normalized_aten_args
+
+        args = list(normalized_aten_args(node))
+        if len(args) < 3:
             return None
 
-        out_shape = [int(lhs_ty.shape[0]), int(rhs_ty.shape[1])]
-        out = tensor_d.EmptyOp(out_shape, lhs_ty.element_type).result
-        return linalg_d.matmul(lhs, rhs, outs=[out])
+        acc = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
+        lhs = self._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
+        rhs = self._get_value(args[2]) if isinstance(args[2], torch.fx.Node) else None
+        if acc is None or lhs is None or rhs is None:
+            return None
+
+        beta = args[3] if len(args) > 3 else 1
+        alpha = args[4] if len(args) > 4 else 1
+        if beta != 1 or alpha != 1:
+            return None
+
+        return self._emit_matmul_like(lhs, rhs, out=acc)
 
     def _lower_aten_relu(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower ``aten.relu`` directly to elementwise ``linalg.generic``."""
@@ -1528,10 +1612,12 @@ class MLIRModuleBuilder:
                 break
             forced = dim in forced_dim_block_id
             block_id = self._infer_block_id_from_index(idx_node, sym_to_block_id)
+            allow_fallback_inference = isinstance(idx_node, torch.fx.Node)
             if forced:
                 block_id = forced_dim_block_id[dim]
             if (
-                block_id is None
+                allow_fallback_inference
+                and block_id is None
                 and result_sizes is not None
                 and dim < len(result_sizes)
             ):
@@ -1546,7 +1632,7 @@ class MLIRModuleBuilder:
                 ]
                 if len(matching) == 1:
                     block_id = matching[0]
-            if block_id is None:
+            if allow_fallback_inference and block_id is None:
                 dim_extent = int(tensor_type.shape[dim])
                 candidates = [
                     bid
@@ -1680,10 +1766,21 @@ class MLIRModuleBuilder:
             for node in graph_info.graph.nodes:
                 if is_aten_op(node):
                     target_name = str(node.target)
+                    target_overload = getattr(node.target, "__name__", "")
                     if (
                         "aten.addmm" in target_name
                         or "aten.mm" in target_name
                         or "aten.matmul" in target_name
+                        or "aten.bmm" in target_name
+                        or "aten.baddbmm" in target_name
+                        or target_overload
+                        in (
+                            "addmm.default",
+                            "mm.default",
+                            "matmul.default",
+                            "bmm.default",
+                            "baddbmm.default",
+                        )
                     ):
                         # These are lowered directly in codegen.
                         continue
@@ -1753,24 +1850,56 @@ class MLIRModuleBuilder:
                         if isinstance(a, torch.Tensor)
                     ]
                     if len(tensor_arg_idxs) >= 2:
-                        ranks = {
+                        max_rank = max(
                             len(eval_args[i].shape)
                             for i in tensor_arg_idxs
                             if isinstance(eval_args[i], torch.Tensor)
-                        }
-                        if len(ranks) == 1:
-                            rank = next(iter(ranks))
-                            common_shape = [
-                                min(int(eval_args[i].shape[d]) for i in tensor_arg_idxs)
-                                for d in range(rank)
-                            ]
+                        )
+                        target_shape_rev: list[int] = []
+                        compatible = True
+                        for rev_dim in range(max_rank):
+                            dim_sizes = []
+                            for i in tensor_arg_idxs:
+                                t = eval_args[i]
+                                if not isinstance(t, torch.Tensor):
+                                    continue
+                                idx = len(t.shape) - 1 - rev_dim
+                                dim_sizes.append(int(t.shape[idx]) if idx >= 0 else 1)
+                            dim_size = max(dim_sizes)
+                            if any(s not in (1, dim_size) for s in dim_sizes):
+                                compatible = False
+                                break
+                            target_shape_rev.append(dim_size)
+
+                        target_shape: list[int] | None = None
+                        if compatible:
+                            target_shape = list(reversed(target_shape_rev))
+                        else:
+                            conservative_rev: list[int] = []
+                            for rev_dim in range(max_rank):
+                                dim_sizes = []
+                                for i in tensor_arg_idxs:
+                                    t = eval_args[i]
+                                    if not isinstance(t, torch.Tensor):
+                                        continue
+                                    idx = len(t.shape) - 1 - rev_dim
+                                    dim_sizes.append(
+                                        int(t.shape[idx]) if idx >= 0 else 1
+                                    )
+                                non_ones = [s for s in dim_sizes if s != 1]
+                                conservative_rev.append(
+                                    min(non_ones) if non_ones else 1
+                                )
+                            target_shape = list(reversed(conservative_rev))
+
+                        if target_shape is not None:
                             for i in tensor_arg_idxs:
                                 t = eval_args[i]
                                 if isinstance(t, torch.Tensor) and tuple(
                                     int(s) for s in t.shape
-                                ) != tuple(common_shape):
+                                ) != tuple(target_shape):
                                     eval_args[i] = torch.zeros(
-                                        common_shape, dtype=t.dtype
+                                        target_shape, dtype=t.dtype
                                     )
 
                 eval_kwargs: dict[str, object] = {}
