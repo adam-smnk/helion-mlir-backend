@@ -5,9 +5,13 @@ import helion.language as hl
 import torch
 from torch import Tensor
 
+import helion_mlir_backend  # noqa: F401
+
 
 @helion.kernel(
     static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[16, 8, 32]),
 )
 def matmul(
     x: Tensor,
@@ -34,3 +38,8 @@ def matmul(
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
     return out
+
+
+A = torch.randn(64, 64)
+B = torch.randn(64, 48)
+matmul(A, B)

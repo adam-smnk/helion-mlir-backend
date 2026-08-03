@@ -128,6 +128,10 @@ class MLIRModuleBuilder:
         self._param_to_value: dict[str, ir.Value] = {}
         # Maps block_id → concrete integer size
         self._block_id_to_size: dict[int, int] = {}
+        # hint_value → block_id; last resort for concretized SymInts
+        self._block_hint_to_id: dict[int, int] = {}
+        # id(sympy.Symbol) → block_id; stable identity via cached sympy symbols
+        self._block_symint_to_id: dict[int, int] = {}
         # Maps block_id → current MLIR offset Value (loop IV)
         self._block_id_to_iv: dict[int, ir.Value] = {}
         # Stack of pending insert_slice ops collected inside forall.in_parallel
@@ -177,7 +181,7 @@ class MLIRModuleBuilder:
                 module = ir.Module.create()
                 self._mlir_module = module
                 self._mlir_context = ctx
-                with ir.InsertionPoint(module.body):
+                with ir.InsertionPoint(module.body), self.hf:
                     # Resolve block sizes first (needed by both phases).
                     self._resolve_block_sizes()
                     # Phase 1: lower all ATen nodes once, insert helpers at
@@ -249,9 +253,10 @@ class MLIRModuleBuilder:
 
             # Block sizes are pre-resolved in build() before this call.
             # Only resolve here if they haven't been populated yet (e.g. in
-            # tests that call _build_function() directly).
+            # tests that call _build_function() directly, without HostFunction).
             if not self._block_id_to_size:
-                self._resolve_block_sizes()
+                with self.hf:
+                    self._resolve_block_sizes()
 
             # Build the kernel body
             result = self._build_kernel_body(out_tensor)
@@ -296,20 +301,44 @@ class MLIRModuleBuilder:
         return tensor_params[-1]
 
     def _resolve_block_sizes(self) -> None:
-        """Populate ``_block_id_to_size`` from ``env.block_sizes``."""
+        """Populate ``_block_id_to_size`` and SymInt identity maps from the config."""
         for bs in self.env.block_sizes:
-            size = bs.size
+            # from_config requires HostFunction.current() — active via `with self.hf:`.
+            config_val = bs.from_config(self.config)
+            size = config_val if config_val is not None else bs.size
             if isinstance(size, torch.SymInt):
-                # With static_shapes=True the SymInt should resolve to a
-                # concrete value via the shape env.
                 try:
                     size = int(size)
                 except Exception:
                     log.warning("block_id %d has dynamic size %s", bs.block_id, size)
-                    size = -1  # unknown; will cause issues later
+                    size = -1
             else:
                 size = int(size)
             self._block_id_to_size[bs.block_id] = size
+
+        # Build hint-value → block_id by scanning _get_symnode nodes.
+        import contextlib
+
+        for graph_info in self.hf.device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                tname = getattr(node.target, "__name__", "")
+                if tname == "_get_symnode" and node.args:
+                    key = node.args[0]
+                    if isinstance(key, str) and "block_size_" in key:
+                        block_id = int(key.split("_")[-1])
+                        val = node.meta.get("val")
+                        if val is not None and block_id in self._block_id_to_size:
+                            # Use sympy Symbol identity — stable because sympy caches symbols.
+                            if isinstance(val, torch.SymInt):
+                                import sympy as _sympy
+
+                                expr = getattr(getattr(val, "node", None), "expr", None)
+                                if isinstance(expr, _sympy.Symbol):
+                                    self._block_symint_to_id[id(expr)] = block_id
+                            with contextlib.suppress(TypeError, ValueError):
+                                self._block_hint_to_id[int(val)] = block_id
 
     # ------------------------------------------------------------------
     # Kernel body – outer forall structure
@@ -472,6 +501,15 @@ class MLIRModuleBuilder:
             if tname in ("sym_size.int", "sym_size_int"):
                 return self._lower_sym_size(node)
 
+            # Special-case addmm in nested reductions: lowering directly to
+            # linalg.matmul with the accumulator as the `outs` tensor preserves
+            # loop-carried equivalence required by downstream lighthouse passes.
+            target_name = str(node.target)
+            if "aten.addmm" in target_name:
+                lowered_addmm = self._lower_aten_addmm(node)
+                if lowered_addmm is not None:
+                    return lowered_addmm
+
             # --- All standard ATen ops → pre-built linalg helper (func.call) ---
             from mlir.dialects import func as func_d
 
@@ -511,6 +549,29 @@ class MLIRModuleBuilder:
             )
 
         return None
+
+    def _lower_aten_addmm(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower ``aten.addmm`` directly to ``linalg.matmul`` when possible."""
+        from mlir.dialects import linalg as linalg_d
+
+        from .aten_lowering import normalized_aten_args
+
+        args = list(normalized_aten_args(node))
+        if len(args) < 3:
+            return None
+
+        acc = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
+        lhs = self._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
+        rhs = self._get_value(args[2]) if isinstance(args[2], torch.fx.Node) else None
+        if acc is None or lhs is None or rhs is None:
+            return None
+
+        beta = args[3] if len(args) > 3 else 1
+        alpha = args[4] if len(args) > 4 else 1
+        if beta != 1 or alpha != 1:
+            return None
+
+        return linalg_d.matmul(lhs, rhs, outs=[acc])
 
     def _lower_call_method(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower selected Tensor call-method ops.
@@ -680,8 +741,46 @@ class MLIRModuleBuilder:
                         if block_id in self._block_id_to_size:
                             shape.append(self._block_id_to_size[block_id])
                             continue
+                if tname in ("sym_size.int", "sym_size_int") and len(s.args) >= 2:
+                    tensor_arg = s.args[0]
+                    dim_arg = s.args[1]
+                    if isinstance(tensor_arg, torch.fx.Node) and isinstance(
+                        dim_arg, int
+                    ):
+                        tval = tensor_arg.meta.get("val")
+                        if isinstance(tval, torch.Tensor):
+                            from .aten_lowering import (
+                                _resolve_shape as _aten_resolve_shape,
+                            )
+
+                            resolved = _aten_resolve_shape(
+                                tval,
+                                self._block_id_to_size,
+                                self._block_hint_to_id,
+                                self._block_symint_to_id,
+                            )
+                            if 0 <= dim_arg < len(resolved):
+                                shape.append(resolved[dim_arg])
+                                continue
                 # Fall back: use meta["val"] if it's concrete
                 val = s.meta.get("val")
+                if isinstance(val, torch.SymInt):
+                    import sympy as _sympy
+
+                    sym = str(val)
+                    if sym.startswith("u") and sym[1:].isdigit():
+                        block_id = int(sym[1:])
+                        if block_id in self._block_id_to_size:
+                            shape.append(self._block_id_to_size[block_id])
+                            continue
+                    expr = getattr(getattr(val, "node", None), "expr", None)
+                    if isinstance(expr, _sympy.Symbol):
+                        sym2 = str(expr)
+                        if sym2.startswith("u") and sym2[1:].isdigit():
+                            block_id = int(sym2[1:])
+                            if block_id in self._block_id_to_size:
+                                shape.append(self._block_id_to_size[block_id])
+                                continue
                 if val is not None:
                     try:
                         shape.append(int(val))
@@ -908,6 +1007,18 @@ class MLIRModuleBuilder:
         )
         block_id = block_ids[0]
         ub = int(upper_bounds[0])
+        # Nested loops can sometimes reuse an outer block_id in FX metadata.
+        # If that happens, pick a non-active block whose configured size best
+        # matches this loop upper bound.
+        if block_id in self._block_id_to_iv:
+            candidates = [
+                bid
+                for bid, size in self._block_id_to_size.items()
+                if bid not in self._block_id_to_iv and size > 0 and ub % size == 0
+            ]
+            if candidates:
+                block_id = max(candidates, key=lambda bid: self._block_id_to_size[bid])
+
         step = self._block_id_to_size.get(block_id, ub)
 
         # Build iter_args list.
@@ -1005,18 +1116,53 @@ class MLIRModuleBuilder:
 
         # Build a mapping from sympy symbol string (e.g. "u0") → block_id.
         sym_to_block_id = self._build_sym_to_block_id()
+        used_block_ids: set[int] = set()
+
+        # Derive tile sizes from the load result's meta — identical source to
+        # what preprocess_aten_nodes uses, guaranteeing consistent shapes.
+        from .aten_lowering import _resolve_shape as _aten_resolve_shape
+
+        result_val = node.meta.get("val")
+        result_sizes: list[int] | None = None
+        if isinstance(result_val, torch.Tensor):
+            result_sizes = _aten_resolve_shape(
+                result_val,
+                self._block_id_to_size,
+                self._block_hint_to_id,
+                self._block_symint_to_id,
+            )
 
         for dim, idx_node in enumerate(index_nodes):
             if dim >= ndim:
                 break
             block_id = self._infer_block_id_from_index(idx_node, sym_to_block_id)
+            if (
+                block_id is None
+                and result_sizes is not None
+                and dim < len(result_sizes)
+            ):
+                # Fallback: infer IV by matching this tile dimension size to
+                # exactly one active block size in the current loop nest.
+                dim_size = result_sizes[dim]
+                matching = [
+                    bid
+                    for bid in self._block_id_to_iv
+                    if self._block_id_to_size.get(bid) == dim_size
+                    and bid not in used_block_ids
+                ]
+                if len(matching) == 1:
+                    block_id = matching[0]
             if block_id is not None and block_id in self._block_id_to_iv:
                 offsets.append(self._block_id_to_iv[block_id])
+                used_block_ids.add(block_id)
             else:
                 # No IV registered → offset is 0.
                 offsets.append(self._get_index_const(0))
-            # Size = concrete block size.
-            if block_id is not None:
+            # Size: prefer result shape (same as ATen helper signatures),
+            # then block_id lookup, then full tensor dimension as last resort.
+            if result_sizes is not None and dim < len(result_sizes):
+                sizes.append(result_sizes[dim])
+            elif block_id is not None:
                 sizes.append(
                     self._block_id_to_size.get(block_id, int(tensor_type.shape[dim]))
                 )
@@ -1079,6 +1225,13 @@ class MLIRModuleBuilder:
         from .aten_lowering import is_aten_op
         from .aten_lowering import preprocess_aten_nodes
 
+        # Propagate symbolic shapes from outer _for_loop iter-args into inner
+        # loop body placeholders BEFORE scanning ATen nodes.  Without this,
+        # placeholder shapes in nested loop bodies are evaluated to their hint
+        # values (e.g. both tile_m and tile_n evaluate to 64), making them
+        # indistinguishable when resolving block_ids in _resolve_shape.
+        self._restore_symbolic_shapes_in_bodies()
+
         aten_nodes: list[torch.fx.Node] = []
         for graph_info in self.hf.device_ir.graphs:
             for node in graph_info.graph.nodes:
@@ -1089,8 +1242,138 @@ class MLIRModuleBuilder:
             return
 
         self._node_to_aten_func = preprocess_aten_nodes(
-            aten_nodes, module, self._block_id_to_size
+            aten_nodes,
+            module,
+            self._block_id_to_size,
+            self._block_hint_to_id,
+            self._block_symint_to_id,
         )
+
+    def _restore_symbolic_shapes_in_bodies(self) -> None:
+        """Copy symbolic meta['val'] from outer iter-args into inner body placeholders.
+
+        Inside a ``_for_loop`` body graph, placeholder meta may be evaluated to
+        hint integers instead of keeping the original symbolic SymInts (e.g.
+        str='u0').  Restoring them ensures _resolve_shape can distinguish blocks
+        by symbolic name rather than falling back to ambiguous hint values.
+
+        Additionally registers the iter-arg tensor's SymInt shape dimensions in
+        ``_block_symint_to_id`` so identity-based lookup works even when the
+        acc tensor's SymInts are different objects from the _get_symnode ones.
+        """
+        for graph_info in self.hf.device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if getattr(node.target, "__name__", "") != "_for_loop":
+                    continue
+                body_graph_id: int = node.args[0]
+                iter_arg_outer_nodes = list(node.args[3])  # outer-scope FX nodes
+                body_graph = self.hf.device_ir.graphs[body_graph_id].graph
+                body_phs = [n for n in body_graph.nodes if n.op == "placeholder"]
+                for ph, outer_node in zip(body_phs, iter_arg_outer_nodes, strict=False):
+                    if not isinstance(outer_node, torch.fx.Node):
+                        continue
+                    outer_val = outer_node.meta.get("val")
+                    if not isinstance(outer_val, torch.Tensor):
+                        continue
+                    # Register the outer tensor's SymInt shape dimensions so
+                    # _resolve_shape can match them by identity.  Match each
+                    # shape dimension to its block_id via the outer node's
+                    # shape-arg nodes (e.g. _get_symnode("block_size_0")).
+                    shape_arg = outer_node.args[0] if outer_node.args else None
+                    if isinstance(shape_arg, (list, tuple)):
+                        for i, shape_node in enumerate(shape_arg):
+                            if (
+                                isinstance(shape_node, torch.fx.Node)
+                                and getattr(shape_node.target, "__name__", "")
+                                == "_get_symnode"
+                                and shape_node.args
+                                and isinstance(shape_node.args[0], str)
+                                and "block_size_" in shape_node.args[0]
+                                and i < len(outer_val.shape)
+                            ):
+                                block_id = int(shape_node.args[0].split("_")[-1])
+                                dim_symint = outer_val.shape[i]
+                                if isinstance(dim_symint, torch.SymInt):
+                                    import sympy as _sympy
+
+                                    expr = getattr(
+                                        getattr(dim_symint, "node", None), "expr", None
+                                    )
+                                    if isinstance(expr, _sympy.Symbol):
+                                        self._block_symint_to_id[id(expr)] = block_id
+                    # Build a concrete-shaped fake tensor using config block sizes.
+                    # This replaces the ambiguous symbolic meta so _resolve_shape
+                    # sees plain Python integers and maps them correctly.
+                    if isinstance(shape_arg, (list, tuple)):
+                        concrete_shape = self._shape_from_nodes(
+                            list(shape_arg), "iter_arg"
+                        )
+                        concrete_val = torch.zeros(
+                            concrete_shape, dtype=outer_val.dtype
+                        )
+                        ph.meta["val"] = concrete_val
+                        # Propagate to _new_var aliases and update all nodes that
+                        # derive their shape from the placeholder (sym_size.int, loads).
+                        for body_node in body_graph.nodes:
+                            if body_node.op != "call_function":
+                                continue
+                            tname = getattr(body_node.target, "__name__", "")
+                            if (
+                                tname == "_new_var"
+                                and body_node.args
+                                and body_node.args[0] is ph
+                            ):
+                                body_node.meta["val"] = concrete_val
+                            elif tname in ("sym_size.int", "sym_size_int"):
+                                tensor_arg = (
+                                    body_node.args[0] if body_node.args else None
+                                )
+                                dim_arg = (
+                                    body_node.args[1]
+                                    if len(body_node.args) > 1
+                                    else None
+                                )
+                                if (
+                                    tensor_arg is ph
+                                    and isinstance(dim_arg, int)
+                                    and dim_arg < len(concrete_shape)
+                                ):
+                                    body_node.meta["val"] = concrete_shape[dim_arg]
+                            elif tname == "load":
+                                # Recompute load result shape using _shape_from_nodes
+                                # so extract_slice sizes match the config values.
+                                load_index_nodes = (
+                                    body_node.args[1]
+                                    if len(body_node.args) > 1
+                                    else None
+                                )
+                                if load_index_nodes is not None:
+                                    try:
+                                        load_shape = self._shape_from_nodes(
+                                            list(load_index_nodes), "load"
+                                        )
+                                        old_val = body_node.meta.get("val")
+                                        if isinstance(old_val, torch.Tensor) and len(
+                                            load_shape
+                                        ) == len(old_val.shape):
+                                            body_node.meta["val"] = torch.zeros(
+                                                load_shape, dtype=old_val.dtype
+                                            )
+                                    except Exception:
+                                        pass
+                    else:
+                        ph.meta["val"] = outer_val
+                        for body_node in body_graph.nodes:
+                            if (
+                                body_node.op == "call_function"
+                                and getattr(body_node.target, "__name__", "")
+                                == "_new_var"
+                                and body_node.args
+                                and body_node.args[0] is ph
+                            ):
+                                body_node.meta["val"] = outer_val
 
     # ------------------------------------------------------------------
     # Helper: infer block_id from an index FX node
@@ -1120,22 +1403,32 @@ class MLIRModuleBuilder:
         if val is None:
             return None
         if isinstance(val, torch.SymInt):
-            # The symbol name is embedded in the node representation.
-            sym_str = str(val)  # e.g. "u0" or "128" (if concrete)
+            sym_str = str(val)
             if sym_str in sym_to_block_id:
                 return sym_to_block_id[sym_str]
-            # Try to match via the block_size_N naming of _get_symnode nodes.
-            # If the FX node's creator is _get_symnode, extract N.
+            # Fallback for cases where symbol strings are unavailable/rewritten.
+            import sympy as _sympy
+
+            val_expr = getattr(getattr(val, "node", None), "expr", None)
+            if (
+                isinstance(val_expr, _sympy.Symbol)
+                and id(val_expr) in self._block_symint_to_id
+            ):
+                return self._block_symint_to_id[id(val_expr)]
             if hasattr(idx_node, "target"):
                 tname = getattr(idx_node.target, "__name__", "")
                 if tname == "_get_symnode" and idx_node.args:
                     key = idx_node.args[0]
                     if isinstance(key, str) and "block_size_" in key:
                         return int(key.split("_")[-1])
+            try:
+                hint_val = int(val)
+                if hint_val in self._block_hint_to_id:
+                    return self._block_hint_to_id[hint_val]
+            except (TypeError, ValueError):
+                pass
         # For sym_size.int nodes the val is a SymInt too.
         if isinstance(val, torch.SymInt):
-            # Fallback: check if the node is computing a shape dimension of a
-            # tensor that has a known block_id mapping.
             tname = getattr(idx_node.target, "__name__", "")
             if tname in ("sym_size.int", "sym_size_int"):
                 tensor_node = idx_node.args[0]
@@ -1148,7 +1441,21 @@ class MLIRModuleBuilder:
                 if isinstance(tensor_val, torch.Tensor):
                     shape_val = tensor_val.shape[dim_idx]
                     if isinstance(shape_val, torch.SymInt):
+                        sv_expr = getattr(
+                            getattr(shape_val, "node", None), "expr", None
+                        )
+                        if (
+                            isinstance(sv_expr, _sympy.Symbol)
+                            and id(sv_expr) in self._block_symint_to_id
+                        ):
+                            return self._block_symint_to_id[id(sv_expr)]
                         sym_str = str(shape_val)
                         if sym_str in sym_to_block_id:
                             return sym_to_block_id[sym_str]
+                        try:
+                            hint_val = int(shape_val)
+                            if hint_val in self._block_hint_to_id:
+                                return self._block_hint_to_id[hint_val]
+                        except (TypeError, ValueError):
+                            pass
         return None

@@ -78,6 +78,8 @@ def preprocess_aten_nodes(
     aten_nodes: list[torch.fx.Node],
     mlir_module: ir.Module,
     block_id_to_size: dict[int, int] | None = None,
+    block_hint_to_id: dict[int, int] | None = None,
+    block_symint_to_id: dict[int, int] | None = None,
 ) -> dict[int, tuple[str, list[ir.Type]]]:
     """Lower *all* ATen nodes in a single torch-mlir pipeline pass.
 
@@ -108,7 +110,12 @@ def preprocess_aten_nodes(
         return {}
 
     # --- Phase 1: build one torch_mlir module with all ATen subgraphs ------
-    ir_text, name_map = _batch_import_and_lower(aten_nodes, block_id_to_size or {})
+    ir_text, name_map = _batch_import_and_lower(
+        aten_nodes,
+        block_id_to_size or {},
+        block_hint_to_id or {},
+        block_symint_to_id or {},
+    )
 
     # --- Phase 2: parse into our mlir.ir context ----------------------------
     helper_mod = ir.Module.parse(ir_text)
@@ -149,6 +156,8 @@ def preprocess_aten_nodes(
 def _batch_import_and_lower(
     aten_nodes: list[torch.fx.Node],
     block_id_to_size: dict[int, int],
+    block_hint_to_id: dict[int, int] | None = None,
+    block_symint_to_id: dict[int, int] | None = None,
 ) -> tuple[str, dict[int, str]]:
     """Build and lower all ATen subgraphs in one torch-mlir pipeline pass.
 
@@ -179,7 +188,9 @@ def _batch_import_and_lower(
         func_name = f"_aten_{next_func_idx}"
         next_func_idx += 1
         try:
-            graph, _ = _build_aten_subgraph(node, block_id_to_size)
+            graph, _ = _build_aten_subgraph(
+                node, block_id_to_size, block_hint_to_id or {}, block_symint_to_id or {}
+            )
             imp.import_stateless_graph(graph, func_name=func_name)
             name_map[id(node)] = func_name
             if fingerprint is not None:
@@ -227,6 +238,8 @@ def _batch_import_and_lower(
 def _build_aten_subgraph(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int] | None = None,
+    block_hint_to_id: dict[int, int] | None = None,
+    block_symint_to_id: dict[int, int] | None = None,
 ) -> tuple[torch.fx.Graph, list[int]]:
     """Build a minimal ``torch.fx.Graph`` for a single ATen node.
 
@@ -238,16 +251,23 @@ def _build_aten_subgraph(
     g = torch.fx.Graph()
     node_args = _normalize_aten_args(node)
     placeholder_map: dict[torch.fx.Node, torch.fx.Node] = {}
+    concrete_tensor_args: dict[torch.fx.Node, torch.Tensor] = {}
     tensor_positions: list[int] = []
 
     for i, arg in enumerate(node_args):
         if isinstance(arg, torch.fx.Node):
-            concrete_val = _fake_tensor_from_node_meta(arg, block_id_to_size or {})
+            concrete_val = _fake_tensor_from_node_meta(
+                arg,
+                block_id_to_size or {},
+                block_hint_to_id or {},
+                block_symint_to_id or {},
+            )
             if concrete_val is not None:
                 ph = g.placeholder(f"arg{i}")
                 ph.meta["val"] = concrete_val
                 ph.meta["tensor_meta"] = _tensor_meta(concrete_val)
                 placeholder_map[arg] = ph
+                concrete_tensor_args[arg] = concrete_val
                 tensor_positions.append(i)
 
     new_args = []
@@ -284,32 +304,98 @@ def _build_aten_subgraph(
 
     aten_node = g.call_function(node.target, tuple(new_args), new_kwargs)
 
-    result_val = node.meta.get("val")
-    if isinstance(result_val, torch.Tensor):
-        concrete_result = torch.zeros(
-            _resolve_shape(result_val, block_id_to_size or {}),
-            dtype=result_val.dtype,
-        )
+    # Prefer an eval-based concrete result shape when possible. FX result
+    # metadata for nested tile loops can be stale/ambiguous for SymInt dims.
+    concrete_result = _try_evaluate_aten_result(node, node_args, concrete_tensor_args)
+
+    if concrete_result is None:
+        result_val = node.meta.get("val")
+        if isinstance(result_val, torch.Tensor):
+            concrete_result = torch.zeros(
+                _resolve_shape(
+                    result_val,
+                    block_id_to_size or {},
+                    block_hint_to_id or {},
+                    block_symint_to_id or {},
+                ),
+                dtype=result_val.dtype,
+            )
+        elif isinstance(result_val, (list, tuple)):
+            for rv in result_val:
+                if isinstance(rv, torch.Tensor):
+                    concrete_result = torch.zeros(
+                        _resolve_shape(
+                            rv,
+                            block_id_to_size or {},
+                            block_hint_to_id or {},
+                            block_symint_to_id or {},
+                        ),
+                        dtype=rv.dtype,
+                    )
+                    break
+        else:
+            concrete_result = _fake_tensor_from_node_meta(
+                node,
+                block_id_to_size or {},
+                block_hint_to_id or {},
+                block_symint_to_id or {},
+            )
+
+    if concrete_result is not None:
         aten_node.meta["val"] = concrete_result
         aten_node.meta["tensor_meta"] = _tensor_meta(concrete_result)
-    elif isinstance(result_val, (list, tuple)):
-        for rv in result_val:
-            if isinstance(rv, torch.Tensor):
-                concrete_rv = torch.zeros(
-                    _resolve_shape(rv, block_id_to_size or {}),
-                    dtype=rv.dtype,
-                )
-                aten_node.meta["val"] = concrete_rv
-                aten_node.meta["tensor_meta"] = _tensor_meta(concrete_rv)
-                break
-    else:
-        concrete_result = _fake_tensor_from_node_meta(node, block_id_to_size or {})
-        if concrete_result is not None:
-            aten_node.meta["val"] = concrete_result
-            aten_node.meta["tensor_meta"] = _tensor_meta(concrete_result)
 
     g.output((aten_node,))
     return g, tensor_positions
+
+
+def _try_evaluate_aten_result(
+    node: torch.fx.Node,
+    normalized_args: tuple[object, ...],
+    concrete_tensor_args: dict[torch.fx.Node, torch.Tensor],
+) -> torch.Tensor | None:
+    """Attempt to evaluate one ATen op on fake concrete inputs for shape inference."""
+    eval_args: list[object] = []
+    for arg in normalized_args:
+        if isinstance(arg, torch.fx.Node):
+            if arg in concrete_tensor_args:
+                eval_args.append(concrete_tensor_args[arg])
+            else:
+                literal = _resolve_fx_literal(arg)
+                if literal is _MISSING_LITERAL:
+                    return None
+                eval_args.append(literal)
+        else:
+            eval_args.append(arg)
+
+    eval_kwargs: dict[str, object] = {}
+    for k, v in node.kwargs.items():
+        if isinstance(v, torch.fx.Node):
+            if v in concrete_tensor_args:
+                eval_kwargs[k] = concrete_tensor_args[v]
+            else:
+                literal = _resolve_fx_literal(v)
+                if literal is _MISSING_LITERAL:
+                    return None
+                eval_kwargs[k] = literal
+        else:
+            eval_kwargs[k] = v
+
+    try:
+        with torch.no_grad():
+            out = node.target(*eval_args, **eval_kwargs)
+    except Exception:
+        return None
+
+    if isinstance(out, torch.Tensor):
+        return torch.zeros(tuple(int(d) for d in out.shape), dtype=out.dtype)
+
+    if isinstance(out, (list, tuple)):
+        for v in out:
+            if isinstance(v, torch.Tensor):
+                return torch.zeros(tuple(int(d) for d in v.shape), dtype=v.dtype)
+
+    return None
 
 
 def _aten_node_fingerprint(
@@ -442,23 +528,46 @@ def _fingerprint_literal(value: object) -> object | None:
     return None
 
 
-def _resolve_shape(t: torch.Tensor, block_id_to_size: dict[int, int]) -> list[int]:
-    """Return the concrete shape of *t*, resolving SymInt dims via *block_id_to_size*.
+def _resolve_shape(
+    t: torch.Tensor,
+    block_id_to_size: dict[int, int],
+    block_hint_to_id: dict[int, int] | None = None,
+    block_symint_to_id: dict[int, int] | None = None,
+) -> list[int]:
+    """Return the concrete shape of *t*, resolving SymInt dims via *block_id_to_size*."""
+    import sympy
 
-    SymInt dimensions have string representations like ``"u0"``, ``"u1"``…
-    where the number is the helion block_id.  We map that to the concrete
-    block size so the helper function uses the same static shapes that
-    ``_lower_load`` will produce for the corresponding ``tensor.extract_slice``.
-    """
     result = []
     for d in t.shape:
         if isinstance(d, torch.SymInt):
-            sym = str(d)  # e.g. "u0", "u1", "u2"
+            sym = str(d)
             if sym.startswith("u") and sym[1:].isdigit():
                 block_id = int(sym[1:])
                 if block_id in block_id_to_size:
                     result.append(block_id_to_size[block_id])
                     continue
+            expr = getattr(getattr(d, "node", None), "expr", None)
+            if isinstance(expr, sympy.Symbol):
+                sym2 = str(expr)
+                if sym2.startswith("u") and sym2[1:].isdigit():
+                    block_id = int(sym2[1:])
+                    if block_id in block_id_to_size:
+                        result.append(block_id_to_size[block_id])
+                        continue
+            # Fallback: identity-based mapping when symbolic names are not usable.
+            if block_symint_to_id:
+                expr = getattr(getattr(d, "node", None), "expr", None)
+                if isinstance(expr, sympy.Symbol) and id(expr) in block_symint_to_id:
+                    result.append(block_id_to_size[block_symint_to_id[id(expr)]])
+                    continue
+            if block_hint_to_id:
+                try:
+                    hint_val = int(d)
+                    if hint_val in block_hint_to_id:
+                        result.append(block_id_to_size[block_hint_to_id[hint_val]])
+                        continue
+                except (TypeError, ValueError):
+                    pass
         result.append(int(d))
     return result
 
@@ -519,11 +628,15 @@ def _resolve_fx_literal(node: torch.fx.Node) -> object:
 def _fake_tensor_from_node_meta(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int],
+    block_hint_to_id: dict[int, int] | None = None,
+    block_symint_to_id: dict[int, int] | None = None,
 ) -> torch.Tensor | None:
     """Construct a concrete fake tensor from ``node.meta`` when possible."""
     val = node.meta.get("val")
     if isinstance(val, torch.Tensor):
-        shape = _resolve_shape(val, block_id_to_size)
+        shape = _resolve_shape(
+            val, block_id_to_size, block_hint_to_id, block_symint_to_id
+        )
         return torch.zeros(shape, dtype=val.dtype)
 
     tmeta = node.meta.get("tensor_meta")
@@ -535,14 +648,21 @@ def _fake_tensor_from_node_meta(
     if dtype is None or shape is None:
         return None
 
-    concrete_shape = _resolve_dims(shape, block_id_to_size)
+    concrete_shape = _resolve_dims(
+        shape, block_id_to_size, block_hint_to_id, block_symint_to_id
+    )
     return torch.zeros(concrete_shape, dtype=dtype)
 
 
 def _resolve_dims(
-    dims: tuple[object, ...] | list[object], block_id_to_size: dict[int, int]
+    dims: tuple[object, ...] | list[object],
+    block_id_to_size: dict[int, int],
+    block_hint_to_id: dict[int, int] | None = None,
+    block_symint_to_id: dict[int, int] | None = None,
 ) -> list[int]:
     """Resolve a sequence of dims (possibly SymInt) to concrete integer sizes."""
+    import sympy
+
     result = []
     for d in dims:
         if isinstance(d, torch.SymInt):
@@ -552,6 +672,27 @@ def _resolve_dims(
                 if block_id in block_id_to_size:
                     result.append(block_id_to_size[block_id])
                     continue
+            expr = getattr(getattr(d, "node", None), "expr", None)
+            if isinstance(expr, sympy.Symbol):
+                sym2 = str(expr)
+                if sym2.startswith("u") and sym2[1:].isdigit():
+                    block_id = int(sym2[1:])
+                    if block_id in block_id_to_size:
+                        result.append(block_id_to_size[block_id])
+                        continue
+            if block_symint_to_id:
+                expr = getattr(getattr(d, "node", None), "expr", None)
+                if isinstance(expr, sympy.Symbol) and id(expr) in block_symint_to_id:
+                    result.append(block_id_to_size[block_symint_to_id[id(expr)]])
+                    continue
+            if block_hint_to_id:
+                try:
+                    hint_val = int(d)
+                    if hint_val in block_hint_to_id:
+                        result.append(block_id_to_size[block_hint_to_id[hint_val]])
+                        continue
+                except (TypeError, ValueError):
+                    pass
         result.append(int(d))
     return result
 
