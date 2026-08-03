@@ -426,3 +426,46 @@ class TestConfigurableBlockSizes:
             "Expected inner scf.for k-reduction step 32"
         )
         assert _allclose(result, A @ B)
+
+    def test_outer_inner_loops_eltwise_block_sizes(self):
+        """Nested outer/inner loops with eltwise ops honor configured steps."""
+        from contextlib import redirect_stdout
+        import io
+        import os
+        from unittest import mock
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[16, 8]),
+        )
+        def add_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+            return out
+
+        torch.manual_seed(19)
+        A = torch.randn(64, 48)
+        B = torch.randn(64, 48)
+
+        # Clear helion's in-memory kernel cache to force fresh compilation.
+        add_nested._bound_kernels.clear()
+        add_nested._dispatch_cache.clear()
+
+        buf = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"HELION_MLIR_DUMP_PRE_LOWERING": "1"}),
+            redirect_stdout(buf),
+        ):
+            result = add_nested(A, B)
+
+        ir_dump = buf.getvalue()
+        assert "step (16)" in ir_dump, "Expected outer scf.forall step (16)"
+        assert "step %c8" in ir_dump or "step (8)" in ir_dump, (
+            "Expected inner loop step 8"
+        )
+
+        assert _allclose(result, A + B)

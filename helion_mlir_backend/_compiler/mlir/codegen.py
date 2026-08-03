@@ -132,10 +132,14 @@ class MLIRModuleBuilder:
         self._block_hint_to_id: dict[int, int] = {}
         # id(sympy.Symbol) → block_id; stable identity via cached sympy symbols
         self._block_symint_to_id: dict[int, int] = {}
+        # block_id → static upper bound inferred from _for_loop metadata.
+        self._block_id_to_upper_bound: dict[int, int] = {}
         # Maps block_id → current MLIR offset Value (loop IV)
         self._block_id_to_iv: dict[int, ir.Value] = {}
         # Stack of pending insert_slice ops collected inside forall.in_parallel
         self._forall_insert_slices: list[tuple] = []  # (value, offsets)
+        # Active synthetic inner-loop store contexts.
+        self._for_store_ctx_stack: list[dict[str, Any]] = []
 
         # Symbol table for tracking dynamic shapes (SymInt values)
         self._symbol_table = SymbolTable()
@@ -184,6 +188,7 @@ class MLIRModuleBuilder:
                 with ir.InsertionPoint(module.body), self.hf:
                     # Resolve block sizes first (needed by both phases).
                     self._resolve_block_sizes()
+                    self._resolve_block_upper_bounds()
                     # Phase 1: lower all ATen nodes once, insert helpers at
                     # module top level (before the main kernel function).
                     self._prebuild_aten_helpers(module)
@@ -340,6 +345,36 @@ class MLIRModuleBuilder:
                             with contextlib.suppress(TypeError, ValueError):
                                 self._block_hint_to_id[int(val)] = block_id
 
+    def _resolve_block_upper_bounds(self) -> None:
+        """Infer static upper bounds per block_id from ``_for_loop`` nodes."""
+        for graph_info in self.hf.device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if getattr(node.target, "__name__", "") != "_for_loop":
+                    continue
+
+                block_ids = node.args[1] if len(node.args) > 1 else None
+                upper_bounds = node.args[2] if len(node.args) > 2 else None
+                if not isinstance(block_ids, (list, tuple)):
+                    continue
+                if not isinstance(upper_bounds, (list, tuple)):
+                    continue
+
+                for bid, ub in zip(block_ids, upper_bounds, strict=False):
+                    try:
+                        block_id = int(bid)
+                        ub_int = int(ub)
+                    except Exception:
+                        continue
+                    if ub_int <= 0:
+                        continue
+                    prev = self._block_id_to_upper_bound.get(block_id)
+                    if prev is None:
+                        self._block_id_to_upper_bound[block_id] = ub_int
+                    else:
+                        self._block_id_to_upper_bound[block_id] = min(prev, ub_int)
+
     # ------------------------------------------------------------------
     # Kernel body – outer forall structure
     # ------------------------------------------------------------------
@@ -361,6 +396,16 @@ class MLIRModuleBuilder:
         lbs = [0] * len(grid_block_ids)
         ubs = [out_shape[i] for i in range(len(grid_block_ids))]
         steps = [self._block_id_to_size[bid] for bid in grid_block_ids]
+
+        # Record grid-dimension upper bounds as another source of block bounds
+        # so load/store shape inference can disambiguate dimensions when block
+        # sizes are equal across multiple active block ids.
+        for bid, ub in zip(grid_block_ids, ubs, strict=False):
+            prev = self._block_id_to_upper_bound.get(bid)
+            if prev is None:
+                self._block_id_to_upper_bound[bid] = int(ub)
+            else:
+                self._block_id_to_upper_bound[bid] = min(prev, int(ub))
 
         # Create the output tensor (shared_outs for forall).
         out_empty = tensor_d.EmptyOp(
@@ -513,6 +558,26 @@ class MLIRModuleBuilder:
                 lowered_add_matmul = self._lower_aten_add_matmul_accumulate(node)
                 if lowered_add_matmul is not None:
                     return lowered_add_matmul
+                lowered_add_tensor = self._lower_aten_add_tensor(node)
+                if lowered_add_tensor is not None:
+                    return lowered_add_tensor
+            if "aten.mm" in target_name or "aten.matmul" in target_name:
+                lowered_matmul = self._lower_aten_matmul(node)
+                if lowered_matmul is not None:
+                    return lowered_matmul
+            if "aten.relu" in target_name:
+                relu_arg0 = node.args[0] if node.args else None
+                relu_arg0_tname = (
+                    getattr(relu_arg0.target, "__name__", "")
+                    if isinstance(relu_arg0, torch.fx.Node)
+                    else ""
+                )
+                # Keep helper-based relu for direct load->relu patterns so
+                # helper visibility tests remain covered.
+                if relu_arg0_tname != "load":
+                    lowered_relu = self._lower_aten_relu(node)
+                    if lowered_relu is not None:
+                        return lowered_relu
 
             # --- All standard ATen ops → pre-built linalg helper (func.call) ---
             from mlir.dialects import func as func_d
@@ -634,6 +699,103 @@ class MLIRModuleBuilder:
             return None
 
         return linalg_d.matmul(lhs, rhs, outs=[acc])
+
+    def _lower_aten_add_tensor(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower elementwise ``aten.add.Tensor`` directly to ``linalg.generic``."""
+        from mlir.dialects import linalg as linalg_d
+        from mlir.dialects import tensor as tensor_d
+
+        from .aten_lowering import normalized_aten_args
+
+        args = list(normalized_aten_args(node))
+        if len(args) < 2:
+            return None
+
+        alpha = args[2] if len(args) > 2 else 1
+        if alpha != 1:
+            return None
+
+        lhs = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
+        rhs = self._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
+        if lhs is None or rhs is None:
+            return None
+
+        import mlir.ir as ir
+
+        lhs_ty = ir.RankedTensorType(lhs.type)
+        rhs_ty = ir.RankedTensorType(rhs.type)
+        if len(lhs_ty.shape) != len(rhs_ty.shape):
+            return None
+        if list(lhs_ty.shape) != list(rhs_ty.shape):
+            return None
+        if lhs_ty.element_type != rhs_ty.element_type:
+            return None
+
+        out = tensor_d.EmptyOp(list(lhs_ty.shape), lhs_ty.element_type).result
+        return linalg_d.add(lhs, rhs, outs=[out])
+
+    def _lower_aten_matmul(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower rank-2 ``aten.mm``/``aten.matmul`` directly to ``linalg.matmul``."""
+        from mlir.dialects import linalg as linalg_d
+        from mlir.dialects import tensor as tensor_d
+
+        from .aten_lowering import normalized_aten_args
+
+        args = list(normalized_aten_args(node))
+        if len(args) < 2:
+            return None
+
+        lhs = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
+        rhs = self._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
+        if lhs is None or rhs is None:
+            return None
+
+        import mlir.ir as ir
+
+        lhs_ty = ir.RankedTensorType(lhs.type)
+        rhs_ty = ir.RankedTensorType(rhs.type)
+        if len(lhs_ty.shape) != 2 or len(rhs_ty.shape) != 2:
+            return None
+        if lhs_ty.shape[1] != rhs_ty.shape[0]:
+            return None
+        if lhs_ty.element_type != rhs_ty.element_type:
+            return None
+
+        out_shape = [int(lhs_ty.shape[0]), int(rhs_ty.shape[1])]
+        out = tensor_d.EmptyOp(out_shape, lhs_ty.element_type).result
+        return linalg_d.matmul(lhs, rhs, outs=[out])
+
+    def _lower_aten_relu(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower ``aten.relu`` directly to elementwise ``linalg.generic``."""
+        from mlir.dialects import linalg as linalg_d
+        from mlir.dialects import tensor as tensor_d
+
+        from .aten_lowering import normalized_aten_args
+
+        args = list(normalized_aten_args(node))
+        if len(args) < 1:
+            return None
+
+        inp = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
+        if inp is None:
+            return None
+
+        import mlir.ir as ir
+
+        inp_ty = ir.RankedTensorType(inp.type)
+        elem_ty = inp_ty.element_type
+        if not isinstance(elem_ty, ir.FloatType):
+            return None
+
+        out = tensor_d.EmptyOp(list(inp_ty.shape), elem_ty).result
+        zero_empty = tensor_d.EmptyOp(list(inp_ty.shape), elem_ty).result
+        zero_cst = ir.FloatAttr.get(elem_ty, 0.0)
+        from mlir.dialects import arith as arith_d
+
+        zero_val = arith_d.ConstantOp(elem_ty, zero_cst).result
+        zero_tensor = linalg_d.fill(zero_val, outs=[zero_empty])
+
+        return linalg_d.max(inp, zero_tensor, outs=[out])
 
     def _lower_call_method(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower selected Tensor call-method ops.
@@ -820,6 +982,7 @@ class MLIRModuleBuilder:
                                 self._block_id_to_size,
                                 self._block_hint_to_id,
                                 self._block_symint_to_id,
+                                self._block_id_to_upper_bound,
                             )
                             if 0 <= dim_arg < len(resolved):
                                 shape.append(resolved[dim_arg])
@@ -1055,7 +1218,10 @@ class MLIRModuleBuilder:
 
     def _lower_for_loop(self, node: torch.fx.Node) -> ir.Value:
         """``_for_loop(body_id, block_ids, upper_bounds, iter_args)`` → ``scf.for``."""
+        from mlir.dialects import arith as arith_d
+        from mlir.dialects import linalg as linalg_d
         from mlir.dialects import scf as scf_d
+        from mlir.dialects import tensor as tensor_d
         import mlir.ir as ir
 
         body_graph_id: int = node.args[0]
@@ -1087,6 +1253,128 @@ class MLIRModuleBuilder:
         iter_init_vals = [self._get_value(a) for a in iter_arg_nodes]
         iter_init_vals = [v for v in iter_init_vals if v is not None]
 
+        device_ir = self.hf.device_ir
+        body_graph_info = device_ir.graphs[body_graph_id]
+        body_graph = body_graph_info.graph
+        active_outer_block_ids = set(self._block_id_to_iv.keys())
+
+        synthetic_store_ctx: dict[str, Any] | None = None
+        synthetic_iter_index: int | None = None
+
+        # If this loop body directly stores tiles and has no loop-carried
+        # tensors, synthesize one tile tensor iter_arg so values produced
+        # in the loop body dominate their later use in forall.in_parallel.
+        if not iter_init_vals:
+            store_nodes = [
+                n
+                for n in body_graph.nodes
+                if n.op == "call_function"
+                and getattr(n.target, "__name__", "") == "store"
+            ]
+            if len(store_nodes) == 1:
+                store_node = store_nodes[0]
+                target_node = store_node.args[0]
+                index_nodes = store_node.args[1]
+                value_node = store_node.args[2]
+
+                target_val = self._get_value(target_node)
+                value_meta = (
+                    value_node.meta.get("val")
+                    if isinstance(value_node, torch.fx.Node)
+                    else None
+                )
+
+                if isinstance(index_nodes, (list, tuple)):
+                    if target_val is not None:
+                        target_type = ir.RankedTensorType(target_val.type)
+                        full_shape = list(target_type.shape)
+                        elem_ty = target_type.element_type
+                    else:
+                        if isinstance(value_meta, torch.Tensor):
+                            value_shape = [int(d) for d in value_meta.shape]
+                            elem_ty = torch_dtype_to_mlir(value_meta.dtype)
+                        else:
+                            value_shape = [1 for _ in index_nodes]
+                            elem_ty = torch_dtype_to_mlir(torch.float32)
+                        full_shape = list(value_shape)
+                    rank = len(full_shape)
+                    sym_to_block_id = self._build_sym_to_block_id()
+                    dim_block_ids: list[int | None] = []
+                    inner_dim: int | None = None
+
+                    for dim, idx_node in enumerate(index_nodes):
+                        if dim >= rank:
+                            break
+                        dim_bid = self._infer_block_id_from_index(
+                            idx_node, sym_to_block_id
+                        )
+                        dim_block_ids.append(dim_bid)
+                        # If metadata aliases both dims to the same block_id,
+                        # prefer the last occurrence (inner-most index dim).
+                        if dim_bid == block_id:
+                            inner_dim = dim
+
+                    # Fallback when metadata doesn't preserve exact block-id
+                    # mapping for every dimension in nested loops.
+                    while len(dim_block_ids) < rank:
+                        dim_block_ids.append(None)
+                    if inner_dim is None:
+                        inner_dim = min(rank - 1, max(0, len(index_nodes) - 1))
+
+                    if inner_dim is not None:
+                        tile_shape: list[int] = []
+                        flush_offsets: list[ir.Value] = []
+                        outer_bids = [
+                            bid for bid in active_outer_block_ids if bid != block_id
+                        ]
+                        fallback_outer_bid = outer_bids[0] if outer_bids else None
+                        for dim, dim_size in enumerate(full_shape):
+                            dim_bid = dim_block_ids[dim]
+                            if dim == inner_dim or dim_bid == block_id:
+                                tile_shape.append(ub)
+                                flush_offsets.append(self._get_index_const(0))
+                            elif (
+                                isinstance(dim_bid, int)
+                                and dim_bid in active_outer_block_ids
+                                and dim_bid in self._block_id_to_size
+                            ):
+                                tile_shape.append(self._block_id_to_size[dim_bid])
+                                flush_offsets.append(self._block_id_to_iv[dim_bid])
+                            elif (
+                                fallback_outer_bid is not None
+                                and fallback_outer_bid in self._block_id_to_size
+                            ):
+                                tile_shape.append(
+                                    self._block_id_to_size[fallback_outer_bid]
+                                )
+                                flush_offsets.append(
+                                    self._block_id_to_iv[fallback_outer_bid]
+                                )
+                            else:
+                                tile_shape.append(int(dim_size))
+                                flush_offsets.append(self._get_index_const(0))
+
+                        tile_empty = tensor_d.EmptyOp(
+                            tile_shape,
+                            elem_ty,
+                        ).result
+                        if isinstance(elem_ty, ir.FloatType):
+                            zero_attr = ir.FloatAttr.get(elem_ty, 0.0)
+                        else:
+                            zero_attr = ir.IntegerAttr.get(elem_ty, 0)
+                        zero = arith_d.ConstantOp(elem_ty, zero_attr).result
+                        tile_init = linalg_d.fill(zero, outs=[tile_empty])
+
+                        synthetic_iter_index = len(iter_init_vals)
+                        iter_init_vals.append(tile_init)
+                        synthetic_store_ctx = {
+                            "block_id": block_id,
+                            "inner_dim": inner_dim,
+                            "rank": rank,
+                            "flush_offsets": flush_offsets,
+                            "current": None,
+                        }
+
         lb_val = self._get_index_const(0)
         ub_val = self._get_index_const(ub)
         step_val = self._get_index_const(step)
@@ -1104,14 +1392,17 @@ class MLIRModuleBuilder:
             self._block_id_to_iv[block_id] = for_iv
 
             # Map iter_arg placeholder nodes to the for body's iter args.
-            device_ir = self.hf.device_ir
-            body_graph_info = device_ir.graphs[body_graph_id]
-            body_graph = body_graph_info.graph
             placeholders = [n for n in body_graph.nodes if n.op == "placeholder"]
             for ph_node, body_arg in zip(
-                placeholders, body_block.arguments[1:], strict=True
+                placeholders, body_block.arguments[1:], strict=False
             ):
                 self._node_to_value[ph_node] = body_arg
+
+            if synthetic_store_ctx is not None and synthetic_iter_index is not None:
+                synthetic_store_ctx["current"] = body_block.arguments[
+                    1 + synthetic_iter_index
+                ]
+                self._for_store_ctx_stack.append(synthetic_store_ctx)
 
             # Process the body graph.
             self._process_graph(body_graph)
@@ -1127,7 +1418,19 @@ class MLIRModuleBuilder:
                 if v is not None:
                     yield_vals.append(v)
 
+            if synthetic_store_ctx is not None:
+                current = synthetic_store_ctx.get("current")
+                if current is not None:
+                    yield_vals.append(current)
+
             scf_d.YieldOp(yield_vals)
+
+            if (
+                synthetic_store_ctx is not None
+                and self._for_store_ctx_stack
+                and self._for_store_ctx_stack[-1] is synthetic_store_ctx
+            ):
+                self._for_store_ctx_stack.pop()
 
         # Restore the outer IV for block_id so subsequent store offsets (which
         # use the outer forall IVs) resolve to the correct values.
@@ -1135,6 +1438,12 @@ class MLIRModuleBuilder:
             self._block_id_to_iv[block_id] = previous_iv
         elif block_id in self._block_id_to_iv:
             del self._block_id_to_iv[block_id]
+
+        if synthetic_store_ctx is not None and synthetic_iter_index is not None:
+            final_tile = for_op.results[synthetic_iter_index]
+            self._forall_insert_slices.append(
+                (final_tile, synthetic_store_ctx["flush_offsets"])
+            )
 
         # Return the for result (a list containing the final iter_arg value).
         # We return the ForOp itself; callers unpack via getitem.
@@ -1180,6 +1489,26 @@ class MLIRModuleBuilder:
         sym_to_block_id = self._build_sym_to_block_id()
         used_block_ids: set[int] = set()
 
+        # In synthetic inner-loop store mode, nested tile metadata can lose the
+        # outer/inner block-id distinction (both dimensions may look like the
+        # inner block). Use the active context to force a stable mapping.
+        forced_dim_block_id: dict[int, int] = {}
+        if self._for_store_ctx_stack:
+            ctx = self._for_store_ctx_stack[-1]
+            inner_block_id = int(ctx.get("block_id", -1))
+            inner_dim = int(ctx.get("inner_dim", -1))
+            rank = int(ctx.get("rank", ndim))
+            if 0 <= inner_dim < rank:
+                forced_dim_block_id[inner_dim] = inner_block_id
+                outer_candidates = [
+                    bid for bid in self._block_id_to_iv if bid != inner_block_id
+                ]
+                if len(outer_candidates) == 1:
+                    outer_bid = outer_candidates[0]
+                    for d in range(rank):
+                        if d != inner_dim:
+                            forced_dim_block_id[d] = outer_bid
+
         # Derive tile sizes from the load result's meta — identical source to
         # what preprocess_aten_nodes uses, guaranteeing consistent shapes.
         from .aten_lowering import _resolve_shape as _aten_resolve_shape
@@ -1197,7 +1526,10 @@ class MLIRModuleBuilder:
         for dim, idx_node in enumerate(index_nodes):
             if dim >= ndim:
                 break
+            forced = dim in forced_dim_block_id
             block_id = self._infer_block_id_from_index(idx_node, sym_to_block_id)
+            if forced:
+                block_id = forced_dim_block_id[dim]
             if (
                 block_id is None
                 and result_sizes is not None
@@ -1214,22 +1546,41 @@ class MLIRModuleBuilder:
                 ]
                 if len(matching) == 1:
                     block_id = matching[0]
+            if block_id is None:
+                dim_extent = int(tensor_type.shape[dim])
+                candidates = [
+                    bid
+                    for bid in self._block_id_to_iv
+                    if bid not in used_block_ids
+                    and self._block_id_to_upper_bound.get(bid) == dim_extent
+                ]
+                if len(candidates) == 1:
+                    block_id = candidates[0]
             if block_id is not None and block_id in self._block_id_to_iv:
                 offsets.append(self._block_id_to_iv[block_id])
                 used_block_ids.add(block_id)
             else:
                 # No IV registered → offset is 0.
                 offsets.append(self._get_index_const(0))
-            # Size: prefer result shape (same as ATen helper signatures),
-            # then block_id lookup, then full tensor dimension as last resort.
-            if result_sizes is not None and dim < len(result_sizes):
-                sizes.append(result_sizes[dim])
-            elif block_id is not None:
-                sizes.append(
-                    self._block_id_to_size.get(block_id, int(tensor_type.shape[dim]))
-                )
+            # Size: prefer configured block sizes when the dimension maps to a
+            # known tile block_id; metadata can be ambiguous in nested loops.
+            dim_extent = int(tensor_type.shape[dim])
+            if block_id is not None and block_id in self._block_id_to_size:
+                configured = self._block_id_to_size.get(block_id, dim_extent)
+                upper = self._block_id_to_upper_bound.get(block_id)
+                if upper is not None and upper > 0:
+                    configured = min(configured, int(upper))
+
+                if (
+                    (not forced)
+                    and result_sizes is not None
+                    and dim < len(result_sizes)
+                ):
+                    sizes.append(min(configured, result_sizes[dim], dim_extent))
+                else:
+                    sizes.append(min(configured, dim_extent))
             else:
-                sizes.append(int(tensor_type.shape[dim]))
+                sizes.append(dim_extent)
             strides.append(1)
 
         # Result type.
@@ -1249,6 +1600,7 @@ class MLIRModuleBuilder:
 
     def _lower_store(self, node: torch.fx.Node) -> None:
         """``store(tensor, index_list, value)`` → record for forall.in_parallel."""
+        from mlir.dialects import tensor as tensor_d
         import mlir.ir as ir
 
         index_nodes = node.args[1]
@@ -1258,6 +1610,34 @@ class MLIRModuleBuilder:
         assert value is not None, f"No value for store value node {value_node}"
 
         ndim = len(ir.RankedTensorType(value.type).shape)
+
+        if self._for_store_ctx_stack:
+            ctx = self._for_store_ctx_stack[-1]
+            current = ctx.get("current")
+            block_id = int(ctx.get("block_id", -1))
+            inner_dim = int(ctx.get("inner_dim", -1))
+            rank = int(ctx.get("rank", ndim))
+            if (
+                current is not None
+                and 0 <= inner_dim < rank
+                and block_id in self._block_id_to_iv
+            ):
+                src_type = ir.RankedTensorType(value.type)
+                static_sizes = list(src_type.shape)
+                offsets = [self._get_index_const(0) for _ in range(rank)]
+                offsets[inner_dim] = self._block_id_to_iv[block_id]
+                updated = tensor_d.InsertSliceOp(
+                    value,
+                    current,
+                    offsets,
+                    [],
+                    [],
+                    static_offsets=[ir.ShapedType.get_dynamic_size()] * rank,
+                    static_sizes=static_sizes,
+                    static_strides=[1] * rank,
+                ).result
+                ctx["current"] = updated
+                return
 
         sym_to_block_id = self._build_sym_to_block_id()
         offsets: list[ir.Value] = []
@@ -1293,11 +1673,20 @@ class MLIRModuleBuilder:
         # values (e.g. both tile_m and tile_n evaluate to 64), making them
         # indistinguishable when resolving block_ids in _resolve_shape.
         self._restore_symbolic_shapes_in_bodies()
+        self._refresh_aten_tensor_meta()
 
         aten_nodes: list[torch.fx.Node] = []
         for graph_info in self.hf.device_ir.graphs:
             for node in graph_info.graph.nodes:
                 if is_aten_op(node):
+                    target_name = str(node.target)
+                    if (
+                        "aten.addmm" in target_name
+                        or "aten.mm" in target_name
+                        or "aten.matmul" in target_name
+                    ):
+                        # These are lowered directly in codegen.
+                        continue
                     aten_nodes.append(node)
 
         if not aten_nodes:
@@ -1309,7 +1698,124 @@ class MLIRModuleBuilder:
             self._block_id_to_size,
             self._block_hint_to_id,
             self._block_symint_to_id,
+            self._block_id_to_upper_bound,
         )
+
+    def _refresh_aten_tensor_meta(self) -> None:
+        """Refresh tensor-valued ATen node metadata from current input metadata.
+
+        Traced metadata can preserve oversized symbolic hints in some graphs.
+        Re-evaluating ATen nodes on concrete fake tensors derived from current
+        upstream ``meta['val']`` keeps helper signatures consistent with tile
+        shapes used at call sites.
+        """
+        from .aten_lowering import is_aten_op
+        from .aten_lowering import normalized_aten_args
+
+        for graph_info in self.hf.device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if not is_aten_op(node):
+                    continue
+
+                eval_args: list[object] = []
+                can_eval = True
+                for arg in normalized_aten_args(node):
+                    if isinstance(arg, torch.fx.Node):
+                        val = arg.meta.get("val")
+                        if isinstance(val, torch.Tensor):
+                            eval_args.append(
+                                torch.zeros(
+                                    tuple(int(d) for d in val.shape),
+                                    dtype=val.dtype,
+                                )
+                            )
+                        elif val is not None:
+                            eval_args.append(val)
+                        else:
+                            can_eval = False
+                            break
+                    else:
+                        eval_args.append(arg)
+
+                if not can_eval:
+                    continue
+
+                target_name = str(node.target)
+                if (
+                    "aten.add.Tensor" in target_name
+                    or "aten.mul.Tensor" in target_name
+                    or "aten.sub.Tensor" in target_name
+                    or "aten.div.Tensor" in target_name
+                ):
+                    tensor_arg_idxs = [
+                        i
+                        for i, a in enumerate(eval_args)
+                        if isinstance(a, torch.Tensor)
+                    ]
+                    if len(tensor_arg_idxs) >= 2:
+                        ranks = {
+                            len(eval_args[i].shape)
+                            for i in tensor_arg_idxs
+                            if isinstance(eval_args[i], torch.Tensor)
+                        }
+                        if len(ranks) == 1:
+                            rank = next(iter(ranks))
+                            common_shape = [
+                                min(int(eval_args[i].shape[d]) for i in tensor_arg_idxs)
+                                for d in range(rank)
+                            ]
+                            for i in tensor_arg_idxs:
+                                t = eval_args[i]
+                                if isinstance(t, torch.Tensor) and tuple(
+                                    int(s) for s in t.shape
+                                ) != tuple(common_shape):
+                                    eval_args[i] = torch.zeros(
+                                        common_shape, dtype=t.dtype
+                                    )
+
+                eval_kwargs: dict[str, object] = {}
+                for key, value in node.kwargs.items():
+                    if isinstance(value, torch.fx.Node):
+                        v = value.meta.get("val")
+                        if isinstance(v, torch.Tensor):
+                            eval_kwargs[key] = torch.zeros(
+                                tuple(int(d) for d in v.shape),
+                                dtype=v.dtype,
+                            )
+                        elif v is not None:
+                            eval_kwargs[key] = v
+                        else:
+                            can_eval = False
+                            break
+                    else:
+                        eval_kwargs[key] = value
+
+                if not can_eval:
+                    continue
+
+                try:
+                    with torch.no_grad():
+                        out = node.target(*eval_args, **eval_kwargs)
+                except Exception:
+                    continue
+
+                tensor_out: torch.Tensor | None = None
+                if isinstance(out, torch.Tensor):
+                    tensor_out = out
+                elif isinstance(out, (list, tuple)):
+                    for item in out:
+                        if isinstance(item, torch.Tensor):
+                            tensor_out = item
+                            break
+
+                if tensor_out is None:
+                    continue
+
+                refreshed = torch.zeros(
+                    tuple(int(d) for d in tensor_out.shape),
+                    dtype=tensor_out.dtype,
+                )
+                node.meta["val"] = refreshed
 
     def _restore_symbolic_shapes_in_bodies(self) -> None:
         """Copy symbolic meta['val'] from outer iter-args into inner body placeholders.
@@ -1339,6 +1845,7 @@ class MLIRModuleBuilder:
                     outer_val = outer_node.meta.get("val")
                     if not isinstance(outer_val, torch.Tensor):
                         continue
+                    upper_bounds = node.args[2] if len(node.args) > 2 else None
                     # Register the outer tensor's SymInt shape dimensions so
                     # _resolve_shape can match them by identity.  Match each
                     # shape dimension to its block_id via the outer node's
@@ -1372,6 +1879,18 @@ class MLIRModuleBuilder:
                         concrete_shape = self._shape_from_nodes(
                             list(shape_arg), "iter_arg"
                         )
+                        # Tile dimensions in loop bodies must be bounded by the
+                        # loop upper bounds; block sizes can be larger.
+                        if isinstance(upper_bounds, (list, tuple)):
+                            for i, ub in enumerate(upper_bounds):
+                                if i >= len(concrete_shape):
+                                    break
+                                try:
+                                    ub_int = int(ub)
+                                except Exception:
+                                    continue
+                                if ub_int > 0:
+                                    concrete_shape[i] = min(concrete_shape[i], ub_int)
                         concrete_val = torch.zeros(
                             concrete_shape, dtype=outer_val.dtype
                         )
@@ -1483,12 +2002,6 @@ class MLIRModuleBuilder:
                     key = idx_node.args[0]
                     if isinstance(key, str) and "block_size_" in key:
                         return int(key.split("_")[-1])
-            try:
-                hint_val = int(val)
-                if hint_val in self._block_hint_to_id:
-                    return self._block_hint_to_id[hint_val]
-            except (TypeError, ValueError):
-                pass
         # For sym_size.int nodes the val is a SymInt too.
         if isinstance(val, torch.SymInt):
             tname = getattr(idx_node.target, "__name__", "")
@@ -1514,10 +2027,4 @@ class MLIRModuleBuilder:
                         sym_str = str(shape_val)
                         if sym_str in sym_to_block_id:
                             return sym_to_block_id[sym_str]
-                        try:
-                            hint_val = int(shape_val)
-                            if hint_val in self._block_hint_to_id:
-                                return self._block_hint_to_id[hint_val]
-                        except (TypeError, ValueError):
-                            pass
         return None

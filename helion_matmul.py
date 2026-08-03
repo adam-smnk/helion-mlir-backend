@@ -11,7 +11,7 @@ import helion_mlir_backend  # noqa: F401
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
-    config=helion.Config(block_sizes=[16, 8, 32]),
+    config=helion.Config(block_sizes=[16, 8]),
 )
 def matmul(
     x: Tensor,
@@ -32,14 +32,21 @@ def matmul(
     out = torch.empty(
         [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
     )
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
+    # for tile_m, tile_n in hl.tile([m, n]):
+    #     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    #     for tile_k in hl.tile(k):
+    #         acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+    #     out[tile_m, tile_n] = acc
+    # return out
+    m, n = x.shape
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
     return out
 
 
 A = torch.randn(64, 64)
-B = torch.randn(64, 48)
-matmul(A, B)
+B = torch.randn(64, 64)
+res = matmul(A, B)
+torch.allclose(A + B, res, atol=1e-4, rtol=1e-4)
