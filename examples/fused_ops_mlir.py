@@ -44,10 +44,10 @@ def matmul_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # Outer loop over output dimensions
     for tile_m, tile_n in hl.tile([m, n]):
         # Accumulator for this output tile
-        acc = helion.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
 
         # Inner loop over reduction dimension
-        for tile_k in helion.tile(k):
+        for tile_k in hl.tile(k):
             # Accumulate matmul
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
 
@@ -80,9 +80,9 @@ def matmul_add(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Te
     out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
 
     for tile_m, tile_n in hl.tile([m, n]):
-        acc = helion.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
 
-        for tile_k in helion.tile(k):
+        for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
 
         # Add bias (broadcasted)
