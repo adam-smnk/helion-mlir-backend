@@ -632,6 +632,62 @@ def _fake_tensor_from_node_meta(
     block_symint_to_id: dict[int, int] | None = None,
 ) -> torch.Tensor | None:
     """Construct a concrete fake tensor from ``node.meta`` when possible."""
+    # Prefer evaluating tensor-producing call_function nodes from their
+    # concrete input tensors. This avoids stale/ambiguous symbolic metadata in
+    # nested tile loops (e.g. matmul feeding add in reduction bodies).
+    if node.op == "call_function":
+        eval_args: list[object] = []
+        can_eval = True
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                concrete = _fake_tensor_from_node_meta(
+                    arg, block_id_to_size, block_hint_to_id, block_symint_to_id
+                )
+                if concrete is not None:
+                    eval_args.append(concrete)
+                    continue
+                literal = _resolve_fx_literal(arg)
+                if literal is not _MISSING_LITERAL:
+                    eval_args.append(literal)
+                    continue
+                can_eval = False
+                break
+            eval_args.append(arg)
+
+        eval_kwargs: dict[str, object] = {}
+        if can_eval:
+            for k, v in node.kwargs.items():
+                if isinstance(v, torch.fx.Node):
+                    concrete = _fake_tensor_from_node_meta(
+                        v, block_id_to_size, block_hint_to_id, block_symint_to_id
+                    )
+                    if concrete is not None:
+                        eval_kwargs[k] = concrete
+                        continue
+                    literal = _resolve_fx_literal(v)
+                    if literal is not _MISSING_LITERAL:
+                        eval_kwargs[k] = literal
+                        continue
+                    can_eval = False
+                    break
+                eval_kwargs[k] = v
+
+        if can_eval:
+            try:
+                with torch.no_grad():
+                    out = node.target(*eval_args, **eval_kwargs)
+            except Exception:
+                out = None
+
+            if isinstance(out, torch.Tensor):
+                return torch.zeros(tuple(int(d) for d in out.shape), dtype=out.dtype)
+            if isinstance(out, (list, tuple)):
+                for item in out:
+                    if isinstance(item, torch.Tensor):
+                        return torch.zeros(
+                            tuple(int(d) for d in item.shape), dtype=item.dtype
+                        )
+
     val = node.meta.get("val")
     if isinstance(val, torch.Tensor):
         shape = _resolve_shape(

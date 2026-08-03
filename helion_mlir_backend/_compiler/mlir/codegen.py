@@ -509,6 +509,10 @@ class MLIRModuleBuilder:
                 lowered_addmm = self._lower_aten_addmm(node)
                 if lowered_addmm is not None:
                     return lowered_addmm
+            if "aten.add.Tensor" in target_name:
+                lowered_add_matmul = self._lower_aten_add_matmul_accumulate(node)
+                if lowered_add_matmul is not None:
+                    return lowered_add_matmul
 
             # --- All standard ATen ops → pre-built linalg helper (func.call) ---
             from mlir.dialects import func as func_d
@@ -569,6 +573,64 @@ class MLIRModuleBuilder:
         beta = args[3] if len(args) > 3 else 1
         alpha = args[4] if len(args) > 4 else 1
         if beta != 1 or alpha != 1:
+            return None
+
+        return linalg_d.matmul(lhs, rhs, outs=[acc])
+
+    def _lower_aten_add_matmul_accumulate(self, node: torch.fx.Node) -> ir.Value | None:
+        """Lower ``acc + matmul(lhs, rhs)`` to ``linalg.matmul(..., outs=[acc])``.
+
+        This keeps the reduction update anchored on the loop-carried accumulator,
+        which is required by downstream scf.for iter-arg equivalence checks.
+        """
+        from mlir.dialects import linalg as linalg_d
+
+        from .aten_lowering import normalized_aten_args
+
+        args = list(normalized_aten_args(node))
+        if len(args) < 2:
+            return None
+
+        alpha = args[2] if len(args) > 2 else 1
+        if alpha != 1:
+            return None
+
+        acc_node: torch.fx.Node | None = None
+        matmul_node: torch.fx.Node | None = None
+
+        for first, second in ((args[0], args[1]), (args[1], args[0])):
+            if not isinstance(first, torch.fx.Node) or not isinstance(
+                second, torch.fx.Node
+            ):
+                continue
+            second_name = str(second.target)
+            if "aten.mm" in second_name or "aten.matmul" in second_name:
+                acc_node = first
+                matmul_node = second
+                break
+
+        if acc_node is None or matmul_node is None:
+            return None
+
+        acc = self._get_value(acc_node)
+        if acc is None:
+            return None
+
+        mat_args = list(normalized_aten_args(matmul_node))
+        if len(mat_args) < 2:
+            return None
+
+        lhs = (
+            self._get_value(mat_args[0])
+            if isinstance(mat_args[0], torch.fx.Node)
+            else None
+        )
+        rhs = (
+            self._get_value(mat_args[1])
+            if isinstance(mat_args[1], torch.fx.Node)
+            else None
+        )
+        if lhs is None or rhs is None:
             return None
 
         return linalg_d.matmul(lhs, rhs, outs=[acc])

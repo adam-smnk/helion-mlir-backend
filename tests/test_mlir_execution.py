@@ -375,3 +375,54 @@ class TestConfigurableBlockSizes:
             "Expected inner scf.for k-reduction step 32"
         )
         assert _allclose(result, A @ B)
+
+    def test_outer_forall_inner_scf_for_block_sizes_matmul_accumulate(self):
+        """Nested tiling with explicit matmul + add accumulation.
+
+        Same structure as addmm test but uses:
+        ``acc = acc + torch.matmul(dequant, act_group)``.
+        """
+        from contextlib import redirect_stdout
+        import io
+        import os
+        from unittest import mock
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[16, 8, 32]),
+        )
+        def matmul_acc_tiled(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    dequant = x[tile_m, tile_k]
+                    act_group = y[tile_k, tile_n]
+                    acc = acc + torch.matmul(dequant, act_group)
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(11)
+        A = torch.randn(32, 64)
+        B = torch.randn(64, 48)
+
+        # Clear helion's in-memory kernel cache to force fresh compilation.
+        matmul_acc_tiled._bound_kernels.clear()
+        matmul_acc_tiled._dispatch_cache.clear()
+
+        buf = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"HELION_MLIR_DUMP_PRE_LOWERING": "1"}),
+            redirect_stdout(buf),
+        ):
+            result = matmul_acc_tiled(A, B)
+
+        ir_dump = buf.getvalue()
+        assert "step (16, 8)" in ir_dump, "Expected outer scf.forall step (16, 8)"
+        assert "step %c32" in ir_dump or "step (32)" in ir_dump, (
+            "Expected inner scf.for k-reduction step 32"
+        )
+        assert _allclose(result, A @ B)
