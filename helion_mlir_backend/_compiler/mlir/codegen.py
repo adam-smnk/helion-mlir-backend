@@ -79,6 +79,7 @@ import torch
 import torch.fx
 
 from .block_ids import block_id_from_key
+from .build_context import BuildContext
 from .errors import DynamicShapeError
 from .errors import ModuleBuilderError
 from .errors import NodeLoweringError
@@ -120,29 +121,71 @@ class MLIRModuleBuilder:
         self.hf = host_function
         self.config = config
         self.env = env
+        self.context = BuildContext(host_function, config, env)
 
-        # Populated during build():
-        # Maps FX node → MLIR value (ir.Value)
-        self._node_to_value: dict[torch.fx.Node, ir.Value] = {}
-        # Maps parameter name → function argument MLIR value
-        self._param_to_value: dict[str, ir.Value] = {}
-        # Maps block_id → concrete integer size
-        self._block_id_to_size: dict[int, int] = {}
-        # hint_value → block_id; last resort for concretized SymInts
-        self._block_hint_to_id: dict[int, int] = {}
-        # id(sympy.Symbol) → block_id; stable identity via cached sympy symbols
-        self._block_symint_to_id: dict[int, int] = {}
-        # block_id → static upper bound inferred from _for_loop metadata.
-        self._block_id_to_upper_bound: dict[int, int] = {}
-        # Maps block_id → current MLIR offset Value (loop IV).
-        self._block_id_to_iv: dict[int, ir.Value] = {}
-        self._forall_insert_slices: list[tuple] = []
-        self._for_store_ctx_stack: list[dict[str, Any]] = []
-        self._for_block_id_stack: list[int] = []
+    @property
+    def _node_to_value(self) -> dict[torch.fx.Node, ir.Value]:
+        return self.context.node_to_value
 
-        self._mlir_module: ir.Module | None = None
-        self._mlir_context: ir.Context | None = None
-        self._node_to_aten_func: dict[int, tuple[str, list]] = {}
+    @property
+    def _param_to_value(self) -> dict[str, ir.Value]:
+        return self.context.param_to_value
+
+    @property
+    def _block_id_to_size(self) -> dict[int, int]:
+        return self.context.block_id_to_size
+
+    @property
+    def _block_hint_to_id(self) -> dict[int, int]:
+        return self.context.block_hint_to_id
+
+    @property
+    def _block_symint_to_id(self) -> dict[int, int]:
+        return self.context.block_symint_to_id
+
+    @property
+    def _block_id_to_upper_bound(self) -> dict[int, int]:
+        return self.context.block_id_to_upper_bound
+
+    @property
+    def _block_id_to_iv(self) -> dict[int, ir.Value]:
+        return self.context.block_id_to_iv
+
+    @property
+    def _forall_insert_slices(self) -> list[tuple]:
+        return self.context.forall_insert_slices
+
+    @property
+    def _for_store_ctx_stack(self) -> list[dict[str, Any]]:
+        return self.context.for_store_ctx_stack
+
+    @property
+    def _for_block_id_stack(self) -> list[int]:
+        return self.context.for_block_id_stack
+
+    @property
+    def _mlir_module(self) -> ir.Module | None:
+        return self.context.mlir_module
+
+    @_mlir_module.setter
+    def _mlir_module(self, value: ir.Module | None) -> None:
+        self.context.mlir_module = value
+
+    @property
+    def _mlir_context(self) -> ir.Context | None:
+        return self.context.mlir_context
+
+    @_mlir_context.setter
+    def _mlir_context(self, value: ir.Context | None) -> None:
+        self.context.mlir_context = value
+
+    @property
+    def _node_to_aten_func(self) -> dict[int, tuple[str, list]]:
+        return self.context.node_to_aten_func
+
+    @_node_to_aten_func.setter
+    def _node_to_aten_func(self, value: dict[int, tuple[str, list]]) -> None:
+        self.context.node_to_aten_func = value
 
     def build(self) -> ir.Module:
         """Build and return the generated MLIR module."""
