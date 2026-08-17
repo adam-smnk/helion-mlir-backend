@@ -750,21 +750,13 @@ def _fake_tensor_from_node_meta(
                     i for i, a in enumerate(eval_args) if isinstance(a, torch.Tensor)
                 ]
                 if len(tensor_arg_idxs) >= 2:
-                    target_shape = _compute_broadcast_target_shape(
+                    target_shape = broadcast_target_shape(
                         [
                             eval_args[i]
                             for i in tensor_arg_idxs
                             if isinstance(eval_args[i], torch.Tensor)
                         ]
                     )
-                    if target_shape is None:
-                        target_shape = _compute_conservative_common_shape(
-                            [
-                                eval_args[i]
-                                for i in tensor_arg_idxs
-                                if isinstance(eval_args[i], torch.Tensor)
-                            ]
-                        )
                     if target_shape is not None:
                         for i in tensor_arg_idxs:
                             t = eval_args[i]

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 
+from .block_ids import block_id_from_key
+from .block_ids import block_id_from_symbol
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
     from helion.runtime.config import Config
@@ -39,3 +46,315 @@ class BuildContext:
     mlir_module: ir.Module | None = None
     mlir_context: ir.Context | None = None
     node_to_aten_func: dict[int, tuple[str, list]] = field(default_factory=dict)
+    lower_node_callback: Callable[[torch.fx.Node], ir.Value | None] | None = None
+
+    def get_value(self, node_or_value: object) -> ir.Value | None:
+        """Look up an MLIR value for an FX node or scalar literal."""
+        from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
+        import torch.fx
+
+        if isinstance(node_or_value, torch.fx.Node):
+            return self.node_to_value.get(node_or_value)
+        if isinstance(node_or_value, int):
+            index_type = ir.IndexType.get()
+            return arith_d.ConstantOp(
+                index_type,
+                ir.IntegerAttr.get(index_type, node_or_value),
+            ).result
+        if isinstance(node_or_value, float):
+            float_type = ir.F32Type.get()
+            return arith_d.ConstantOp(
+                float_type,
+                ir.FloatAttr.get(float_type, node_or_value),
+            ).result
+        return None
+
+    def set_value(self, node: torch.fx.Node, value: ir.Value) -> None:
+        """Associate an FX node with its generated MLIR value."""
+        self.node_to_value[node] = value
+
+    def index_const(self, value: int) -> ir.Value:
+        """Create an MLIR index constant."""
+        from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
+
+        index_type = ir.IndexType.get()
+        return arith_d.ConstantOp(
+            index_type,
+            ir.IntegerAttr.get(index_type, value),
+        ).result
+
+    def cast_to_index(self, value: ir.Value) -> ir.Value:
+        """Cast an integer or rank-zero tensor value to MLIR index type."""
+        from mlir.dialects import arith as arith_d
+        from mlir.dialects import tensor as tensor_d
+        import mlir.ir as ir
+
+        if isinstance(value.type, ir.IndexType):
+            return value
+        if isinstance(value.type, ir.RankedTensorType) and value.type.rank == 0:
+            element_type = value.type.element_type
+            if isinstance(element_type, (ir.IntegerType, ir.IndexType)):
+                value = tensor_d.ExtractOp(value, []).result
+                if isinstance(value.type, ir.IndexType):
+                    return value
+        return arith_d.IndexCastOp(ir.IndexType.get(), value).result
+
+    def shape_from_node_meta(self, node: object) -> list[int] | None:
+        """Extract a concrete tensor shape from FX metadata."""
+        import torch.fx
+
+        if not isinstance(node, torch.fx.Node):
+            return None
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            try:
+                return [int(dim) for dim in value.shape]
+            except Exception:
+                return None
+        tensor_meta = node.meta.get("tensor_meta")
+        shape = getattr(tensor_meta, "shape", None)
+        if shape is None:
+            return None
+        try:
+            return [int(dim) for dim in shape]
+        except Exception:
+            return None
+
+    def shape_from_nodes(
+        self, shape_nodes: list, operation_name: str = "op"
+    ) -> list[int]:
+        """Resolve FX shape nodes using configured block sizes and metadata."""
+        import sympy
+        import torch.fx
+
+        shape: list[int] = []
+        for shape_node in shape_nodes:
+            if isinstance(shape_node, torch.fx.Node):
+                target_name = getattr(shape_node.target, "__name__", "")
+                if target_name == "_get_symnode" and shape_node.args:
+                    block_id = block_id_from_key(shape_node.args[0])
+                    if block_id is not None and block_id in self.block_id_to_size:
+                        shape.append(self.block_id_to_size[block_id])
+                        continue
+                if (
+                    target_name in ("sym_size.int", "sym_size_int")
+                    and len(shape_node.args) >= 2
+                ):
+                    tensor_node, dim = shape_node.args[:2]
+                    value = (
+                        tensor_node.meta.get("val")
+                        if isinstance(tensor_node, torch.fx.Node)
+                        else None
+                    )
+                    if isinstance(value, torch.Tensor) and isinstance(dim, int):
+                        from helion_mlir_backend._compiler.mlir.aten_lowering import (
+                            _resolve_dims,
+                        )
+
+                        resolved = _resolve_dims(
+                            value.shape,
+                            self.block_id_to_size,
+                            self.block_hint_to_id,
+                            self.block_symint_to_id,
+                            self.block_id_to_upper_bound,
+                        )
+                        if 0 <= dim < len(resolved):
+                            shape.append(resolved[dim])
+                            continue
+                value = shape_node.meta.get("val")
+                if isinstance(value, torch.SymInt):
+                    block_id = block_id_from_symbol(str(value))
+                    if block_id is None:
+                        expression = getattr(getattr(value, "node", None), "expr", None)
+                        if isinstance(expression, sympy.Symbol):
+                            block_id = block_id_from_symbol(str(expression))
+                    if block_id is not None and block_id in self.block_id_to_size:
+                        shape.append(self.block_id_to_size[block_id])
+                        continue
+                if value is not None:
+                    try:
+                        shape.append(int(value))
+                        continue
+                    except Exception:
+                        pass
+            elif isinstance(shape_node, int):
+                shape.append(shape_node)
+                continue
+            shape.append(1)
+        return shape
+
+    def build_sym_to_block_id(self) -> dict[str, int]:
+        """Build symbolic ``uN`` names from the active Helion block sizes."""
+        return {f"u{block.block_id}": block.block_id for block in self.env.block_sizes}
+
+    def infer_block_id_from_index(
+        self, index_node: object, sym_to_block_id: dict[str, int]
+    ) -> int | None:
+        """Infer the block id represented by an index expression."""
+        block_id, _ = self.infer_index_block_and_bias(index_node, sym_to_block_id)
+        return block_id
+
+    def infer_index_block_and_bias(
+        self, index_node: object, sym_to_block_id: dict[str, int]
+    ) -> tuple[int | None, int]:
+        """Infer a block id and additive bias from a tile-index expression."""
+        import torch.fx
+
+        block_id = self.infer_block_id_from_index_symbolic(index_node, sym_to_block_id)
+        if block_id is not None:
+            return block_id, 0
+        if isinstance(index_node, int):
+            return None, index_node
+        if not isinstance(index_node, torch.fx.Node):
+            return None, 0
+
+        target_name = str(index_node.target)
+        target_short_name = getattr(index_node.target, "__name__", "")
+        if "aten.add" in target_name or target_short_name in (
+            "add.Tensor",
+            "add.default",
+        ):
+            if len(index_node.args) >= 2:
+                left_block, left_bias = self.infer_index_block_and_bias(
+                    index_node.args[0], sym_to_block_id
+                )
+                right_block, right_bias = self.infer_index_block_and_bias(
+                    index_node.args[1], sym_to_block_id
+                )
+                if left_block is not None and right_block is None:
+                    return left_block, left_bias + right_bias
+                if right_block is not None and left_block is None:
+                    return right_block, right_bias + left_bias
+                if left_block is None and right_block is None:
+                    left_shape_block = self.infer_block_id_from_value_shape(
+                        index_node.args[0]
+                    )
+                    right_shape_block = self.infer_block_id_from_value_shape(
+                        index_node.args[1]
+                    )
+                    if left_shape_block is not None and right_shape_block is None:
+                        return left_shape_block, left_bias + right_bias
+                    if right_shape_block is not None and left_shape_block is None:
+                        return right_shape_block, right_bias + left_bias
+        return None, 0
+
+    def infer_block_id_from_value_shape(self, index_node: object) -> int | None:
+        """Infer a block id from a one-dimensional index value extent."""
+        import mlir.ir as ir
+        import torch.fx
+
+        if not isinstance(index_node, torch.fx.Node):
+            return None
+        value = self.get_value(index_node)
+        if value is None:
+            return None
+        try:
+            value_type = ir.RankedTensorType(value.type)
+        except Exception:
+            return None
+        if value_type.rank != 1:
+            return None
+        extent = int(value_type.shape[0])
+        candidates = [
+            block_id
+            for block_id in self.block_id_to_iv
+            if self.block_id_to_upper_bound.get(block_id) == extent
+            or self.block_id_to_size.get(block_id) == extent
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def infer_block_id_from_index_symbolic(
+        self, index_node: object, sym_to_block_id: dict[str, int]
+    ) -> int | None:
+        """Infer a block id from symbolic FX metadata."""
+        import sympy
+        import torch
+        import torch.fx
+
+        if not isinstance(index_node, torch.fx.Node):
+            return None
+        value = index_node.meta.get("val")
+        if not isinstance(value, torch.SymInt):
+            return None
+        symbol = str(value)
+        if symbol in sym_to_block_id:
+            return sym_to_block_id[symbol]
+        expression = getattr(getattr(value, "node", None), "expr", None)
+        if (
+            isinstance(expression, sympy.Symbol)
+            and id(expression) in self.block_symint_to_id
+        ):
+            return self.block_symint_to_id[id(expression)]
+        target_name = getattr(index_node.target, "__name__", "")
+        if target_name == "_get_symnode" and index_node.args:
+            return block_id_from_key(index_node.args[0])
+        if target_name in ("sym_size.int", "sym_size_int"):
+            tensor_node = index_node.args[0]
+            dim = int(index_node.args[1])
+            tensor_value = (
+                tensor_node.meta.get("val")
+                if isinstance(tensor_node, torch.fx.Node)
+                else None
+            )
+            if isinstance(tensor_value, torch.Tensor):
+                dimension = tensor_value.shape[dim]
+                dimension_expression = getattr(
+                    getattr(dimension, "node", None), "expr", None
+                )
+                if isinstance(dimension_expression, sympy.Symbol):
+                    return self.block_symint_to_id.get(id(dimension_expression))
+                return sym_to_block_id.get(str(dimension))
+        return None
+
+    def lower_graph(self, graph: torch.fx.Graph) -> ir.Value | None:
+        """Lower an FX graph through the builder callback."""
+        if self.lower_node_callback is None:
+            raise RuntimeError("BuildContext.lower_node_callback is not configured")
+        last_value: ir.Value | None = None
+        for node in graph.nodes:
+            value = self.lower_node_callback(node)
+            if value is not None:
+                self.set_value(node, value)
+                last_value = value
+        return last_value
+
+    def lower_root_graphs(self, shared_out: ir.Value) -> ir.Value:
+        """Lower all root device graphs for the active forall body."""
+        result = shared_out
+        for root_id in self.host_function.device_ir.root_ids:
+            graph = self.host_function.device_ir.graphs[root_id].graph
+            result = self.lower_graph(graph) or result
+        return result
+
+    @contextmanager
+    def enter_for_loop(
+        self, block_id: int, induction_variable: ir.Value
+    ) -> Iterator[None]:
+        """Bind a loop induction variable and restore the previous binding."""
+        previous = self.block_id_to_iv.get(block_id)
+        self.block_id_to_iv[block_id] = induction_variable
+        self.for_block_id_stack.append(block_id)
+        try:
+            yield
+        finally:
+            if self.for_block_id_stack and self.for_block_id_stack[-1] == block_id:
+                self.for_block_id_stack.pop()
+            if previous is None:
+                self.block_id_to_iv.pop(block_id, None)
+            else:
+                self.block_id_to_iv[block_id] = previous
+
+    @contextmanager
+    def push_store_ctx(self, store_context: dict[str, Any]) -> Iterator[None]:
+        """Push and reliably remove a synthetic store context."""
+        self.for_store_ctx_stack.append(store_context)
+        try:
+            yield
+        finally:
+            if (
+                self.for_store_ctx_stack
+                and self.for_store_ctx_stack[-1] is store_context
+            ):
+                self.for_store_ctx_stack.pop()

@@ -8,10 +8,12 @@ if TYPE_CHECKING:
     import mlir.ir as ir
     import torch.fx
 
+    from .build_context import BuildContext
 
-def lower_getitem(builder: object, node: torch.fx.Node) -> ir.Value | None:
+
+def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Extract one result from an ``scf.for`` result container."""
-    container_value = builder._get_value(node.args[0])
+    container_value = ctx.get_value(node.args[0])
     if container_value is None:
         return None
     index = int(node.args[1])
@@ -20,19 +22,19 @@ def lower_getitem(builder: object, node: torch.fx.Node) -> ir.Value | None:
     return container_value
 
 
-def lower_store(builder: object, node: torch.fx.Node) -> None:
+def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     """Record or apply a Helion store in the active loop context."""
     from mlir.dialects import tensor as tensor_d
     import mlir.ir as ir
 
     index_nodes = node.args[1]
     value_node = node.args[2]
-    value = builder._get_value(value_node)
+    value = ctx.get_value(value_node)
     assert value is not None, f"No value for store value node {value_node}"
     ndim = len(ir.RankedTensorType(value.type).shape)
 
-    if builder._for_store_ctx_stack:
-        context = builder._for_store_ctx_stack[-1]
+    if ctx.for_store_ctx_stack:
+        context = ctx.for_store_ctx_stack[-1]
         current = context.get("current")
         block_id = int(context.get("block_id", -1))
         inner_dim = int(context.get("inner_dim", -1))
@@ -40,16 +42,16 @@ def lower_store(builder: object, node: torch.fx.Node) -> None:
         if (
             current is not None
             and 0 <= inner_dim < rank
-            and block_id in builder._block_id_to_iv
+            and block_id in ctx.block_id_to_iv
         ):
             source_type = ir.RankedTensorType(value.type)
             updated = tensor_d.InsertSliceOp(
                 value,
                 current,
                 [
-                    builder._block_id_to_iv[block_id]
+                    ctx.block_id_to_iv[block_id]
                     if dimension == inner_dim
-                    else builder._get_index_const(0)
+                    else ctx.index_const(0)
                     for dimension in range(rank)
                 ],
                 [],
@@ -61,14 +63,14 @@ def lower_store(builder: object, node: torch.fx.Node) -> None:
             context["current"] = updated
             return
 
-    sym_to_block_id = builder._build_sym_to_block_id()
+    sym_to_block_id = ctx.build_sym_to_block_id()
     offsets: list[ir.Value] = []
     for dimension, index_node in enumerate(index_nodes):
         if dimension >= ndim:
             break
-        block_id = builder._infer_block_id_from_index(index_node, sym_to_block_id)
-        if block_id is not None and block_id in builder._block_id_to_iv:
-            offsets.append(builder._block_id_to_iv[block_id])
+        block_id = ctx.infer_block_id_from_index(index_node, sym_to_block_id)
+        if block_id is not None and block_id in ctx.block_id_to_iv:
+            offsets.append(ctx.block_id_to_iv[block_id])
         else:
-            offsets.append(builder._get_index_const(0))
-    builder._forall_insert_slices.append((value, offsets))
+            offsets.append(ctx.index_const(0))
+    ctx.forall_insert_slices.append((value, offsets))

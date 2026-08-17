@@ -22,13 +22,15 @@ def lower_helion_node(
     target_name: str,
 ) -> tuple[bool, ir.Value | None]:
     """Lower a Helion tracing node, returning whether it was recognized."""
+    from .memory_ops import lower_getitem
+
     lowerers: dict[str, Lowerer] = {
         "_host_tensor": builder._lower_host_tensor,
         "_get_symnode": builder._lower_get_symnode,
         "_new_var": lambda current: builder._get_value(current.args[0]),
         "_phi": lambda current: builder._get_value(current.args[1]),
         "_for_loop": builder._lower_for_loop,
-        "getitem": builder._lower_getitem,
+        "getitem": lambda current: lower_getitem(builder.context, current),
         "load": builder._lower_load,
         "store": builder._lower_store_node,
         "full": builder._lower_full,

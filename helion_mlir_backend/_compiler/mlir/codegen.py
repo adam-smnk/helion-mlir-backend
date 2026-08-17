@@ -122,6 +122,7 @@ class MLIRModuleBuilder:
         self.config = config
         self.env = env
         self.context = BuildContext(host_function, config, env)
+        self.context.lower_node_callback = self._lower_node
 
     @property
     def _node_to_value(self) -> dict[torch.fx.Node, ir.Value]:
@@ -341,46 +342,21 @@ class MLIRModuleBuilder:
     def _build_kernel_body(self, out_tensor: torch.Tensor) -> ir.Value:
         from .control_flow import build_kernel_body
 
-        return build_kernel_body(self, out_tensor)
+        return build_kernel_body(self.context, out_tensor)
 
     # ------------------------------------------------------------------
     # Root graph processing
     # ------------------------------------------------------------------
 
     def _process_root_graphs(self, shared_out: ir.Value) -> ir.Value:
-        """Walk all root graphs and return the accumulated result.
-
-        For a single root graph (the typical case), this processes the body
-        of one forall tile iteration.
-        """
-        device_ir = self.hf.device_ir
-        result: ir.Value = shared_out
-
-        for root_id in device_ir.root_ids:
-            root_graph_info = device_ir.graphs[root_id]
-            result = self._process_graph(root_graph_info.graph)
-
-        return result
+        return self.context.lower_root_graphs(shared_out)
 
     # ------------------------------------------------------------------
     # Graph walker
     # ------------------------------------------------------------------
 
     def _process_graph(self, graph: torch.fx.Graph) -> ir.Value | None:
-        """Walk an FX graph and emit MLIR ops for each node.
-
-        Returns the "last meaningful value" produced by the graph (used as the
-        result of ``scf.for`` iterations or the forall body).
-        """
-        last_val: ir.Value | None = None
-
-        for node in graph.nodes:
-            val = self._lower_node(node)
-            if val is not None:
-                self._node_to_value[node] = val
-                last_val = val
-
-        return last_val
+        return self.context.lower_graph(graph)
 
     # ------------------------------------------------------------------
     # Per-node lowering dispatcher
@@ -408,39 +384,11 @@ class MLIRModuleBuilder:
             if handled:
                 return value
 
-            # Special-case addmm in nested reductions: lowering directly to
-            # linalg.matmul with the accumulator as the `outs` tensor preserves
-            # loop-carried equivalence required by downstream lighthouse passes.
-            target_name = str(node.target)
-            is_addmm = "aten.addmm" in target_name or tname == "addmm.default"
-            is_add_tensor = "aten.add.Tensor" in target_name or tname == "add.Tensor"
-            is_mm_like = (
-                "aten.mm" in target_name
-                or "aten.matmul" in target_name
-                or tname in ("mm.default", "matmul.default")
-            )
-            is_bmm_like = "aten.bmm" in target_name or tname == "bmm.default"
-            is_baddbmm = "aten.baddbmm" in target_name or tname == "baddbmm.default"
+            from .aten_ops import lower_custom_aten
 
-            if is_addmm:
-                lowered_addmm = self._lower_aten_addmm(node)
-                if lowered_addmm is not None:
-                    return lowered_addmm
-            if is_baddbmm:
-                lowered_baddbmm = self._lower_aten_baddbmm(node)
-                if lowered_baddbmm is not None:
-                    return lowered_baddbmm
-            if is_add_tensor:
-                lowered_add_matmul = self._lower_aten_add_matmul_accumulate(node)
-                if lowered_add_matmul is not None:
-                    return lowered_add_matmul
-                lowered_add_tensor = self._lower_aten_add_tensor(node)
-                if lowered_add_tensor is not None:
-                    return lowered_add_tensor
-            if is_mm_like or is_bmm_like:
-                lowered_matmul = self._lower_aten_matmul(node)
-                if lowered_matmul is not None:
-                    return lowered_matmul
+            lowered_custom = lower_custom_aten(self, node)
+            if lowered_custom is not None:
+                return lowered_custom
             if tname == "subscript":
                 lowered_subscript = self._lower_subscript(node)
                 if lowered_subscript is not None:
@@ -781,17 +729,17 @@ class MLIRModuleBuilder:
     ) -> ir.Value | None:
         from .matmul_ops import emit_matmul_like
 
-        return emit_matmul_like(self, lhs, rhs, out)
+        return emit_matmul_like(self.context, lhs, rhs, out)
 
     def _lower_aten_matmul(self, node: torch.fx.Node) -> ir.Value | None:
         from .matmul_ops import lower_matmul
 
-        return lower_matmul(self, node)
+        return lower_matmul(self.context, node)
 
     def _lower_aten_baddbmm(self, node: torch.fx.Node) -> ir.Value | None:
         from .matmul_ops import lower_baddbmm
 
-        return lower_baddbmm(self, node)
+        return lower_baddbmm(self.context, node)
 
     def _lower_aten_relu(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower ``aten.relu`` directly to elementwise ``linalg.generic``."""
@@ -962,146 +910,25 @@ class MLIRModuleBuilder:
         return None
 
     def _shape_from_node_meta(self, node: object) -> list[int] | None:
-        """Extract concrete shape list from an FX node's metadata when possible."""
-        if not isinstance(node, torch.fx.Node):
-            return None
-
-        val = node.meta.get("val")
-        if isinstance(val, torch.Tensor):
-            try:
-                return [int(d) for d in val.shape]
-            except Exception:
-                return None
-
-        tmeta = node.meta.get("tensor_meta")
-        if tmeta is None:
-            return None
-        shape = getattr(tmeta, "shape", None)
-        if shape is None:
-            return None
-        try:
-            return [int(d) for d in shape]
-        except Exception:
-            return None
+        return self.context.shape_from_node_meta(node)
 
     # ------------------------------------------------------------------
     # Helpers for retrieving values
     # ------------------------------------------------------------------
 
     def _get_value(self, node_or_val: object) -> ir.Value | None:
-        """Look up an MLIR Value for a node or constant."""
-        from mlir.dialects import arith as arith_d
-        import mlir.ir as ir
-
-        if isinstance(node_or_val, torch.fx.Node):
-            return self._node_to_value.get(node_or_val)
-        if isinstance(node_or_val, (int, float)):
-            # Scalar constant – create an index constant for now.
-            if isinstance(node_or_val, int):
-                idx = ir.IndexType.get()
-                return arith_d.ConstantOp(
-                    idx, ir.IntegerAttr.get(idx, node_or_val)
-                ).result
-            f32 = ir.F32Type.get()
-            return arith_d.ConstantOp(
-                f32, ir.FloatAttr.get(f32, float(node_or_val))
-            ).result
-        return None
+        return self.context.get_value(node_or_val)
 
     def _get_index_const(self, val: int) -> ir.Value:
-        from mlir.dialects import arith as arith_d
-        import mlir.ir as ir
-
-        idx = ir.IndexType.get()
-        return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, val)).result
+        return self.context.index_const(val)
 
     def _cast_to_index(self, val: ir.Value) -> ir.Value:
-        """Cast an integer value to index type if needed."""
-        from mlir.dialects import arith as arith_d
-        from mlir.dialects import tensor as tensor_d
-        import mlir.ir as ir
-
-        if isinstance(val.type, ir.IndexType):
-            return val
-        if isinstance(val.type, ir.RankedTensorType) and val.type.rank == 0:
-            elem = val.type.element_type
-            if isinstance(elem, (ir.IntegerType, ir.IndexType)):
-                val = tensor_d.ExtractOp(val, []).result
-                if isinstance(val.type, ir.IndexType):
-                    return val
-        return arith_d.IndexCastOp(ir.IndexType.get(), val).result
+        return self.context.cast_to_index(val)
 
     def _shape_from_nodes(
         self, shape_nodes: list, operation_name: str = "op"
     ) -> list[int]:
-        """Return a concrete integer shape list from a list of FX shape nodes.
-
-        For ``_get_symnode("block_size_N")`` nodes the concrete block size is
-        read from ``_block_id_to_size`` (which is populated before codegen
-        starts).  For other nodes the ``meta["val"]`` SymInt hint is used as
-        a fallback.
-        """
-        shape = []
-        for s in shape_nodes:
-            if isinstance(s, torch.fx.Node):
-                tname = getattr(s.target, "__name__", "")
-                if tname == "_get_symnode" and s.args:
-                    key = s.args[0]
-                    block_id = block_id_from_key(key)
-                    if block_id is not None:
-                        if block_id in self._block_id_to_size:
-                            shape.append(self._block_id_to_size[block_id])
-                            continue
-                if tname in ("sym_size.int", "sym_size_int") and len(s.args) >= 2:
-                    tensor_arg = s.args[0]
-                    dim_arg = s.args[1]
-                    if isinstance(tensor_arg, torch.fx.Node) and isinstance(
-                        dim_arg, int
-                    ):
-                        tval = tensor_arg.meta.get("val")
-                        if isinstance(tval, torch.Tensor):
-                            from .aten_lowering import _resolve_dims
-
-                            resolved = _resolve_dims(
-                                tval.shape,
-                                self._block_id_to_size,
-                                self._block_hint_to_id,
-                                self._block_symint_to_id,
-                                self._block_id_to_upper_bound,
-                            )
-                            if 0 <= dim_arg < len(resolved):
-                                shape.append(resolved[dim_arg])
-                                continue
-                # Fall back: use meta["val"] if it's concrete
-                val = s.meta.get("val")
-                if isinstance(val, torch.SymInt):
-                    import sympy as _sympy
-
-                    sym = str(val)
-                    if sym.startswith("u") and sym[1:].isdigit():
-                        block_id = int(sym[1:])
-                        if block_id in self._block_id_to_size:
-                            shape.append(self._block_id_to_size[block_id])
-                            continue
-                    expr = getattr(getattr(val, "node", None), "expr", None)
-                    if isinstance(expr, _sympy.Symbol):
-                        sym2 = str(expr)
-                        if sym2.startswith("u") and sym2[1:].isdigit():
-                            block_id = int(sym2[1:])
-                            if block_id in self._block_id_to_size:
-                                shape.append(self._block_id_to_size[block_id])
-                                continue
-                if val is not None:
-                    try:
-                        shape.append(int(val))
-                        continue
-                    except Exception:
-                        pass
-            elif isinstance(s, int):
-                shape.append(s)
-                continue
-            shape.append(1)  # safe default
-        return shape
+        return self.context.shape_from_nodes(shape_nodes, operation_name)
 
     # ------------------------------------------------------------------
     # Individual node lowering methods
@@ -1287,7 +1114,7 @@ class MLIRModuleBuilder:
     def _lower_subscript(self, node: torch.fx.Node) -> ir.Value | None:
         from .subscript_ops import lower_subscript
 
-        return lower_subscript(self, node)
+        return lower_subscript(self.context, node)
 
     def _lower_sym_size(self, node: torch.fx.Node) -> ir.Value:
         """``sym_size.int(tensor, dim)`` → constant for the tensor dimension.
@@ -1723,7 +1550,7 @@ class MLIRModuleBuilder:
     def _lower_getitem(self, node: torch.fx.Node) -> ir.Value | None:
         from .memory_ops import lower_getitem
 
-        return lower_getitem(self, node)
+        return lower_getitem(self.context, node)
 
     def _lower_load(self, node: torch.fx.Node) -> ir.Value:
         """``load(tensor, index_list)`` → ``tensor.extract_slice``."""
@@ -1758,7 +1585,7 @@ class MLIRModuleBuilder:
                     from .load_ops import lower_flat_gather
 
                     gathered = lower_flat_gather(
-                        self,
+                        self.context,
                         tensor_node,
                         tensor_val,
                         gather_index_val,
@@ -1916,7 +1743,7 @@ class MLIRModuleBuilder:
     def _lower_store(self, node: torch.fx.Node) -> None:
         from .memory_ops import lower_store
 
-        lower_store(self, node)
+        lower_store(self.context, node)
 
     def _lower_store_node(self, node: torch.fx.Node) -> ir.Value | None:
         self._lower_store(node)
@@ -1934,6 +1761,7 @@ class MLIRModuleBuilder:
         """
         from .aten_lowering import is_aten_op
         from .aten_lowering import preprocess_aten_nodes
+        from .aten_ops import is_custom_aten
 
         # Propagate symbolic shapes from outer _for_loop iter-args into inner
         # loop body placeholders BEFORE scanning ATen nodes.  Without this,
@@ -1947,24 +1775,7 @@ class MLIRModuleBuilder:
         for graph_info in self.hf.device_ir.graphs:
             for node in graph_info.graph.nodes:
                 if is_aten_op(node):
-                    target_name = str(node.target)
-                    target_overload = getattr(node.target, "__name__", "")
-                    if (
-                        "aten.addmm" in target_name
-                        or "aten.mm" in target_name
-                        or "aten.matmul" in target_name
-                        or "aten.bmm" in target_name
-                        or "aten.baddbmm" in target_name
-                        or target_overload
-                        in (
-                            "addmm.default",
-                            "mm.default",
-                            "matmul.default",
-                            "bmm.default",
-                            "baddbmm.default",
-                        )
-                    ):
-                        # These are lowered directly in codegen.
+                    if is_custom_aten(node):
                         continue
                     aten_nodes.append(node)
 
@@ -2282,12 +2093,7 @@ class MLIRModuleBuilder:
     # ------------------------------------------------------------------
 
     def _build_sym_to_block_id(self) -> dict[str, int]:
-        """Build mapping from sympy symbol name (e.g. "u0") → block_id."""
-        mapping: dict[str, int] = {}
-        for bs in self.env.block_sizes:
-            # The symbolic variable name follows the pattern "uN" where N == block_id.
-            mapping[f"u{bs.block_id}"] = bs.block_id
-        return mapping
+        return self.context.build_sym_to_block_id()
 
     def _infer_block_id_from_index(
         self,

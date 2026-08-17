@@ -8,15 +8,17 @@ if TYPE_CHECKING:
     import mlir.ir as ir
     import torch.fx
 
+    from .build_context import BuildContext
 
-def lower_subscript(builder: object, node: torch.fx.Node) -> ir.Value | None:
+
+def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower tensor-valued indexing and full-slice subscripts."""
     from mlir.dialects import tensor as tensor_d
     import mlir.ir as ir
 
     if len(node.args) < 2:
         return None
-    source_value = builder._get_value(node.args[0])
+    source_value = ctx.get_value(node.args[0])
     if source_value is None:
         return None
 
@@ -25,9 +27,9 @@ def lower_subscript(builder: object, node: torch.fx.Node) -> ir.Value | None:
         index_candidates.extend(arg if isinstance(arg, (list, tuple)) else [arg])
     index_value = next(
         (
-            builder._get_value(candidate)
+            ctx.get_value(candidate)
             for candidate in index_candidates
-            if builder._get_value(candidate) is not None
+            if ctx.get_value(candidate) is not None
         ),
         None,
     )
@@ -75,7 +77,7 @@ def lower_subscript(builder: object, node: torch.fx.Node) -> ir.Value | None:
                 index_value, indices, results=[ir.IndexType.get()]
             ).result
             if not isinstance(extracted_index.type, ir.IndexType):
-                extracted_index = builder._cast_to_index(extracted_index)
+                extracted_index = ctx.cast_to_index(extracted_index)
             gathered = tensor_d.ExtractOp(
                 source_value, [extracted_index], results=[element_type]
             ).result
@@ -84,7 +86,7 @@ def lower_subscript(builder: object, node: torch.fx.Node) -> ir.Value | None:
 
     if any(isinstance(spec, (int, float)) for spec in index_candidates):
         return None
-    result_shape = builder._shape_from_node_meta(node)
+    result_shape = ctx.shape_from_node_meta(node)
     if result_shape is None:
         result_shape = [int(dim) for dim in source_type.shape]
         result_shape.extend(1 for spec in index_candidates if spec is None)

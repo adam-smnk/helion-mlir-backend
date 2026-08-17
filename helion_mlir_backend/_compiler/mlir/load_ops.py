@@ -10,9 +10,11 @@ import torch.fx
 if TYPE_CHECKING:
     import mlir.ir as ir
 
+    from .build_context import BuildContext
+
 
 def lower_flat_gather(
-    builder: object,
+    ctx: BuildContext,
     tensor_node: object,
     tensor_value: ir.Value,
     index_value: ir.Value,
@@ -50,8 +52,8 @@ def lower_flat_gather(
             alias_name = tensor_node.args[0]
             if isinstance(alias_name, str) and alias_name.endswith("_flat"):
                 base_name = alias_name[: -len("_flat")]
-                alias_value = builder.hf.params.arguments.get(alias_name)
-                base_value = builder.hf.params.arguments.get(base_name)
+                alias_value = ctx.host_function.params.arguments.get(alias_name)
+                base_value = ctx.host_function.params.arguments.get(base_name)
                 if (
                     isinstance(alias_value, torch.Tensor)
                     and isinstance(base_value, torch.Tensor)
@@ -75,7 +77,7 @@ def lower_flat_gather(
             indices,
             results=[index_type.element_type],
         ).result
-        extracted_index = builder._cast_to_index(extracted_index)
+        extracted_index = ctx.cast_to_index(extracted_index)
         gathered = tensor_d.ExtractOp(
             tensor_value,
             [extracted_index],

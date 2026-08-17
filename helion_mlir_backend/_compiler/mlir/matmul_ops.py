@@ -9,9 +9,11 @@ import torch.fx
 if TYPE_CHECKING:
     import mlir.ir as ir
 
+    from .build_context import BuildContext
+
 
 def emit_matmul_like(
-    builder: object,
+    ctx: BuildContext,
     lhs: ir.Value,
     rhs: ir.Value,
     out: ir.Value | None = None,
@@ -77,34 +79,34 @@ def emit_matmul_like(
     return linalg_d.batch_matmul(lhs, rhs, outs=[out])
 
 
-def lower_matmul(builder: object, node: torch.fx.Node) -> ir.Value | None:
+def lower_matmul(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower ``aten.mm``, ``aten.matmul``, or ``aten.bmm``."""
     from .aten_lowering import normalized_aten_args
 
     args = list(normalized_aten_args(node))
     if len(args) < 2:
         return None
-    lhs = builder._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
-    rhs = builder._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
+    lhs = ctx.get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
+    rhs = ctx.get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
     if lhs is None or rhs is None:
         return None
-    return emit_matmul_like(builder, lhs, rhs)
+    return emit_matmul_like(ctx, lhs, rhs)
 
 
-def lower_baddbmm(builder: object, node: torch.fx.Node) -> ir.Value | None:
+def lower_baddbmm(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower ``aten.baddbmm`` when its scale factors are one."""
     from .aten_lowering import normalized_aten_args
 
     args = list(normalized_aten_args(node))
     if len(args) < 3:
         return None
-    acc = builder._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
-    lhs = builder._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
-    rhs = builder._get_value(args[2]) if isinstance(args[2], torch.fx.Node) else None
+    acc = ctx.get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
+    lhs = ctx.get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
+    rhs = ctx.get_value(args[2]) if isinstance(args[2], torch.fx.Node) else None
     if acc is None or lhs is None or rhs is None:
         return None
     beta = args[3] if len(args) > 3 else 1
     alpha = args[4] if len(args) > 4 else 1
     if beta != 1 or alpha != 1:
         return None
-    return emit_matmul_like(builder, lhs, rhs, out=acc)
+    return emit_matmul_like(ctx, lhs, rhs, out=acc)
