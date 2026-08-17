@@ -330,17 +330,9 @@ def _build_aten_subgraph(
         or "aten.sub.Tensor" in target_name
         or "aten.div.Tensor" in target_name
     ):
-        target_shape = _compute_broadcast_target_shape(
+        target_shape = broadcast_target_shape(
             [t for t in concrete_tensor_args.values() if isinstance(t, torch.Tensor)]
         )
-        if target_shape is None:
-            target_shape = _compute_conservative_common_shape(
-                [
-                    t
-                    for t in concrete_tensor_args.values()
-                    if isinstance(t, torch.Tensor)
-                ]
-            )
         if target_shape is not None:
             for fx_node, t in list(concrete_tensor_args.items()):
                 if tuple(int(s) for s in t.shape) != tuple(target_shape):
@@ -531,6 +523,13 @@ def _compute_conservative_common_shape(
             result_rev.append(1)
 
     return list(reversed(result_rev))
+
+
+def broadcast_target_shape(tensors: list[torch.Tensor]) -> list[int] | None:
+    """Return a broadcast shape with a fallback for stale metadata."""
+    return _compute_broadcast_target_shape(
+        tensors
+    ) or _compute_conservative_common_shape(tensors)
 
 
 def _tensor_meta(t: torch.Tensor) -> object:
