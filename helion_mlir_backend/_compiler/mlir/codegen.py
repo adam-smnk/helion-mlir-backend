@@ -134,48 +134,24 @@ class MLIRModuleBuilder:
         self._block_symint_to_id: dict[int, int] = {}
         # block_id → static upper bound inferred from _for_loop metadata.
         self._block_id_to_upper_bound: dict[int, int] = {}
-        # Maps block_id → current MLIR offset Value (loop IV)
+        # Maps block_id → current MLIR offset Value (loop IV).
         self._block_id_to_iv: dict[int, ir.Value] = {}
-        # Stack of pending insert_slice ops collected inside forall.in_parallel
-        self._forall_insert_slices: list[tuple] = []  # (value, offsets)
-        # Active synthetic inner-loop store contexts.
+        self._forall_insert_slices: list[tuple] = []
         self._for_store_ctx_stack: list[dict[str, Any]] = []
-        # Stack of active scf.for block ids (innermost last).
         self._for_block_id_stack: list[int] = []
 
-        # These are populated inside build() once the ir.Module/Context exist.
         self._mlir_module: ir.Module | None = None
         self._mlir_context: ir.Context | None = None
-        # Pre-computed ATen helper map: id(node) → (func_name, return_types).
-        # Populated by _prebuild_aten_helpers() before _build_function() runs.
         self._node_to_aten_func: dict[int, tuple[str, list]] = {}
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
     def build(self) -> ir.Module:
-        """Build and return the MLIR module.
-
-        Returns
-        -------
-        ir.Module
-            The generated MLIR module
-
-        Raises
-        ------
-        ModuleBuilderError
-            If module building fails at any stage
-        """
+        """Build and return the generated MLIR module."""
         import mlir.ir as ir
 
         try:
             ctx = ir.Context()
-            # Register dialects we use
             from mlir.dialects import arith as arith_d  # noqa: F401
-            from mlir.dialects import (
-                func as func_d,  # noqa: F401 – side-effect registration
-            )
+            from mlir.dialects import func as func_d  # noqa: F401
             from mlir.dialects import linalg as linalg_d  # noqa: F401
             from mlir.dialects import scf as scf_d  # noqa: F401
             from mlir.dialects import tensor as tensor_d  # noqa: F401
@@ -185,13 +161,9 @@ class MLIRModuleBuilder:
                 self._mlir_module = module
                 self._mlir_context = ctx
                 with ir.InsertionPoint(module.body), self.hf:
-                    # Resolve block sizes first (needed by both phases).
                     self._resolve_block_sizes()
                     self._resolve_block_upper_bounds()
-                    # Phase 1: lower all ATen nodes once, insert helpers at
-                    # module top level (before the main kernel function).
                     self._prebuild_aten_helpers(module)
-                    # Phase 2: build the main kernel function.
                     self._build_function()
             return module
         except (
@@ -200,232 +172,54 @@ class MLIRModuleBuilder:
             ValueNotFoundError,
             UnsupportedOperationError,
         ):
-            # Re-raise our custom exceptions
             raise
-        except Exception as e:
+        except Exception as exc:
             raise ModuleBuilderError(
                 "module_creation",
-                reason=str(e),
+                reason=str(exc),
                 recovery_hint="Check that kernel has static_shapes=True and all ops are in hl.tile() loops",
-            ) from e
-
-    # ------------------------------------------------------------------
-    # Function signature
-    # ------------------------------------------------------------------
+            ) from exc
 
     def _build_function(self) -> None:
         from mlir.dialects import func as func_d
         import mlir.ir as ir
 
-        hf = self.hf
-        # Collect tensor parameters (non-constexpr, non-symbolic)
-        tensor_params: list[tuple[str, torch.Tensor]] = []
-        for name, val in hf.params.arguments.items():
-            if isinstance(val, torch.Tensor):
-                tensor_params.append((name, val))
-
-        # Build input types
-        input_types: list[ir.Type] = [
-            torch_tensor_to_mlir_type(t) for _, t in tensor_params
+        tensor_params = [
+            (name, value)
+            for name, value in self.hf.params.arguments.items()
+            if isinstance(value, torch.Tensor)
         ]
-
-        # Output type: the return tensor.
-        # Helion kernels return a tensor assigned to the last name in
-        # ``tensor_params`` that appears in the kernel return statement.
-        # For static_shapes=True, the output tensor is among the fake_args
-        # or is created inside the kernel (torch.empty).  We detect it as the
-        # tensor registered with name "out" (or the last one if none found).
-        #
-        # TODO(helion-mlir): handle multiple return tensors.
         out_name, out_tensor = self._find_output_tensor(tensor_params)
-        output_types: list[ir.Type] = [torch_tensor_to_mlir_type(out_tensor)]
-
-        # Filter tensor_params to INPUTS only (exclude the selected output tensor
-        # which is created inside the kernel body, not passed as an argument).
-        # When output selection comes from store-target or metadata fallbacks,
-        # out_name can be synthetic and not present in tensor_params.
+        output_types = [torch_tensor_to_mlir_type(out_tensor)]
         if any(name == out_name for name, _ in tensor_params):
-            input_params = [(n, t) for n, t in tensor_params if n != out_name]
+            input_params = [
+                (name, value) for name, value in tensor_params if name != out_name
+            ]
         else:
-            input_params = [(n, t) for n, t in tensor_params if t is not out_tensor]
-        input_types = [torch_tensor_to_mlir_type(t) for _, t in input_params]
+            input_params = [
+                (name, value)
+                for name, value in tensor_params
+                if value is not out_tensor
+            ]
+        input_types = [torch_tensor_to_mlir_type(value) for _, value in input_params]
 
-        func_type = ir.FunctionType.get(input_types, output_types)
-        fn = func_d.FuncOp(hf.name, func_type)
+        fn = func_d.FuncOp(self.hf.name, ir.FunctionType.get(input_types, output_types))
         fn.attributes["sym_visibility"] = ir.StringAttr.get("public")
-
         entry = fn.add_entry_block()
         with ir.InsertionPoint(entry):
-            # Register parameter names → MLIR values
             for (name, _), arg in zip(input_params, entry.arguments, strict=True):
                 self._param_to_value[name] = arg
-
-            # Block sizes are pre-resolved in build() before this call.
-            # Only resolve here if they haven't been populated yet (e.g. in
-            # tests that call _build_function() directly, without HostFunction).
             if not self._block_id_to_size:
                 with self.hf:
                     self._resolve_block_sizes()
-
-            # Build the kernel body
-            result = self._build_kernel_body(out_tensor)
-            func_d.ReturnOp([result])
+            func_d.ReturnOp([self._build_kernel_body(out_tensor)])
 
     def _find_output_tensor(
         self, tensor_params: list[tuple[str, torch.Tensor]]
     ) -> tuple[str, torch.Tensor]:
-        """Find the name and fake value of the output tensor.
+        from .output_resolver import OutputTensorResolver
 
-        The output tensor is the one created by ``torch.empty`` inside the
-        kernel.  In the HostFunction params it appears with the name used in
-        the kernel body (commonly ``"out"``).  We look for it via
-        ``_host_tensor`` nodes in the device IR that reference tensors NOT
-        passed as inputs.
-        """
-
-        output_meta_tensor: torch.Tensor | None = None
-
-        # Prefer the tensor that actually appears in graph output metadata.
-        for graph_info in self.hf.device_ir.graphs:
-            output_node = next(
-                (n for n in graph_info.graph.nodes if n.op == "output"), None
-            )
-            if output_node is None or not output_node.args:
-                continue
-            out_arg = output_node.args[0]
-            if isinstance(out_arg, (list, tuple)) and out_arg:
-                out_arg = out_arg[0]
-            if not isinstance(out_arg, torch.fx.Node):
-                continue
-            out_val = out_arg.meta.get("val")
-            if not isinstance(out_val, torch.Tensor):
-                continue
-            output_meta_tensor = out_val
-            for name, tensor in tensor_params:
-                if tensor is out_val:
-                    return name, tensor
-
-        # Fallback: match by output metadata shape/dtype when identity differs.
-        # This avoids selecting aliases like flattened views as the function output.
-        if output_meta_tensor is not None:
-            same_meta = [
-                (name, tensor)
-                for name, tensor in tensor_params
-                if tuple(tensor.shape) == tuple(output_meta_tensor.shape)
-                and tensor.dtype == output_meta_tensor.dtype
-            ]
-            if len(same_meta) == 1:
-                return same_meta[0]
-
-        # Collect tensor_param names that are genuine INPUTS (referenced in
-        # the original kernel signature ``hf.args``).
-        input_names = {arg.arg for arg in self.hf.args.args}
-
-        # Common-case preference: explicit output name used in kernels.
-        for name, tensor in tensor_params:
-            if name == "out" and name not in input_names:
-                return name, tensor
-
-        # Prefer tensors that are explicit store destinations before alias/
-        # metadata fallbacks. This avoids selecting flattened aliases (e.g.
-        # x_flat) as function outputs when stores target a higher-rank tensor.
-        # This is more reliable than output metadata for alias-heavy kernels
-        # where the graph output may reference a flattened/viewed tensor.
-        input_tensor_ids = {id(t) for _, t in tensor_params}
-        store_targets: list[torch.Tensor] = []
-        for g in self.hf.device_ir.graphs:
-            for node in g.graph.nodes:
-                if (
-                    node.op == "call_function"
-                    and getattr(node.target, "__name__", "") == "store"
-                    and len(node.args) >= 1
-                    and isinstance(node.args[0], torch.fx.Node)
-                ):
-                    dst = node.args[0]
-                    dst_val = dst.meta.get("val")
-                    if (
-                        isinstance(dst_val, torch.Tensor)
-                        and id(dst_val) not in input_tensor_ids
-                    ):
-                        store_targets.append(dst_val)
-
-        if store_targets:
-            unique_targets: list[torch.Tensor] = []
-            seen_ids: set[int] = set()
-            for t in store_targets:
-                if id(t) in seen_ids:
-                    continue
-                seen_ids.add(id(t))
-                unique_targets.append(t)
-
-            if len(unique_targets) == 1:
-                return "__store_target__", unique_targets[0]
-
-            if output_meta_tensor is not None:
-                matching_store_targets = [
-                    t
-                    for t in unique_targets
-                    if tuple(t.shape) == tuple(output_meta_tensor.shape)
-                    and t.dtype == output_meta_tensor.dtype
-                ]
-                if len(matching_store_targets) == 1:
-                    return "__store_target__", matching_store_targets[0]
-
-            ranked_store_targets = sorted(
-                unique_targets,
-                key=lambda t: (len(t.shape), t.numel()),
-                reverse=True,
-            )
-            if ranked_store_targets:
-                return "__store_target__", ranked_store_targets[0]
-
-        non_input_tensors = [
-            (name, tensor) for name, tensor in tensor_params if name not in input_names
-        ]
-        if len(non_input_tensors) == 1:
-            return non_input_tensors[0]
-
-        if output_meta_tensor is not None:
-            same_non_input_meta = [
-                (name, tensor)
-                for name, tensor in non_input_tensors
-                if tuple(tensor.shape) == tuple(output_meta_tensor.shape)
-                and tensor.dtype == output_meta_tensor.dtype
-            ]
-            if len(same_non_input_meta) == 1:
-                return same_non_input_meta[0]
-
-        # Fallback: look through device IR for _host_tensor calls on tensors
-        # not in input_names.
-        for g in self.hf.device_ir.graphs:
-            for node in g.graph.nodes:
-                if (
-                    node.op == "call_function"
-                    and getattr(node.target, "__name__", "") == "_host_tensor"
-                ):
-                    tname = node.args[0]
-                    if tname not in input_names:
-                        val = node.meta.get("val")
-                        if isinstance(val, torch.Tensor):
-                            return tname, val
-
-        # If multiple non-input tensors exist (e.g. flattened aliases), prefer
-        # higher-rank candidates before falling back to metadata-only output.
-        if non_input_tensors:
-            ranked = sorted(
-                non_input_tensors,
-                key=lambda kv: (len(kv[1].shape), kv[1].numel()),
-                reverse=True,
-            )
-            return ranked[0]
-
-        # Final fallback for alias-heavy kernels where output does not map to a
-        # registered tensor parameter.
-        if output_meta_tensor is not None:
-            return "__output_meta__", output_meta_tensor
-
-        # Last resort: use the last tensor param.
-        return tensor_params[-1]
+        return OutputTensorResolver(self.hf).resolve(tensor_params)
 
     def _resolve_block_sizes(self) -> None:
         """Populate ``_block_id_to_size`` and SymInt identity maps from the config."""
@@ -634,24 +428,11 @@ class MLIRModuleBuilder:
             target = node.target
             tname = getattr(target, "__name__", str(target))
 
-            helion_lowerer = {
-                "_host_tensor": self._lower_host_tensor,
-                "_get_symnode": self._lower_get_symnode,
-                "_new_var": lambda n: self._get_value(n.args[0]),
-                "_phi": lambda n: self._get_value(n.args[1]),
-                "_for_loop": self._lower_for_loop,
-                "getitem": self._lower_getitem,
-                "load": self._lower_load,
-                "store": self._lower_store_node,
-                "full": self._lower_full,
-                "zeros": self._lower_zeros,
-                "sym_size.int": self._lower_sym_size,
-                "sym_size_int": self._lower_sym_size,
-                "tile_index": self._lower_tile_index,
-                "_mask_to": self._lower_mask_to,
-            }.get(tname)
-            if helion_lowerer is not None:
-                return helion_lowerer(node)
+            from .node_dispatch import lower_helion_node
+
+            handled, value = lower_helion_node(self, node, tname)
+            if handled:
+                return value
 
             # Special-case addmm in nested reductions: lowering directly to
             # linalg.matmul with the accumulator as the `outs` tensor preserves
