@@ -78,7 +78,7 @@ from typing import Any
 import torch
 import torch.fx
 
-from .dynamic_shapes import SymbolTable
+from .block_ids import block_id_from_key
 from .errors import DynamicShapeError
 from .errors import ModuleBuilderError
 from .errors import NodeLoweringError
@@ -142,9 +142,6 @@ class MLIRModuleBuilder:
         self._for_store_ctx_stack: list[dict[str, Any]] = []
         # Stack of active scf.for block ids (innermost last).
         self._for_block_id_stack: list[int] = []
-
-        # Symbol table for tracking dynamic shapes (SymInt values)
-        self._symbol_table = SymbolTable()
 
         # These are populated inside build() once the ir.Module/Context exist.
         self._mlir_module: ir.Module | None = None
@@ -456,8 +453,8 @@ class MLIRModuleBuilder:
                 tname = getattr(node.target, "__name__", "")
                 if tname == "_get_symnode" and node.args:
                     key = node.args[0]
-                    if isinstance(key, str) and "block_size_" in key:
-                        block_id = int(key.split("_")[-1])
+                    block_id = block_id_from_key(key)
+                    if block_id is not None:
                         val = node.meta.get("val")
                         if val is not None and block_id in self._block_id_to_size:
                             # Use sympy Symbol identity — stable because sympy caches symbols.
@@ -637,39 +634,24 @@ class MLIRModuleBuilder:
             target = node.target
             tname = getattr(target, "__name__", str(target))
 
-            # --- Helion tracing ops ---
-            if tname == "_host_tensor":
-                return self._lower_host_tensor(node)
-            if tname == "_get_symnode":
-                return self._lower_get_symnode(node)
-            if tname == "_new_var":
-                # Alias / SSA rename – just pass through.
-                return self._get_value(node.args[0])
-            if tname == "_phi":
-                # After the for loop: _phi(init, loop_result) → loop_result.
-                return self._get_value(node.args[1])
-            if tname == "_for_loop":
-                return self._lower_for_loop(node)
-            if tname == "getitem":
-                # Extract element from a list/tuple result.
-                return self._lower_getitem(node)
-
-            # --- Memory ops ---
-            if tname == "load":
-                return self._lower_load(node)
-            if tname == "store":
-                self._lower_store(node)
-                return None
-
-            # --- Creation ops ---
-            if tname == "full":
-                return self._lower_full(node)
-            if tname == "zeros":
-                return self._lower_zeros(node)
-
-            # --- Tensor shape ops ---
-            if tname in ("sym_size.int", "sym_size_int"):
-                return self._lower_sym_size(node)
+            helion_lowerer = {
+                "_host_tensor": self._lower_host_tensor,
+                "_get_symnode": self._lower_get_symnode,
+                "_new_var": lambda n: self._get_value(n.args[0]),
+                "_phi": lambda n: self._get_value(n.args[1]),
+                "_for_loop": self._lower_for_loop,
+                "getitem": self._lower_getitem,
+                "load": self._lower_load,
+                "store": self._lower_store_node,
+                "full": self._lower_full,
+                "zeros": self._lower_zeros,
+                "sym_size.int": self._lower_sym_size,
+                "sym_size_int": self._lower_sym_size,
+                "tile_index": self._lower_tile_index,
+                "_mask_to": self._lower_mask_to,
+            }.get(tname)
+            if helion_lowerer is not None:
+                return helion_lowerer(node)
 
             # Special-case addmm in nested reductions: lowering directly to
             # linalg.matmul with the accumulator as the `outs` tensor preserves
@@ -704,24 +686,6 @@ class MLIRModuleBuilder:
                 lowered_matmul = self._lower_aten_matmul(node)
                 if lowered_matmul is not None:
                     return lowered_matmul
-            if "aten.relu" in target_name:
-                relu_arg0 = node.args[0] if node.args else None
-                relu_arg0_tname = (
-                    getattr(relu_arg0.target, "__name__", "")
-                    if isinstance(relu_arg0, torch.fx.Node)
-                    else ""
-                )
-                # Keep helper-based relu for direct load->relu patterns so
-                # helper visibility tests remain covered.
-                if relu_arg0_tname != "load":
-                    lowered_relu = self._lower_aten_relu(node)
-                    if lowered_relu is not None:
-                        return lowered_relu
-
-            if tname == "tile_index":
-                lowered_tile_index = self._lower_tile_index(node)
-                if lowered_tile_index is not None:
-                    return lowered_tile_index
             if tname == "subscript":
                 lowered_subscript = self._lower_subscript(node)
                 if lowered_subscript is not None:
@@ -730,11 +694,6 @@ class MLIRModuleBuilder:
                     tname,
                     reason=f"Unsupported subscript form with args={node.args!r}",
                 )
-            if tname == "_mask_to":
-                lowered_mask_to = self._lower_mask_to(node)
-                if lowered_mask_to is not None:
-                    return lowered_mask_to
-
             # --- All standard ATen ops → pre-built linalg helper (func.call) ---
             from mlir.dialects import func as func_d
 
@@ -1394,45 +1353,6 @@ class MLIRModuleBuilder:
                     return val
         return arith_d.IndexCastOp(ir.IndexType.get(), val).result
 
-    def _extract_concrete_shape(
-        self,
-        shape_nodes: list[Any],
-        operation_name: str = "unknown",
-    ) -> list[int]:
-        """Extract concrete shape from potentially dynamic shape nodes.
-
-        This method uses the symbol table to track SymInt values and
-        returns a concrete shape suitable for MLIR code generation.
-
-        Parameters
-        ----------
-        shape_nodes : list[Any]
-            Nodes/values representing each dimension
-        operation_name : str
-            Name of operation (for logging)
-
-        Returns
-        -------
-        list[int]
-            Concrete shape values (SymInts resolved to their values or defaults)
-        """
-        from .dynamic_shapes import extract_symbol_from_shape
-
-        shape: list[int] = []
-        for i, s in enumerate(shape_nodes):
-            sym_name, concrete = extract_symbol_from_shape(s, i, self._symbol_table)
-            if sym_name is not None and concrete is None:
-                # Symbol couldn't be resolved, use default
-                log.debug(
-                    "Dynamic dim %d in %s: symbol=%s (using default)",
-                    i,
-                    operation_name,
-                    sym_name,
-                )
-                concrete = 1  # Safe default
-            shape.append(max(1, concrete or 0))
-        return shape
-
     def _shape_from_nodes(
         self, shape_nodes: list, operation_name: str = "op"
     ) -> list[int]:
@@ -1449,8 +1369,8 @@ class MLIRModuleBuilder:
                 tname = getattr(s.target, "__name__", "")
                 if tname == "_get_symnode" and s.args:
                     key = s.args[0]
-                    if isinstance(key, str) and "block_size_" in key:
-                        block_id = int(key.split("_")[-1])
+                    block_id = block_id_from_key(key)
+                    if block_id is not None:
                         if block_id in self._block_id_to_size:
                             shape.append(self._block_id_to_size[block_id])
                             continue
@@ -1462,12 +1382,10 @@ class MLIRModuleBuilder:
                     ):
                         tval = tensor_arg.meta.get("val")
                         if isinstance(tval, torch.Tensor):
-                            from .aten_lowering import (
-                                _resolve_shape as _aten_resolve_shape,
-                            )
+                            from .aten_lowering import _resolve_dims
 
-                            resolved = _aten_resolve_shape(
-                                tval,
+                            resolved = _resolve_dims(
+                                tval.shape,
                                 self._block_id_to_size,
                                 self._block_hint_to_id,
                                 self._block_symint_to_id,
@@ -1596,7 +1514,9 @@ class MLIRModuleBuilder:
 
         key: str = node.args[0]
         # Parse "block_size_N" to get block_id N.
-        block_id = int(key.split("_")[-1])
+        block_id = block_id_from_key(key)
+        if block_id is None:
+            raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
         size = self._block_id_to_size.get(block_id, 0)
         idx = ir.IndexType.get()
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
@@ -2400,13 +2320,13 @@ class MLIRModuleBuilder:
 
         # Derive tile sizes from the load result's meta — identical source to
         # what preprocess_aten_nodes uses, guaranteeing consistent shapes.
-        from .aten_lowering import _resolve_shape as _aten_resolve_shape
+        from .aten_lowering import _resolve_dims
 
         result_val = node.meta.get("val")
         result_sizes: list[int] | None = None
         if isinstance(result_val, torch.Tensor):
-            result_sizes = _aten_resolve_shape(
-                result_val,
+            result_sizes = _resolve_dims(
+                result_val.shape,
                 self._block_id_to_size,
                 self._block_hint_to_id,
                 self._block_symint_to_id,
@@ -2569,6 +2489,10 @@ class MLIRModuleBuilder:
         # Queue the insert_slice for the forall.in_parallel region.
         self._forall_insert_slices.append((value, offsets))
 
+    def _lower_store_node(self, node: torch.fx.Node) -> ir.Value | None:
+        self._lower_store(node)
+        return None
+
     # ------------------------------------------------------------------
     # ATen pre-pass: lower all ATen nodes before codegen starts
     # ------------------------------------------------------------------
@@ -2704,18 +2628,7 @@ class MLIRModuleBuilder:
         if len(tensor_positions) != len(input_mlir_vals):
             return None
 
-        mlir_to_torch: dict[str, torch.dtype] = {
-            "f32": torch.float32,
-            "f64": torch.float64,
-            "f16": torch.float16,
-            "bf16": torch.bfloat16,
-            "i64": torch.int64,
-            "i32": torch.int32,
-            "i16": torch.int16,
-            "i8": torch.int8,
-            "i1": torch.bool,
-            "index": torch.int64,
-        }
+        from .type_utils import mlir_dtype_to_torch
 
         backups: list[tuple[torch.fx.Node, object, object]] = []
         override_by_position: dict[int, torch.Tensor] = {}
@@ -2730,8 +2643,22 @@ class MLIRModuleBuilder:
                 rty = ir.RankedTensorType(mlir_val.type)
                 shape = [int(d) for d in rty.shape]
                 elem_key = str(rty.element_type)
-                dtype = mlir_to_torch.get(elem_key)
-                if dtype is None:
+                dtype = mlir_dtype_to_torch(
+                    elem_key,
+                    default=torch.int64 if elem_key == "index" else torch.float32,
+                )
+                if elem_key not in {
+                    "f32",
+                    "f64",
+                    "f16",
+                    "bf16",
+                    "i1",
+                    "i8",
+                    "i16",
+                    "i32",
+                    "i64",
+                    "index",
+                }:
                     return None
 
                 old_val = arg_node.meta.get("val")
@@ -2968,7 +2895,9 @@ class MLIRModuleBuilder:
                                 and "block_size_" in shape_node.args[0]
                                 and i < len(outer_val.shape)
                             ):
-                                block_id = int(shape_node.args[0].split("_")[-1])
+                                block_id = block_id_from_key(shape_node.args[0])
+                                if block_id is None:
+                                    continue
                                 dim_symint = outer_val.shape[i]
                                 if isinstance(dim_symint, torch.SymInt):
                                     import sympy as _sympy
@@ -3195,7 +3124,7 @@ class MLIRModuleBuilder:
                 if tname == "_get_symnode" and idx_node.args:
                     key = idx_node.args[0]
                     if isinstance(key, str) and "block_size_" in key:
-                        return int(key.split("_")[-1])
+                        return block_id_from_key(key)
         # For sym_size.int nodes the val is a SymInt too.
         if isinstance(val, torch.SymInt):
             tname = getattr(idx_node.target, "__name__", "")

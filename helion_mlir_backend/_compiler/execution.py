@@ -185,16 +185,7 @@ class HelionMLIRExecutor:
         """Extract output shapes/dtypes from the func.func IR before lowering."""
         import mlir.ir as ir
 
-        _MLIR_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
-            "f32": torch.float32,
-            "f64": torch.float64,
-            "f16": torch.float16,
-            "bf16": torch.bfloat16,
-            "i32": torch.int32,
-            "i64": torch.int64,
-            "i8": torch.int8,
-            "i1": torch.bool,
-        }
+        from helion_mlir_backend._compiler.mlir.type_utils import mlir_dtype_to_torch
 
         func_op = None
         for op in module.operation.regions[0].blocks[0].operations:
@@ -218,7 +209,7 @@ class HelionMLIRExecutor:
             if not isinstance(res_type, ir.RankedTensorType):
                 continue
             elem = str(res_type.element_type)
-            dtype = _MLIR_TO_TORCH_DTYPE.get(elem, torch.float32)
+            dtype = mlir_dtype_to_torch(elem)
             results.append(
                 BufferMetadata(
                     shape=list(res_type.shape),

@@ -31,6 +31,7 @@ import uuid
 import torch
 import torch.fx
 
+from .block_ids import block_id_from_symbol
 from .errors import NodeLoweringError
 
 if TYPE_CHECKING:
@@ -295,8 +296,8 @@ def _build_aten_subgraph(
                 if bound_shape is None:
                     arg_val = arg.meta.get("val")
                     if isinstance(arg_val, torch.Tensor):
-                        bound_shape = _resolve_shape(
-                            arg_val,
+                        bound_shape = _resolve_dims(
+                            arg_val.shape,
                             block_id_to_size or {},
                             block_hint_to_id or {},
                             block_symint_to_id or {},
@@ -392,8 +393,8 @@ def _build_aten_subgraph(
         result_val = node.meta.get("val")
         if isinstance(result_val, torch.Tensor):
             concrete_result = torch.zeros(
-                _resolve_shape(
-                    result_val,
+                _resolve_dims(
+                    result_val.shape,
                     block_id_to_size or {},
                     block_hint_to_id or {},
                     block_symint_to_id or {},
@@ -405,8 +406,8 @@ def _build_aten_subgraph(
             for rv in result_val:
                 if isinstance(rv, torch.Tensor):
                     concrete_result = torch.zeros(
-                        _resolve_shape(
-                            rv,
+                        _resolve_dims(
+                            rv.shape,
                             block_id_to_size or {},
                             block_hint_to_id or {},
                             block_symint_to_id or {},
@@ -481,136 +482,6 @@ def _try_evaluate_aten_result(
     return None
 
 
-def _aten_node_fingerprint(
-    node: torch.fx.Node,
-    block_id_to_size: dict[int, int],
-) -> tuple[object, ...] | None:
-    """Return a canonical key for ATen-node semantic deduplication.
-
-    Returns ``None`` when we cannot safely canonicalize all inputs; callers
-    should then skip deduplication for that node.
-    """
-    target_name = str(node.target)
-    norm_args = _normalize_aten_args(node)
-
-    arg_keys: list[object] = []
-    for arg in norm_args:
-        key = _fingerprint_arg(arg, block_id_to_size)
-        if key is None:
-            return None
-        arg_keys.append(key)
-
-    kwarg_keys: list[tuple[str, object]] = []
-    for key, val in sorted(node.kwargs.items()):
-        val_key = _fingerprint_arg(val, block_id_to_size)
-        if val_key is None:
-            return None
-        kwarg_keys.append((key, val_key))
-
-    result_sig = _tensor_signature_from_meta(node, block_id_to_size)
-
-    return (
-        "target",
-        target_name,
-        "args",
-        tuple(arg_keys),
-        "kwargs",
-        tuple(kwarg_keys),
-        "result",
-        result_sig,
-    )
-
-
-def _fingerprint_arg(
-    arg: object,
-    block_id_to_size: dict[int, int],
-) -> object | None:
-    """Canonicalize one ATen argument for deduplication."""
-    if isinstance(arg, torch.fx.Node):
-        if _node_returns_tensor(arg):
-            sig = _tensor_signature_from_meta(arg, block_id_to_size)
-            if sig is None:
-                return None
-            return ("tensor", sig)
-
-        literal = _resolve_fx_literal(arg)
-        if literal is _MISSING_LITERAL:
-            return None
-        lit_key = _fingerprint_literal(literal)
-        if lit_key is None:
-            return None
-        return ("literal", lit_key)
-
-    lit_key = _fingerprint_literal(arg)
-    if lit_key is None:
-        return None
-    return ("literal", lit_key)
-
-
-def _tensor_signature_from_meta(
-    node: torch.fx.Node,
-    block_id_to_size: dict[int, int],
-) -> tuple[tuple[int, ...], str] | None:
-    """Return a stable ``(shape, dtype)`` signature for a tensor FX node."""
-    fake = _fake_tensor_from_node_meta(node, block_id_to_size)
-    if fake is not None:
-        return (tuple(int(d) for d in fake.shape), str(fake.dtype))
-
-    val = node.meta.get("val")
-    if isinstance(val, torch.Tensor):
-        shape = tuple(_resolve_shape(val, block_id_to_size))
-        return (shape, str(val.dtype))
-
-    tmeta = node.meta.get("tensor_meta")
-    if tmeta is None:
-        return None
-
-    dtype = getattr(tmeta, "dtype", None)
-    shape = getattr(tmeta, "shape", None)
-    if dtype is None or shape is None:
-        return None
-
-    return (tuple(_resolve_dims(shape, block_id_to_size)), str(dtype))
-
-
-def _fingerprint_literal(value: object) -> object | None:
-    """Return a stable literal fingerprint or ``None`` if unsupported."""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-
-    if isinstance(value, torch.dtype):
-        return ("dtype", str(value))
-    if isinstance(value, torch.device):
-        return ("device", str(value))
-    if isinstance(value, slice):
-        start = _fingerprint_literal(value.start)
-        stop = _fingerprint_literal(value.stop)
-        step = _fingerprint_literal(value.step)
-        if start is None or stop is None or step is None:
-            return None
-        return ("slice", start, stop, step)
-
-    if isinstance(value, tuple):
-        parts: list[object] = []
-        for part in value:
-            fp = _fingerprint_literal(part)
-            if fp is None:
-                return None
-            parts.append(fp)
-        return ("tuple", tuple(parts))
-
-    if isinstance(value, list):
-        parts = []
-        for part in value:
-            fp = _fingerprint_literal(part)
-            if fp is None:
-                return None
-            parts.append(fp)
-        return ("list", tuple(parts))
-
-    return None
-
-
 def _compute_broadcast_target_shape(tensors: list[torch.Tensor]) -> list[int] | None:
     """Return the common broadcast shape for tensors, or None if incompatible."""
     if not tensors:
@@ -660,80 +531,6 @@ def _compute_conservative_common_shape(
             result_rev.append(1)
 
     return list(reversed(result_rev))
-
-
-def _resolve_shape(
-    t: torch.Tensor,
-    block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int] | None = None,
-    block_symint_to_id: dict[int, int] | None = None,
-    block_id_to_upper_bound: dict[int, int] | None = None,
-) -> list[int]:
-    """Return the concrete shape of *t*, resolving SymInt dims via *block_id_to_size*."""
-    import sympy
-
-    result = []
-    for d in t.shape:
-        if isinstance(d, torch.SymInt):
-            hint_val: int | None = None
-            try:
-                hint_val = int(d)
-            except Exception:
-                hint_val = None
-
-            sym = str(d)
-            if sym.startswith("u") and sym[1:].isdigit():
-                block_id = int(sym[1:])
-                if block_id in block_id_to_size:
-                    mapped = block_id_to_size[block_id]
-                    ub = (
-                        block_id_to_upper_bound.get(block_id)
-                        if block_id_to_upper_bound is not None
-                        else None
-                    )
-                    if ub is not None and ub > 0:
-                        mapped = min(mapped, ub)
-                    if hint_val is not None and hint_val > 0:
-                        mapped = min(mapped, hint_val)
-                    result.append(mapped)
-                    continue
-            expr = getattr(getattr(d, "node", None), "expr", None)
-            if isinstance(expr, sympy.Symbol):
-                sym2 = str(expr)
-                if sym2.startswith("u") and sym2[1:].isdigit():
-                    block_id = int(sym2[1:])
-                    if block_id in block_id_to_size:
-                        mapped = block_id_to_size[block_id]
-                        ub = (
-                            block_id_to_upper_bound.get(block_id)
-                            if block_id_to_upper_bound is not None
-                            else None
-                        )
-                        if ub is not None and ub > 0:
-                            mapped = min(mapped, ub)
-                        if hint_val is not None and hint_val > 0:
-                            mapped = min(mapped, hint_val)
-                        result.append(mapped)
-                        continue
-            # Fallback: identity-based mapping when symbolic names are not usable.
-            if block_symint_to_id:
-                expr = getattr(getattr(d, "node", None), "expr", None)
-                if isinstance(expr, sympy.Symbol) and id(expr) in block_symint_to_id:
-                    block_id = block_symint_to_id[id(expr)]
-                    mapped = block_id_to_size[block_id]
-                    ub = (
-                        block_id_to_upper_bound.get(block_id)
-                        if block_id_to_upper_bound is not None
-                        else None
-                    )
-                    if ub is not None and ub > 0:
-                        mapped = min(mapped, ub)
-                    if hint_val is not None and hint_val > 0:
-                        mapped = min(mapped, hint_val)
-                    result.append(mapped)
-                    continue
-        result.append(int(d))
-    return result
 
 
 def _tensor_meta(t: torch.Tensor) -> object:
@@ -831,8 +628,8 @@ def _fake_tensor_from_node_meta(
                     )
                     if isinstance(idx_fake, torch.Tensor):
                         return torch.zeros(
-                            _resolve_shape(
-                                idx_fake,
+                            _resolve_dims(
+                                idx_fake.shape,
                                 block_id_to_size,
                                 block_hint_to_id,
                                 block_symint_to_id,
@@ -995,8 +792,8 @@ def _fake_tensor_from_node_meta(
 
     val = node.meta.get("val")
     if isinstance(val, torch.Tensor):
-        shape = _resolve_shape(
-            val,
+        shape = _resolve_dims(
+            val.shape,
             block_id_to_size,
             block_hint_to_id,
             block_symint_to_id,
@@ -1043,8 +840,8 @@ def _resolve_dims(
                 hint_val = None
 
             sym = str(d)
-            if sym.startswith("u") and sym[1:].isdigit():
-                block_id = int(sym[1:])
+            block_id = block_id_from_symbol(sym)
+            if block_id is not None:
                 if block_id in block_id_to_size:
                     mapped = block_id_to_size[block_id]
                     ub = (
@@ -1061,8 +858,8 @@ def _resolve_dims(
             expr = getattr(getattr(d, "node", None), "expr", None)
             if isinstance(expr, sympy.Symbol):
                 sym2 = str(expr)
-                if sym2.startswith("u") and sym2[1:].isdigit():
-                    block_id = int(sym2[1:])
+                block_id = block_id_from_symbol(sym2)
+                if block_id is not None:
                     if block_id in block_id_to_size:
                         mapped = block_id_to_size[block_id]
                         ub = (

@@ -378,17 +378,7 @@ class TestExtendedOperations:
 
     def test_error_diagnostics_available(self):
         """Test that error diagnostics module is available."""
-        from helion_mlir_backend._compiler.mlir.errors import diagnose_unsupported_op
         from helion_mlir_backend._compiler.mlir.errors import safe_int_conversion
-        from helion_mlir_backend._compiler.mlir.errors import validate_tensor_shape
-
-        # Test error message generation
-        msg = diagnose_unsupported_op("layer_norm")
-        assert "layer_norm" in msg
-        assert "Supported operations:" in msg
-
-        # Test shape validation
-        validate_tensor_shape([64, 128], allow_dynamic=False)
 
         # Test safe int conversion
         val = safe_int_conversion(64, "test_param")
@@ -397,33 +387,6 @@ class TestExtendedOperations:
 
 class TestDynamicShapes:
     """Test dynamic shape (SymInt) handling."""
-
-    def test_symbol_table_creation(self):
-        """Test that SymbolTable can be created."""
-        from helion_mlir_backend._compiler.mlir.dynamic_shapes import SymbolTable
-
-        table = SymbolTable()
-        assert table is not None
-        assert len(table.all_symbols()) == 0
-
-    def test_symbol_registration(self):
-        """Test symbol registration in table."""
-        from helion_mlir_backend._compiler.mlir.dynamic_shapes import SymbolTable
-
-        table = SymbolTable()
-        info = table.register_symbol("u0", 128, block_id=0)
-
-        assert info.name == "u0"
-        assert info.block_id == 0
-        assert table.get_concrete_value("u0") == 128
-
-    def test_symbol_resolution(self):
-        """Test SymInt resolution."""
-        from helion_mlir_backend._compiler.mlir.dynamic_shapes import SymbolInfo
-
-        # Create a SymbolInfo with a concrete integer
-        info = SymbolInfo("test", 42)
-        assert info.try_resolve() == 42
 
     def test_dynamic_shape_in_kernel(self):
         """Test that kernels with dynamic-looking shapes still work."""
@@ -444,26 +407,6 @@ class TestDynamicShapes:
         module.operation.verify()
         ir_str = str(module)
         assert "func.func" in ir_str
-
-    def test_symbol_table_in_codegen(self):
-        """Test that codegen has a symbol table."""
-
-        # Create a minimal test setup
-        @helion.kernel(static_shapes=True)
-        def test_kernel(x: torch.Tensor) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[tile_m, tile_n] = x[tile_m, tile_n]
-            return out
-
-        device = torch.device("cpu")
-        x = torch.randn(64, 128, dtype=torch.float32, device=device)
-
-        # Generate MLIR - should use symbol table internally
-        module = generate_mlir(test_kernel, [x])
-        module.operation.verify()
-        assert module is not None
 
 
 class TestErrorHandling:

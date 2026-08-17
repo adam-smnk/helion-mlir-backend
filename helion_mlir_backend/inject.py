@@ -34,6 +34,9 @@ def _patch_bound_kernel(
     mlir_compile_config: Callable[..., object],
 ) -> None:
     """Patch BoundKernel.compile_config to route MLIR-backend kernels through lighthouse."""
+    if getattr(BoundKernel, "_helion_mlir_compile_config_patched", False):
+        return
+
     _original = BoundKernel.compile_config
 
     def _compile_config(
@@ -47,3 +50,4 @@ def _patch_bound_kernel(
         return _original(self, config, allow_print=allow_print)
 
     BoundKernel.compile_config = _compile_config
+    BoundKernel._helion_mlir_compile_config_patched = True

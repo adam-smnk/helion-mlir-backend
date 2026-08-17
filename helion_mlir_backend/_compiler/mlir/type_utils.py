@@ -25,6 +25,15 @@ _DTYPE_TO_MLIR: dict[torch.dtype, str] = {
     torch.bool: "i1",
 }
 
+_MLIR_TO_DTYPE: dict[str, torch.dtype] = {
+    mlir_name: dtype for dtype, mlir_name in _DTYPE_TO_MLIR.items()
+}
+
+
+def mlir_dtype_to_torch(name: str, default: torch.dtype = torch.float32) -> torch.dtype:
+    """Convert an MLIR scalar type name to a PyTorch dtype."""
+    return _MLIR_TO_DTYPE.get(name, default)
+
 
 def torch_dtype_to_mlir(dtype: torch.dtype) -> ir.Type:
     """Convert a :mod:`torch` dtype to an MLIR scalar type.
