@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..support.errors import DynamicShapeError
-from ..support.errors import NodeLoweringError
-from ..support.errors import ShapeError
-from ..support.type_utils import get_zero_attr
-from ..support.type_utils import torch_dtype_to_mlir
+from ..support import DynamicShapeError
+from ..support import NodeLoweringError
+from ..support import ShapeError
+from ..support import get_zero_attr
+from ..support import torch_dtype_to_mlir
 
 if TYPE_CHECKING:
     import mlir.ir as ir

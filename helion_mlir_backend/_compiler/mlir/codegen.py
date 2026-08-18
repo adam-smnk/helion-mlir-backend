@@ -77,19 +77,18 @@ from typing import TYPE_CHECKING
 import torch
 import torch.fx
 
-from .aten_bridge.aten_helper_table import AtenHelperTable
+from .aten_bridge import AtenHelperTable
 from .build_context import BuildContext
-from .lowering.control_flow import lower_nested_for_loop
-from .lowering.load_slice_ops import lower_load
-from .lowering.memory_ops import lower_getitem
-from .lowering.memory_ops import lower_store
-from .support.block_ids import block_id_from_key
-from .support.errors import ModuleBuilderError
-from .support.errors import NodeLoweringError
-from .support.errors import UnsupportedOperationError
-from .support.errors import ValueNotFoundError
-from .support.errors import safe_int_conversion
-from .support.type_utils import torch_tensor_to_mlir_type
+from .lowering import lower_load
+from .lowering import lower_nested_for_loop
+from .lowering import lower_store
+from .support import ModuleBuilderError
+from .support import NodeLoweringError
+from .support import UnsupportedOperationError
+from .support import ValueNotFoundError
+from .support import block_id_from_key
+from .support import safe_int_conversion
+from .support import torch_tensor_to_mlir_type
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
@@ -283,7 +282,7 @@ class MLIRModuleBuilder:
     # ------------------------------------------------------------------
 
     def _build_kernel_body(self, out_tensor: torch.Tensor) -> ir.Value:
-        from .lowering.control_flow import build_kernel_body
+        from .lowering import build_kernel_body
 
         return build_kernel_body(self.context, out_tensor)
 
@@ -321,13 +320,13 @@ class MLIRModuleBuilder:
             target = node.target
             tname = getattr(target, "__name__", str(target))
 
-            from .support.node_dispatch import lower_helion_node
+            from .support import lower_helion_node
 
             handled, value = lower_helion_node(self, node, tname)
             if handled:
                 return value
 
-            from .aten_bridge.aten_ops import lower_custom_aten
+            from .aten_bridge import lower_custom_aten
 
             lowered_custom = lower_custom_aten(self, node)
             if lowered_custom is not None:
@@ -387,7 +386,7 @@ class MLIRModuleBuilder:
                     ):
                         return input_mlir_vals[0]
                     if len(input_mlir_vals) == 1 and len(return_types) == 1:
-                        from .aten_bridge.aten_ops import lower_max_reduce_from_tensor
+                        from .aten_bridge import lower_max_reduce_from_tensor
 
                         reduced = lower_max_reduce_from_tensor(
                             self.context, input_mlir_vals[0]
@@ -409,23 +408,13 @@ class MLIRModuleBuilder:
 
         return None
 
-    def _emit_matmul_like(
-        self,
-        lhs: ir.Value,
-        rhs: ir.Value,
-        out: ir.Value | None = None,
-    ) -> ir.Value | None:
-        from .lowering.matmul_ops import emit_matmul_like
-
-        return emit_matmul_like(self.context, lhs, rhs, out)
-
     def _lower_aten_matmul(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering.matmul_ops import lower_matmul
+        from .lowering import lower_matmul
 
         return lower_matmul(self.context, node)
 
     def _lower_aten_baddbmm(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering.matmul_ops import lower_baddbmm
+        from .lowering import lower_baddbmm
 
         return lower_baddbmm(self.context, node)
 
@@ -484,39 +473,14 @@ class MLIRModuleBuilder:
     def _get_value(self, node_or_val: object) -> ir.Value | None:
         return self.context.get_value(node_or_val)
 
-    def _get_index_const(self, val: int) -> ir.Value:
-        return self.context.index_const(val)
-
-    def _cast_to_index(self, val: ir.Value) -> ir.Value:
-        return self.context.cast_to_index(val)
-
-    def _shape_from_nodes(
-        self, shape_nodes: list, operation_name: str = "op"
-    ) -> list[int]:
-        return self.context.shape_from_nodes(shape_nodes, operation_name)
-
     # ------------------------------------------------------------------
     # Individual node lowering methods
     # ------------------------------------------------------------------
 
     def _lower_host_tensor(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering.host_tensor_ops import lower_host_tensor
+        from .lowering import lower_host_tensor
 
         return lower_host_tensor(self.context, node)
-
-    def _resolve_host_tensor_alias_value(self, t: torch.Tensor) -> ir.Value | None:
-        from .lowering.host_tensor_ops import resolve_host_tensor_alias_value
-
-        return resolve_host_tensor_alias_value(self.context, t)
-
-    def _materialize_host_tensor_alias_shape(
-        self,
-        base_val: ir.Value,
-        alias_node: torch.fx.Node,
-    ) -> ir.Value | None:
-        from .lowering.host_tensor_ops import materialize_host_tensor_alias_shape
-
-        return materialize_host_tensor_alias_shape(self.context, base_val, alias_node)
 
     def _lower_get_symnode(self, node: torch.fx.Node) -> ir.Value:
         """``_get_symnode('block_size_N')`` → integer index constant."""
@@ -533,7 +497,7 @@ class MLIRModuleBuilder:
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
 
     def _lower_tile_index(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering.tile_index_ops import lower_tile_index
+        from .lowering import lower_tile_index
 
         return lower_tile_index(self.context, node)
 
@@ -544,7 +508,7 @@ class MLIRModuleBuilder:
         return self._get_value(node.args[0])
 
     def _lower_subscript(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering.subscript_ops import lower_subscript
+        from .lowering import lower_subscript
 
         return lower_subscript(self.context, node)
 
@@ -576,20 +540,17 @@ class MLIRModuleBuilder:
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, concrete)).result
 
     def _lower_full(self, node: torch.fx.Node) -> ir.Value:
-        from .lowering.tensor_creation_ops import lower_full
+        from .lowering import lower_full
 
         return lower_full(self.context, node)
 
     def _lower_zeros(self, node: torch.fx.Node) -> ir.Value:
-        from .lowering.tensor_creation_ops import lower_zeros
+        from .lowering import lower_zeros
 
         return lower_zeros(self.context, node)
 
     def _lower_for_loop(self, node: torch.fx.Node) -> ir.Value:
         return lower_nested_for_loop(self.context, node)
-
-    def _lower_getitem(self, node: torch.fx.Node) -> ir.Value | None:
-        return lower_getitem(self.context, node)
 
     def _lower_load(self, node: torch.fx.Node) -> ir.Value:
         return lower_load(self.context, node)
@@ -611,7 +572,7 @@ class MLIRModuleBuilder:
         Results are stored in the context's ATen helper map and the helper
         ``func.func`` operations are inserted at the module's top level.
         """
-        from .aten_bridge.aten_ops import is_custom_aten
+        from .aten_bridge import is_custom_aten
         from .aten_lowering import is_aten_op
         from .aten_lowering import preprocess_aten_nodes
 
@@ -620,9 +581,7 @@ class MLIRModuleBuilder:
         # placeholder shapes in nested loop bodies are evaluated to their hint
         # values (e.g. both tile_m and tile_n evaluate to 64), making them
         # indistinguishable when resolving block_ids in _resolve_shape.
-        from .support.symbolic_shape_restoration import (
-            restore_symbolic_shapes_in_bodies,
-        )
+        from .support import restore_symbolic_shapes_in_bodies
 
         restore_symbolic_shapes_in_bodies(self.hf, self.context)
         self._refresh_aten_tensor_meta()
@@ -671,11 +630,11 @@ class MLIRModuleBuilder:
         node: torch.fx.Node,
         input_mlir_vals: list[ir.Value],
     ) -> tuple[str, list[ir.Type]] | None:
-        from .aten_bridge.helper_rebuild import rebuild_aten_helper_for_call
+        from .aten_bridge import rebuild_aten_helper_for_call
 
         return rebuild_aten_helper_for_call(self.context, node, input_mlir_vals)
 
     def _refresh_aten_tensor_meta(self) -> None:
-        from .support.aten_prepass import refresh_aten_tensor_meta
+        from .support import refresh_aten_tensor_meta
 
         refresh_aten_tensor_meta(self.hf)

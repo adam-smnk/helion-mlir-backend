@@ -30,8 +30,9 @@ from typing import TYPE_CHECKING
 import torch
 import torch.fx
 
-from .support.block_ids import block_id_from_symbol
-from .support.errors import NodeLoweringError
+from .support import NodeLoweringError
+from .support import block_id_from_key
+from .support import block_id_from_symbol
 
 if TYPE_CHECKING:
     import mlir.ir as ir
@@ -126,7 +127,7 @@ def preprocess_aten_nodes(
         return {}
 
     # --- Phase 1: build one torch_mlir module with all ATen subgraphs ------
-    from .aten_bridge.torch_mlir_pipeline import batch_import_and_lower
+    from .aten_bridge import batch_import_and_lower
 
     ir_text, name_map = batch_import_and_lower(
         aten_nodes,
@@ -556,8 +557,6 @@ def _fake_tensor_from_load_node(
     if source is None:
         return None
 
-    import sympy
-
     if len(index_nodes) == 1 and isinstance(index_nodes[0], torch.fx.Node):
         idx_fake = _fake_tensor_from_node_meta(
             index_nodes[0],
@@ -585,33 +584,7 @@ def _fake_tensor_from_load_node(
             break
 
         extent = src_shape[dim]
-        block_id: int | None = None
-        if isinstance(idx_node, torch.fx.Node):
-            target_name = getattr(idx_node.target, "__name__", "")
-            if target_name == "_get_symnode" and idx_node.args:
-                key = idx_node.args[0]
-                if isinstance(key, str) and key.startswith("block_size_"):
-                    try:
-                        block_id = int(key.split("_")[-1])
-                    except Exception:
-                        block_id = None
-
-            idx_val = idx_node.meta.get("val")
-            if isinstance(idx_val, torch.SymInt):
-                symbol_name = str(idx_val)
-                if symbol_name.startswith("u") and symbol_name[1:].isdigit():
-                    block_id = int(symbol_name[1:])
-                if block_id is None:
-                    expr = getattr(getattr(idx_val, "node", None), "expr", None)
-                    if isinstance(expr, sympy.Symbol):
-                        expr_name = str(expr)
-                        if expr_name.startswith("u") and expr_name[1:].isdigit():
-                            block_id = int(expr_name[1:])
-                        elif (
-                            block_symint_to_id is not None
-                            and id(expr) in block_symint_to_id
-                        ):
-                            block_id = block_symint_to_id[id(expr)]
+        block_id = _block_id_from_load_index(idx_node, block_symint_to_id)
 
         if block_id is not None and block_id in block_id_to_size:
             mapped = int(block_id_to_size[block_id])
@@ -781,69 +754,100 @@ def _resolve_dims(
     block_id_to_upper_bound: dict[int, int] | None = None,
 ) -> list[int]:
     """Resolve a sequence of dims (possibly SymInt) to concrete integer sizes."""
-    import sympy
-
     result = []
     for d in dims:
         if isinstance(d, torch.SymInt):
-            hint_val: int | None = None
-            try:
-                hint_val = int(d)
-            except Exception:
-                hint_val = None
-
-            sym = str(d)
-            block_id = block_id_from_symbol(sym)
-            if block_id is not None:
-                if block_id in block_id_to_size:
-                    mapped = block_id_to_size[block_id]
-                    ub = (
-                        block_id_to_upper_bound.get(block_id)
-                        if block_id_to_upper_bound is not None
-                        else None
-                    )
-                    if ub is not None and ub > 0:
-                        mapped = min(mapped, ub)
-                    if hint_val is not None and hint_val > 0:
-                        mapped = min(mapped, hint_val)
-                    result.append(mapped)
-                    continue
-            expr = getattr(getattr(d, "node", None), "expr", None)
-            if isinstance(expr, sympy.Symbol):
-                sym2 = str(expr)
-                block_id = block_id_from_symbol(sym2)
-                if block_id is not None:
-                    if block_id in block_id_to_size:
-                        mapped = block_id_to_size[block_id]
-                        ub = (
-                            block_id_to_upper_bound.get(block_id)
-                            if block_id_to_upper_bound is not None
-                            else None
-                        )
-                        if ub is not None and ub > 0:
-                            mapped = min(mapped, ub)
-                        if hint_val is not None and hint_val > 0:
-                            mapped = min(mapped, hint_val)
-                        result.append(mapped)
-                        continue
-            if block_symint_to_id:
-                expr = getattr(getattr(d, "node", None), "expr", None)
-                if isinstance(expr, sympy.Symbol) and id(expr) in block_symint_to_id:
-                    block_id = block_symint_to_id[id(expr)]
-                    mapped = block_id_to_size[block_id]
-                    ub = (
-                        block_id_to_upper_bound.get(block_id)
-                        if block_id_to_upper_bound is not None
-                        else None
-                    )
-                    if ub is not None and ub > 0:
-                        mapped = min(mapped, ub)
-                    if hint_val is not None and hint_val > 0:
-                        mapped = min(mapped, hint_val)
-                    result.append(mapped)
-                    continue
+            resolved = _resolve_symint_dim(
+                d,
+                block_id_to_size,
+                block_hint_to_id,
+                block_symint_to_id,
+                block_id_to_upper_bound,
+            )
+            if resolved is not None:
+                result.append(resolved)
+                continue
         result.append(int(d))
     return result
+
+
+def _block_id_from_load_index(
+    index_node: object,
+    block_symint_to_id: dict[int, int] | None,
+) -> int | None:
+    if not isinstance(index_node, torch.fx.Node):
+        return None
+    target_name = getattr(index_node.target, "__name__", "")
+    if target_name == "_get_symnode" and index_node.args:
+        block_id = block_id_from_key(index_node.args[0])
+        if block_id is not None:
+            return block_id
+
+    value = index_node.meta.get("val")
+    if not isinstance(value, torch.SymInt):
+        return None
+    block_id = block_id_from_symbol(str(value))
+    if block_id is not None:
+        return block_id
+
+    import sympy
+
+    expression = getattr(getattr(value, "node", None), "expr", None)
+    if not isinstance(expression, sympy.Symbol):
+        return None
+    block_id = block_id_from_symbol(str(expression))
+    if block_id is not None:
+        return block_id
+    if block_symint_to_id is not None:
+        return block_symint_to_id.get(id(expression))
+    return None
+
+
+def _resolve_symint_dim(
+    dimension: torch.SymInt,
+    block_id_to_size: dict[int, int],
+    block_hint_to_id: dict[int, int] | None,
+    block_symint_to_id: dict[int, int] | None,
+    block_id_to_upper_bound: dict[int, int] | None,
+) -> int | None:
+    del block_hint_to_id
+    try:
+        hint_value = int(dimension)
+    except Exception:
+        hint_value = None
+
+    import sympy
+
+    expression = getattr(getattr(dimension, "node", None), "expr", None)
+    candidates = [block_id_from_symbol(str(dimension))]
+    if isinstance(expression, sympy.Symbol):
+        candidates.append(block_id_from_symbol(str(expression)))
+        if block_symint_to_id is not None:
+            candidates.append(block_symint_to_id.get(id(expression)))
+
+    for block_id in candidates:
+        if block_id is None or block_id not in block_id_to_size:
+            continue
+        resolved = _clamp_by_upper_bound(
+            block_id_to_size[block_id], block_id, block_id_to_upper_bound
+        )
+        if hint_value is not None and hint_value > 0:
+            resolved = min(resolved, hint_value)
+        return resolved
+    return None
+
+
+def _clamp_by_upper_bound(
+    value: int,
+    block_id: int,
+    upper_bounds: dict[int, int] | None,
+) -> int:
+    if upper_bounds is None:
+        return value
+    upper_bound = upper_bounds.get(block_id)
+    if upper_bound is None or upper_bound <= 0:
+        return value
+    return min(value, upper_bound)
 
 
 def _infer_node_dtype(node: torch.fx.Node) -> torch.dtype | None:

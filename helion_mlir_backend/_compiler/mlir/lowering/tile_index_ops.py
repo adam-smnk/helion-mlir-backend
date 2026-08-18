@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..support.errors import UnsupportedOperationError
-from ..support.type_utils import torch_dtype_to_mlir
+from ..support import UnsupportedOperationError
+from ..support import torch_dtype_to_mlir
 
 if TYPE_CHECKING:
     import mlir.ir as ir

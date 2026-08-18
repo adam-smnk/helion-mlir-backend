@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.fx
 
-from ..support.type_utils import mlir_dtype_to_torch
+from ..support import mlir_dtype_to_torch
 
 if TYPE_CHECKING:
     import mlir.ir as ir

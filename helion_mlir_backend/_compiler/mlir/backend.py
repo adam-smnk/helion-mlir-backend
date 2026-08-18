@@ -39,13 +39,6 @@ class MLIRBackend(Backend):
     def experimental(self) -> bool:
         return True
 
-    @property
-    def codegen_name(self) -> str:
-        # Fall back to triton codegen for any per-op registrations we haven't
-        # overridden yet.  This keeps the compilation pipeline working even
-        # before all MLIR op lowerings are implemented.
-        return "triton"
-
     def autotune(
         self,
         bound_kernel: object,

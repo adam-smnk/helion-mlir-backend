@@ -17,7 +17,7 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
     from mlir.dialects import tensor as tensor_d
     import mlir.ir as ir
 
-    from ..support.type_utils import torch_dtype_to_mlir
+    from ..support import torch_dtype_to_mlir
 
     grid_block_ids: list[int] = []
     for ids in ctx.host_function.device_ir.grid_block_ids:
@@ -80,8 +80,8 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     import torch
     import torch.fx
 
-    from ..support.errors import NodeLoweringError
-    from ..support.type_utils import torch_dtype_to_mlir
+    from ..support import NodeLoweringError
+    from ..support import torch_dtype_to_mlir
 
     body_graph_id = node.args[0]
     block_ids = list(node.args[1])

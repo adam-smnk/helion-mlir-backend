@@ -8,8 +8,8 @@ from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 
-from .support.block_ids import block_id_from_key
-from .support.block_ids import block_id_from_symbol
+from .support import block_id_from_key
+from .support import block_id_from_symbol
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -212,32 +212,43 @@ class BuildContext:
 
         target_name = str(index_node.target)
         target_short_name = getattr(index_node.target, "__name__", "")
-        if "aten.add" in target_name or target_short_name in (
+        if "aten.add" not in target_name and target_short_name not in (
             "add.Tensor",
             "add.default",
         ):
-            if len(index_node.args) >= 2:
-                left_block, left_bias = self.infer_index_block_and_bias(
-                    index_node.args[0], sym_to_block_id
-                )
-                right_block, right_bias = self.infer_index_block_and_bias(
-                    index_node.args[1], sym_to_block_id
-                )
-                if left_block is not None and right_block is None:
-                    return left_block, left_bias + right_bias
-                if right_block is not None and left_block is None:
-                    return right_block, right_bias + left_bias
-                if left_block is None and right_block is None:
-                    left_shape_block = self.infer_block_id_from_value_shape(
-                        index_node.args[0]
-                    )
-                    right_shape_block = self.infer_block_id_from_value_shape(
-                        index_node.args[1]
-                    )
-                    if left_shape_block is not None and right_shape_block is None:
-                        return left_shape_block, left_bias + right_bias
-                    if right_shape_block is not None and left_shape_block is None:
-                        return right_shape_block, right_bias + left_bias
+            return None, 0
+        if len(index_node.args) < 2:
+            return None, 0
+
+        return self._infer_add_index_block_and_bias(
+            index_node.args[0], index_node.args[1], sym_to_block_id
+        )
+
+    def _infer_add_index_block_and_bias(
+        self,
+        left_index: object,
+        right_index: object,
+        sym_to_block_id: dict[str, int],
+    ) -> tuple[int | None, int]:
+        left_block, left_bias = self.infer_index_block_and_bias(
+            left_index, sym_to_block_id
+        )
+        right_block, right_bias = self.infer_index_block_and_bias(
+            right_index, sym_to_block_id
+        )
+        if left_block is not None and right_block is None:
+            return left_block, left_bias + right_bias
+        if right_block is not None and left_block is None:
+            return right_block, right_bias + left_bias
+        if left_block is not None or right_block is not None:
+            return None, 0
+
+        left_shape_block = self.infer_block_id_from_value_shape(left_index)
+        right_shape_block = self.infer_block_id_from_value_shape(right_index)
+        if left_shape_block is not None and right_shape_block is None:
+            return left_shape_block, left_bias + right_bias
+        if right_shape_block is not None and left_shape_block is None:
+            return right_shape_block, right_bias + left_bias
         return None, 0
 
     def infer_block_id_from_value_shape(self, index_node: object) -> int | None:
@@ -290,23 +301,21 @@ class BuildContext:
         target_name = getattr(index_node.target, "__name__", "")
         if target_name == "_get_symnode" and index_node.args:
             return block_id_from_key(index_node.args[0])
-        if target_name in ("sym_size.int", "sym_size_int"):
-            tensor_node = index_node.args[0]
-            dim = int(index_node.args[1])
-            tensor_value = (
-                tensor_node.meta.get("val")
-                if isinstance(tensor_node, torch.fx.Node)
-                else None
-            )
-            if isinstance(tensor_value, torch.Tensor):
-                dimension = tensor_value.shape[dim]
-                dimension_expression = getattr(
-                    getattr(dimension, "node", None), "expr", None
-                )
-                if isinstance(dimension_expression, sympy.Symbol):
-                    return self.block_symint_to_id.get(id(dimension_expression))
-                return sym_to_block_id.get(str(dimension))
-        return None
+        if target_name not in ("sym_size.int", "sym_size_int"):
+            return None
+        if len(index_node.args) < 2:
+            return None
+        tensor_node = index_node.args[0]
+        if not isinstance(tensor_node, torch.fx.Node):
+            return None
+        tensor_value = tensor_node.meta.get("val")
+        if not isinstance(tensor_value, torch.Tensor):
+            return None
+        dimension = tensor_value.shape[int(index_node.args[1])]
+        dimension_expression = getattr(getattr(dimension, "node", None), "expr", None)
+        if isinstance(dimension_expression, sympy.Symbol):
+            return self.block_symint_to_id.get(id(dimension_expression))
+        return sym_to_block_id.get(str(dimension))
 
     def lower_graph(self, graph: torch.fx.Graph) -> ir.Value | None:
         """Lower an FX graph through the builder callback."""

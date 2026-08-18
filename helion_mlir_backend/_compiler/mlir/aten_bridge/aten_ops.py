@@ -130,7 +130,7 @@ def lower_add_matmul_accumulate(
 ) -> ir.Value | None:
     """Lower ``acc + matmul`` into a loop-carried accumulator update."""
     from ..aten_lowering import normalized_aten_args
-    from ..lowering.matmul_ops import emit_matmul_like
+    from ..lowering import emit_matmul_like
 
     args = list(normalized_aten_args(node))
     if len(args) < 2 or (args[2] if len(args) > 2 else 1) != 1:

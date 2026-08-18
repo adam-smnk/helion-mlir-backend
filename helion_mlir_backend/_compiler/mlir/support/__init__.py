@@ -11,6 +11,7 @@ compilation pipeline:
 
 from __future__ import annotations
 
+from .aten_prepass import refresh_aten_tensor_meta
 from .block_ids import block_id_from_key
 from .block_ids import block_id_from_symbol
 from .errors import DynamicShapeError
@@ -21,6 +22,7 @@ from .errors import UnsupportedOperationError
 from .errors import ValueNotFoundError
 from .errors import safe_int_conversion
 from .node_dispatch import lower_helion_node
+from .symbolic_shape_restoration import restore_symbolic_shapes_in_bodies
 from .type_utils import get_zero_attr
 from .type_utils import mlir_dtype_to_torch
 from .type_utils import torch_dtype_to_mlir
@@ -38,6 +40,8 @@ __all__ = [
     "get_zero_attr",
     "lower_helion_node",
     "mlir_dtype_to_torch",
+    "refresh_aten_tensor_meta",
+    "restore_symbolic_shapes_in_bodies",
     "safe_int_conversion",
     "torch_dtype_to_mlir",
     "torch_tensor_to_mlir_type",

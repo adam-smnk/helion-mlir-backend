@@ -22,7 +22,7 @@ def lower_helion_node(
     target_name: str,
 ) -> tuple[bool, ir.Value | None]:
     """Lower a Helion tracing node, returning whether it was recognized."""
-    from ..lowering.memory_ops import lower_getitem
+    from ..lowering import lower_getitem
 
     lowerers: dict[str, Lowerer] = {
         "_host_tensor": builder._lower_host_tensor,
