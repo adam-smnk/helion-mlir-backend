@@ -615,6 +615,49 @@ class TestConfigurableBlockSizes:
                 f"Expected step ({block_size}) in IR, got:\n{ir_str}"
             )
 
+    def test_decorator_config_is_used_without_kwarg(self):
+        """A config on @helion.kernel applies even when generate_mlir omits it."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[8]))
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] + y[tile_m, :]
+            return out
+
+        torch.manual_seed(0)
+        A = torch.randn(64, 32)
+        B = torch.randn(64, 32)
+
+        ir_str = str(generate_mlir(add_kernel, [A, B]))
+
+        assert "step (8)" in ir_str, (
+            f"decorator block_sizes=[8] was ignored, got:\n{ir_str}"
+        )
+
+    def test_explicit_config_overrides_decorator_config(self):
+        """An explicit config= argument wins over the decorator's config."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[8]))
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] + y[tile_m, :]
+            return out
+
+        torch.manual_seed(0)
+        A = torch.randn(64, 32)
+        B = torch.randn(64, 32)
+
+        ir_str = str(
+            generate_mlir(add_kernel, [A, B], config=helion.Config(block_sizes=[32]))
+        )
+
+        assert "step (32)" in ir_str
+        assert "step (8)" not in ir_str
+
     def test_different_block_sizes_same_result(self):
         """Different block_sizes produce numerically identical results via execute_mlir."""
 
