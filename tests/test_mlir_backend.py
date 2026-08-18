@@ -81,6 +81,101 @@ class TestTypeConversions:
             torch_dtype_to_mlir(torch.complex64)
 
 
+class TestBackendStructure:
+    """Test the backend contract and extracted module facades."""
+
+    def test_mlir_backend_uses_backend_neutral_codegen_name(self):
+        from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
+
+        backend = MLIRBackend()
+        assert backend.name == "mlir"
+        assert backend.codegen_name == "mlir"
+        assert backend.dtype_str(torch.float32) == "torch.float32"
+        assert backend.acc_type(torch.float32) == "torch.float32"
+
+    @pytest.mark.parametrize(
+        "property_name",
+        (
+            "function_decorator",
+            "constexpr_type",
+            "default_launcher_name",
+            "library_imports",
+        ),
+    )
+    def test_python_codegen_properties_are_rejected(self, property_name):
+        from helion import exc
+
+        from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
+
+        with pytest.raises(exc.BackendUnsupported):
+            getattr(MLIRBackend(), property_name)
+
+    def test_extracted_helpers_are_available_from_facades(self):
+        from helion_mlir_backend._compiler.mlir.aten_bridge import (
+            rebuild_aten_helper_for_call,
+        )
+        from helion_mlir_backend._compiler.mlir.lowering import lower_tile_index
+        from helion_mlir_backend._compiler.mlir.support import (
+            restore_symbolic_shapes_in_bodies,
+        )
+
+        assert callable(rebuild_aten_helper_for_call)
+        assert callable(lower_tile_index)
+        assert callable(restore_symbolic_shapes_in_bodies)
+
+
+class TestExtractedHelpers:
+    """Unit tests for pure metadata and argument helpers."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        (
+            ("block_size_0", 0),
+            ("block_size_12", 12),
+            ("block_size_", None),
+            ("u3", None),
+            (3, None),
+        ),
+    )
+    def test_block_id_from_key(self, value, expected):
+        from helion_mlir_backend._compiler.mlir.support import block_id_from_key
+
+        assert block_id_from_key(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        (("u0", 0), ("u17", 17), ("block_size_2", None), ("u", None)),
+    )
+    def test_block_id_from_symbol(self, value, expected):
+        from helion_mlir_backend._compiler.mlir.support import block_id_from_symbol
+
+        assert block_id_from_symbol(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "block_id", "upper_bounds", "expected"),
+        ((64, 0, {0: 32}, 32), (64, 0, {0: 0}, 64), (64, 0, None, 64)),
+    )
+    def test_upper_bound_clamp(self, value, block_id, upper_bounds, expected):
+        from helion_mlir_backend._compiler.mlir.aten_lowering import (
+            _clamp_by_upper_bound,
+        )
+
+        assert _clamp_by_upper_bound(value, block_id, upper_bounds) == expected
+
+    def test_normalize_aten_args_repairs_missing_mul_operand(self):
+        from helion_mlir_backend._compiler.mlir.aten_lowering import (
+            normalized_aten_args,
+        )
+
+        graph = torch.fx.Graph()
+        tensor_node = graph.placeholder("tensor")
+        tensor_node.meta["val"] = torch.ones(2)
+        mul_node = graph.call_function(torch.ops.aten.mul.Tensor, (tensor_node, None))
+
+        args = normalized_aten_args(mul_node)
+        assert args == (tensor_node, tensor_node)
+
+
 class TestBasicOpLowerings:
     """Test lowering of basic PyTorch operations."""
 
