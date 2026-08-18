@@ -1,4 +1,4 @@
-# helion-mlir
+# helion-mlir-backend
 
 External MLIR backend package for vanilla Helion.
 
