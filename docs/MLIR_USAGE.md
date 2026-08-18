@@ -10,7 +10,8 @@ This guide describes the current usage of the MLIR backend in this repository.
   - Explicit flow: generate MLIR then execute via backend API.
   - Direct flow: call a kernel decorated with backend="mlir".
 
-Reference tests are in `tests/test_mlir_execution.py`.
+Reference tests are in `tests/test_mlir_backend.py`, `tests/test_mlir_execution.py`,
+and `tests/test_mlir_integration.py` (currently 85 tests across the MLIR test suite).
 
 ## Recommended Environment
 
@@ -151,6 +152,26 @@ with open("kernel_ir.mlir", "w") as f:
 
 - `HELION_MLIR_DUMP_PRE_LOWERING=1`
   - Prints MLIR after inlining and before lighthouse lowering.
+
+## Current Package Layout
+
+The implementation is organized by responsibility:
+
+```text
+helion_mlir_backend/_compiler/mlir/
+├── backend.py, bound_kernel.py       # backend registration and runtime hook
+├── build_context.py                  # typed mutable lowering state
+├── codegen.py                        # module orchestration and node dispatch
+├── aten_lowering.py                  # ATen helper preprocessing
+├── lowering/                         # operation-family MLIR emitters
+├── aten_bridge/                      # custom ATen and torch-mlir bridge
+└── support/                          # shape, type, dispatch, and diagnostics
+```
+
+`MLIRBackend` inherits from Helion's backend-neutral `Backend`; it does not use
+the Triton Python AST code-generation path. MLIR is emitted directly as
+Linalg-on-Tensors IR and execution is handled separately by
+`HelionMLIRExecutor`.
 
 For shape-resolution details, see `docs/BACKEND_SHAPE_INFERENCE_AND_PROPAGATION.md`.
 

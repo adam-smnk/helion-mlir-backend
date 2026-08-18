@@ -3,8 +3,10 @@
 This document explains how shapes are inferred, resolved, and propagated in the Helion MLIR backend in this repository.
 
 It focuses on these implementation files:
+- `helion_mlir_backend/_compiler/mlir/build_context.py`
 - `helion_mlir_backend/_compiler/mlir/codegen.py`
 - `helion_mlir_backend/_compiler/mlir/aten_lowering.py`
+- `helion_mlir_backend/_compiler/mlir/support/symbolic_shape_restoration.py`
 
 ## Why Shape Propagation Matters
 
@@ -28,7 +30,7 @@ Shape propagation runs through multiple stages:
 
 ## Stage 1: Block Size Resolution
 
-In `MLIRModuleBuilder._resolve_block_sizes` (`codegen.py`):
+In `MLIRModuleBuilder._resolve_block_sizes` (`codegen.py`), with shared state owned by `BuildContext`:
 
 - `CompileEnvironment.block_sizes` are resolved from config (`from_config`) with `HostFunction` active.
 - Concrete sizes are stored in:
@@ -41,7 +43,7 @@ These maps allow SymInt dimensions to be concretized consistently even when shap
 
 ## Stage 2: Nested Body Placeholder Repair
 
-In `MLIRModuleBuilder._restore_symbolic_shapes_in_bodies` (`codegen.py`):
+In `support.symbolic_shape_restoration.restore_symbolic_shapes_in_bodies`:
 
 - For `_for_loop` body graphs, placeholder `meta["val"]` can become ambiguous after tracing.
 - The backend reconstructs concrete placeholder shapes from loop/block shape nodes.
@@ -63,19 +65,19 @@ This stage is critical because helper function argument/result types become fixe
 
 ## Stage 4: Concrete Shape Resolution Rules
 
-In `_resolve_shape` and `_resolve_dims` (`aten_lowering.py`), dimension resolution order is:
+In `_resolve_dims` (`aten_lowering.py`) and `BuildContext` block-ID inference, dimension resolution order is:
 
 1. Symbolic name lookup (`uN` style symbol -> block id).
 2. Sympy expression symbol lookup.
 3. Symbol identity lookup via `_block_symint_to_id`.
-4. Hint-value lookup via `_block_hint_to_id`.
+4. Upper-bound clamping against configured loop bounds.
 5. Final fallback to `int(dim)`.
 
 This layered strategy makes propagation robust across traced graph rewrites.
 
 ## Stage 5: Load/Store Lowering Consistency
 
-In `_lower_load` (`codegen.py`):
+In `lowering/load_slice_ops.py` and `lowering/tile_index_ops.py`:
 
 - Slice result sizes are derived using the same shape resolution path used for ATen helpers.
 - IV offsets are inferred from symbolic index nodes and block-id mappings.
@@ -110,7 +112,7 @@ Without these rewrites, generic decomposition patterns can still fail verificati
 ## Practical Debugging Checklist
 
 1. Verify config-driven block sizes were resolved as expected.
-2. Inspect symbolic maps (`_block_id_to_size`, `_block_hint_to_id`, `_block_symint_to_id`).
+2. Inspect symbolic maps (`BuildContext.block_id_to_size`, `block_hint_to_id`, `block_symint_to_id`).
 3. Confirm placeholder metadata repair happened for nested `_for_loop` bodies.
 4. Check ATen helper signatures and concrete fake input/output shapes.
 5. Compare `tensor.extract_slice` result shapes against helper input types.

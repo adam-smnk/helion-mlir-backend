@@ -6,7 +6,9 @@ This document lists current limitations for the MLIR backend in this repository.
 
 - The backend is experimental.
 - CPU execution is supported and validated in tests.
-- The main validation suite is `tests/test_mlir_execution.py`.
+- The MLIR validation suite spans `tests/test_mlir_backend.py`,
+  `tests/test_mlir_execution.py`, and `tests/test_mlir_integration.py`.
+- The current suite contains 85 passing tests.
 - Both explicit generate-and-execute flow and direct backend="mlir" flow are exercised.
 
 This replaces earlier "IR-only" descriptions.
@@ -96,6 +98,20 @@ Current limitation:
 Recommended workflow:
 - Use `HELION_MLIR_DUMP_PRE_LOWERING=1`.
 - Reproduce with targeted tests in `tests/test_mlir_execution.py`.
+
+## 9) Backend Architecture Boundary
+
+The MLIR backend is intentionally decoupled from `TritonBackend`. It inherits
+from Helion's backend-neutral `Backend` and bypasses Helion's Python AST codegen
+and Triton cache-management path. The implementation is split into:
+
+- `lowering/` for operation and control-flow emission.
+- `aten_bridge/` for custom ATen handling and torch-mlir helper management.
+- `support/` for shape repair, type conversion, dispatch, and diagnostics.
+
+This means Triton-specific code-generation behavior is not a fallback for MLIR;
+unsupported MLIR operations must be added to the appropriate MLIR lowering or
+ATen bridge module.
 
 ## Out of Scope for This Backend Today
 

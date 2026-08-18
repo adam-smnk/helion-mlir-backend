@@ -390,4 +390,4 @@ pytest test/test_examples.py -k attention -x -vv -s
 
 ---
 
-**Next Step for New Backend**: Study [helion-compilation-flow.md](/memories/repo/helion-compilation-flow.md) in repo memory for detailed API documentation and extension points.
+**Next Step for New Backend**: Study [BACKEND_IMPLEMENTATION_GUIDE.md](BACKEND_IMPLEMENTATION_GUIDE.md) for backend APIs and extension points.

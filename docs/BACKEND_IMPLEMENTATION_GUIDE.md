@@ -421,7 +421,7 @@ HELION_PRINT_OUTPUT_CODE=1 python examples/matmul.py --backend mybackend
 - Study existing backends: `helion/_compiler/{triton,pallas,cute}/backend.py`
 - Example codegen: `helion/_compiler/triton/memory_ops.py`
 - Test examples: `helion/examples/matmul.py`, `helion/examples/attention.py`
-- Memory reference: `/memories/repo/helion-compilation-flow.md`
+- Compilation flow: [HELION_COMPILATION_SUMMARY.md](HELION_COMPILATION_SUMMARY.md)
 
 ---
 

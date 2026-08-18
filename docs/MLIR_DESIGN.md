@@ -13,7 +13,7 @@ Helion Kernel (Python)
         ↓
 Type Propagation & Device IR (FX Graph)
         ↓
-MLIRModuleBuilder (Codegen)
+      MLIRBackend → MLIRModuleBuilder
         ↓
 MLIR Module (Linalg-on-Tensors)
         ↓
@@ -23,7 +23,7 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
 ### Component Breakdown
 
 #### 1. **Entry Point: generate_mlir()**
-- Location: [helion/mlir.py](../helion/helion/mlir.py)
+- Location: [api.py](../helion_mlir_backend/api.py) and [backend.py](../helion_mlir_backend/_compiler/mlir/backend.py)
 - Orchestrates the full compilation pipeline
 - Accepts a Helion kernel and input arguments
 - Returns an `mlir.ir.Module` containing the MLIR IR
@@ -37,23 +37,25 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
 6. Return the MLIR module
 
 #### 2. **Backend Registration: MLIRBackend**
-- Location: [helion/_compiler/mlir/backend.py](../helion/helion/_compiler/mlir/backend.py)
+- Location: [backend.py](../helion_mlir_backend/_compiler/mlir/backend.py)
 - Registers as a compiler backend option
 - Implements `generate_mlir()` method
-- Inherits setup/cleanup logic from TritonBackend
+- Inherits from Helion's backend-neutral `Backend` class, not `TritonBackend`
+- Rejects Python-source-codegen-only properties because MLIR is emitted directly
+- Uses the MLIR-specific `bound_kernel.py` hook for direct `backend="mlir"` calls
 
 #### 3. **Core Lowering: MLIRModuleBuilder**
-- Location: [helion/_compiler/mlir/codegen.py](../helion/helion/_compiler/mlir/codegen.py)
-- ~1500 lines of lowering logic
+- Location: [codegen.py](../helion_mlir_backend/_compiler/mlir/codegen.py)
+- Orchestrates module/function construction and dispatches to focused lowering modules
 - Converts Helion's device IR (FX graph) to MLIR IR
 
 **Architecture:**
 - **State Management:**
-  - `_node_to_value`: Maps FX nodes to MLIR SSA values
-  - `_block_id_to_size`: Maps block IDs to concrete tile sizes
-  - `_block_id_to_iv`: Maps block IDs to scf loop induction variables
-  - `_param_to_value`: Maps parameters to function arguments
-  - `_forall_insert_slices`: Tracks pending parallel tensor insertions
+  - `BuildContext.node_to_value`: Maps FX nodes to MLIR SSA values
+  - `BuildContext.block_id_to_size`: Maps block IDs to concrete tile sizes
+  - `BuildContext.block_id_to_iv`: Maps block IDs to scf loop induction variables
+  - `BuildContext.param_to_value`: Maps parameters to function arguments
+  - `BuildContext.forall_insert_slices`: Tracks pending parallel tensor insertions
 
 - **Key Methods:**
   - `build()`: Entry point, creates MLIR module
@@ -61,10 +63,40 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
   - `_build_kernel_body()`: Creates scf.forall with grid-level parallelism
   - `_process_graph()`: Walks FX graph recursively
   - `_lower_node()`: Dispatches to operation-specific lowering
-  - `_lower_*()`: 15+ methods for specific operations (matmul, relu, etc.)
+  - `_lower_node()`: Routes Helion and ATen nodes
+  - Thin delegates: preserve the FX dispatch contract while calling modules under `lowering/`
 
-#### 4. **Type System: torch_dtype_to_mlir()**
-- Location: [helion/_compiler/mlir/type_utils.py](../helion/helion/_compiler/mlir/type_utils.py)
+#### 4. **Lowering Modules**
+
+Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
+
+- `control_flow.py`: outer `scf.forall` and nested `scf.for`
+- `load_slice_ops.py`, `load_ops.py`: tile loads and gathers
+- `memory_ops.py`: getitem and stores
+- `matmul_ops.py`: matmul-family lowering
+- `subscript_ops.py`: tensor subscripts
+- `host_tensor_ops.py`: host arguments and alias materialization
+- `tensor_creation_ops.py`: `full` and `zeros`
+- `tile_index_ops.py`: tile-index tensor generation
+
+#### 5. **ATen Bridge and Support**
+
+The ATen-specific path is organized under [aten_bridge/](../helion_mlir_backend/_compiler/mlir/aten_bridge/):
+
+- `aten_ops.py`: custom ATen registry and direct MLIR lowerings
+- `aten_helper_table.py`: helper signature and identity tracking
+- `helper_rebuild.py`: call-site-specific helper variants
+- `torch_mlir_pipeline.py`: batched torch-mlir import and lowering
+
+Shared utilities live under [support/](../helion_mlir_backend/_compiler/mlir/support/):
+
+- `block_ids.py`: canonical block-key and symbolic-name parsing
+- `symbolic_shape_restoration.py`: nested loop metadata repair
+- `aten_prepass.py`: ATen metadata refresh
+- `node_dispatch.py`, `type_utils.py`, and `errors.py`
+
+#### 6. **Type System: torch_dtype_to_mlir()**
+- Location: [type_utils.py](../helion_mlir_backend/_compiler/mlir/support/type_utils.py)
 - Converts PyTorch dtypes to MLIR types
 - Handles tensor shape + dtype conversion
 - Supports dynamic dimensions (SymInt → `?`)
