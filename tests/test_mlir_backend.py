@@ -27,7 +27,9 @@ class TestTypeConversions:
 
     def test_float32_conversion(self, mlir_context):
         """Test float32 dtype conversion."""
-        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.support.type_utils import (
+            torch_dtype_to_mlir,
+        )
 
         with mlir_context:
             result = torch_dtype_to_mlir(torch.float32)
@@ -35,7 +37,9 @@ class TestTypeConversions:
 
     def test_float64_conversion(self, mlir_context):
         """Test float64 dtype conversion."""
-        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.support.type_utils import (
+            torch_dtype_to_mlir,
+        )
 
         with mlir_context:
             result = torch_dtype_to_mlir(torch.float64)
@@ -43,7 +47,9 @@ class TestTypeConversions:
 
     def test_int32_conversion(self, mlir_context):
         """Test int32 dtype conversion."""
-        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.support.type_utils import (
+            torch_dtype_to_mlir,
+        )
 
         with mlir_context:
             result = torch_dtype_to_mlir(torch.int32)
@@ -51,7 +57,7 @@ class TestTypeConversions:
 
     def test_tensor_type_conversion(self, mlir_context):
         """Test tensor shape + dtype conversion."""
-        from helion_mlir_backend._compiler.mlir.type_utils import (
+        from helion_mlir_backend._compiler.mlir.support.type_utils import (
             torch_tensor_to_mlir_type,
         )
 
@@ -67,7 +73,9 @@ class TestTypeConversions:
 
     def test_unsupported_dtype_raises(self, mlir_context):
         """Test that unsupported dtypes raise error."""
-        from helion_mlir_backend._compiler.mlir.type_utils import torch_dtype_to_mlir
+        from helion_mlir_backend._compiler.mlir.support.type_utils import (
+            torch_dtype_to_mlir,
+        )
 
         with mlir_context, pytest.raises((ValueError, NotImplementedError)):
             torch_dtype_to_mlir(torch.complex64)
@@ -378,7 +386,9 @@ class TestExtendedOperations:
 
     def test_error_diagnostics_available(self):
         """Test that error diagnostics module is available."""
-        from helion_mlir_backend._compiler.mlir.errors import safe_int_conversion
+        from helion_mlir_backend._compiler.mlir.support.errors import (
+            safe_int_conversion,
+        )
 
         # Test safe int conversion
         val = safe_int_conversion(64, "test_param")

@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     import mlir.ir as ir
     import torch.fx
 
-    from .build_context import BuildContext
+    from ..build_context import BuildContext
 
 
 def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:

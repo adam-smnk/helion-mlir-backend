@@ -9,7 +9,7 @@ import torch.fx
 if TYPE_CHECKING:
     import mlir.ir as ir
 
-    from .build_context import BuildContext
+    from ..build_context import BuildContext
 
 
 def emit_matmul_like(
@@ -81,7 +81,7 @@ def emit_matmul_like(
 
 def lower_matmul(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower ``aten.mm``, ``aten.matmul``, or ``aten.bmm``."""
-    from .aten_lowering import normalized_aten_args
+    from ..aten_lowering import normalized_aten_args
 
     args = list(normalized_aten_args(node))
     if len(args) < 2:
@@ -95,7 +95,7 @@ def lower_matmul(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
 
 def lower_baddbmm(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower ``aten.baddbmm`` when its scale factors are one."""
-    from .aten_lowering import normalized_aten_args
+    from ..aten_lowering import normalized_aten_args
 
     args = list(normalized_aten_args(node))
     if len(args) < 3:

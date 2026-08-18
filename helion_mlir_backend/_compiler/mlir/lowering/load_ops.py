@@ -10,7 +10,7 @@ import torch.fx
 if TYPE_CHECKING:
     import mlir.ir as ir
 
-    from .build_context import BuildContext
+    from ..build_context import BuildContext
 
 
 def lower_flat_gather(

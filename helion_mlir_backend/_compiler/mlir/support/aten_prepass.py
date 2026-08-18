@@ -13,9 +13,9 @@ if TYPE_CHECKING:
 
 def refresh_aten_tensor_meta(host_function: HostFunction) -> None:
     """Refresh tensor-valued ATen metadata from current fake input shapes."""
-    from .aten_lowering import broadcast_target_shape
-    from .aten_lowering import is_aten_op
-    from .aten_lowering import normalized_aten_args
+    from ..aten_lowering import broadcast_target_shape
+    from ..aten_lowering import is_aten_op
+    from ..aten_lowering import normalized_aten_args
 
     for graph_info in host_function.device_ir.graphs:
         for node in graph_info.graph.nodes:

@@ -10,7 +10,7 @@ import torch.fx
 if TYPE_CHECKING:
     import mlir.ir as ir
 
-    from .codegen import MLIRModuleBuilder
+    from ..codegen import MLIRModuleBuilder
 
 
 Lowerer = Callable[[torch.fx.Node], object]
@@ -22,7 +22,7 @@ def lower_helion_node(
     target_name: str,
 ) -> tuple[bool, ir.Value | None]:
     """Lower a Helion tracing node, returning whether it was recognized."""
-    from .memory_ops import lower_getitem
+    from ..lowering.memory_ops import lower_getitem
 
     lowerers: dict[str, Lowerer] = {
         "_host_tensor": builder._lower_host_tensor,

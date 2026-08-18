@@ -31,8 +31,8 @@ import uuid
 import torch
 import torch.fx
 
-from .block_ids import block_id_from_symbol
-from .errors import NodeLoweringError
+from .support.block_ids import block_id_from_symbol
+from .support.errors import NodeLoweringError
 
 if TYPE_CHECKING:
     import mlir.ir as ir

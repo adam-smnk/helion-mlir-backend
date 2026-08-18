@@ -185,7 +185,9 @@ class HelionMLIRExecutor:
         """Extract output shapes/dtypes from the func.func IR before lowering."""
         import mlir.ir as ir
 
-        from helion_mlir_backend._compiler.mlir.type_utils import mlir_dtype_to_torch
+        from helion_mlir_backend._compiler.mlir.support.type_utils import (
+            mlir_dtype_to_torch,
+        )
 
         func_op = None
         for op in module.operation.regions[0].blocks[0].operations:

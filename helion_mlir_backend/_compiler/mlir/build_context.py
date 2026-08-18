@@ -8,8 +8,8 @@ from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 
-from .block_ids import block_id_from_key
-from .block_ids import block_id_from_symbol
+from .support.block_ids import block_id_from_key
+from .support.block_ids import block_id_from_symbol
 
 if TYPE_CHECKING:
     from collections.abc import Callable
