@@ -243,7 +243,12 @@ class HelionMLIRExecutor:
                 result_to_args=True,
                 benchmark=False,
             )
-            driver.add_stage(Descriptor("scalar-lowering.yaml"))
+            if os.environ.get("HELION_MLIR_PIPELINE", "").strip() == "1":
+                driver.add_stage(
+                    Descriptor("./pipeline.yaml", base_path=os.path.dirname(__file__))
+                )
+            else:
+                driver.add_stage(Descriptor("scalar-lowering.yaml"))
             lowered = driver.apply(module)
 
         log.info("Lowered via scalar-lowering pipeline")
