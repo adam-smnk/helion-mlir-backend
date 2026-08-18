@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-import uuid
 
 import torch
 import torch.fx
@@ -127,9 +126,12 @@ def preprocess_aten_nodes(
         return {}
 
     # --- Phase 1: build one torch_mlir module with all ATen subgraphs ------
-    ir_text, name_map = _batch_import_and_lower(
+    from .aten_bridge.torch_mlir_pipeline import batch_import_and_lower
+
+    ir_text, name_map = batch_import_and_lower(
         aten_nodes,
         block_id_to_size or {},
+        _build_aten_subgraph,
         block_hint_to_id or {},
         block_symint_to_id or {},
         block_id_to_upper_bound or {},
@@ -170,91 +172,6 @@ def preprocess_aten_nodes(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _batch_import_and_lower(
-    aten_nodes: list[torch.fx.Node],
-    block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int] | None = None,
-    block_symint_to_id: dict[int, int] | None = None,
-    block_id_to_upper_bound: dict[int, int] | None = None,
-    arg_position_overrides: dict[int, dict[int, torch.Tensor]] | None = None,
-) -> tuple[str, dict[int, str]]:
-    """Build and lower all ATen subgraphs in one torch-mlir pipeline pass.
-
-    Each ATen node is materialized as its own helper function.
-
-    Note: We intentionally do not deduplicate helpers across nodes because
-    jagged/tiled kernels can carry subtly different shape bounds at different
-    call sites even for semantically similar ops. Sharing helpers can then
-    produce invalid func.call operand type mismatches during MLIR inlining.
-    """
-    from torch_mlir.compiler_utils import OutputType
-    from torch_mlir.compiler_utils import lower_mlir_module
-    from torch_mlir.compiler_utils import run_pipeline_with_repro_report
-    from torch_mlir.dialects import torch as torch_d
-    from torch_mlir.extras.fx_importer import FxImporter
-    import torch_mlir.ir as tm_ir
-
-    tm_ctx = tm_ir.Context()
-    torch_d.register_dialect(tm_ctx)
-    imp = FxImporter(context=tm_ctx)
-
-    name_map: dict[int, str] = {}
-
-    for next_func_idx, node in enumerate(aten_nodes):
-        # Include node identity and a nonce so repeated preprocess passes can
-        # add variants without symbol collisions.
-        func_name = f"_aten_{next_func_idx}_{id(node)}_{uuid.uuid4().hex[:8]}"
-        try:
-            graph, _ = _build_aten_subgraph(
-                node,
-                block_id_to_size,
-                block_hint_to_id or {},
-                block_symint_to_id or {},
-                block_id_to_upper_bound or {},
-                (arg_position_overrides or {}).get(id(node)),
-            )
-            imp.import_stateless_graph(graph, func_name=func_name)
-            name_map[id(node)] = func_name
-        except Exception as exc:
-            arg_info = []
-            for a in node.args:
-                if isinstance(a, torch.fx.Node):
-                    arg_info.append(
-                        f"{a.name}:{a.op}:{a.target}:val={type(a.meta.get('val')).__name__ if a.meta.get('val') is not None else 'None'}:tm={a.meta.get('tensor_meta') is not None}"
-                    )
-                else:
-                    arg_info.append(f"lit:{type(a).__name__}:{a}")
-            kw_info = {}
-            for k, v in node.kwargs.items():
-                if isinstance(v, torch.fx.Node):
-                    kw_info[k] = (
-                        f"{v.name}:{v.op}:{v.target}:val={type(v.meta.get('val')).__name__ if v.meta.get('val') is not None else 'None'}:tm={v.meta.get('tensor_meta') is not None}"
-                    )
-                else:
-                    kw_info[k] = f"lit:{type(v).__name__}:{v}"
-            log.warning(
-                "Could not import ATen node '%s' (%s): %s | args=%s kwargs=%s",
-                node.name,
-                node.target,
-                exc,
-                arg_info,
-                kw_info,
-            )
-
-    # Two-stage torch-mlir pipeline (single run for all subgraphs)
-    run_pipeline_with_repro_report(
-        imp.module,
-        "builtin.module(func.func(torch-match-quantized-custom-ops),"
-        " torchdynamo-export-to-torch-backend-pipeline{})",
-        "Lowering TorchFX IR -> Torch Backend IR",
-        enable_ir_printing=False,
-    )
-    lower_mlir_module(False, OutputType.LINALG_ON_TENSORS, imp.module)
-
-    ir_text = imp.module.operation.get_asm(binary=False, enable_debug_info=False)
-    return ir_text, name_map
 
 
 def _build_aten_subgraph(

@@ -84,15 +84,11 @@ from .lowering.load_slice_ops import lower_load
 from .lowering.memory_ops import lower_getitem
 from .lowering.memory_ops import lower_store
 from .support.block_ids import block_id_from_key
-from .support.errors import DynamicShapeError
 from .support.errors import ModuleBuilderError
 from .support.errors import NodeLoweringError
-from .support.errors import ShapeError
 from .support.errors import UnsupportedOperationError
 from .support.errors import ValueNotFoundError
 from .support.errors import safe_int_conversion
-from .support.type_utils import get_zero_attr
-from .support.type_utils import torch_dtype_to_mlir
 from .support.type_utils import torch_tensor_to_mlir_type
 
 if TYPE_CHECKING:
@@ -504,82 +500,23 @@ class MLIRModuleBuilder:
     # ------------------------------------------------------------------
 
     def _lower_host_tensor(self, node: torch.fx.Node) -> ir.Value | None:
-        """``_host_tensor('name')`` → look up the function argument."""
-        name = node.args[0]
-        assert isinstance(name, str)
-        if name in self.context.param_to_value:
-            return self.context.param_to_value[name]
+        from .lowering.host_tensor_ops import lower_host_tensor
 
-        # Alias fallback: some host-tensor names correspond to view/contiguous
-        # aliases traced as separate host symbols (e.g. "z") while the backing
-        # tensor ultimately originates from an argument (e.g. "x").
-        val = node.meta.get("val")
-        if isinstance(val, torch.Tensor):
-            resolved = self._resolve_host_tensor_alias_value(val)
-            if resolved is not None:
-                aliased = self._materialize_host_tensor_alias_shape(resolved, node)
-                if aliased is not None:
-                    return aliased
-                return resolved
-
-        return None
+        return lower_host_tensor(self.context, node)
 
     def _resolve_host_tensor_alias_value(self, t: torch.Tensor) -> ir.Value | None:
-        """Resolve a host tensor alias to an existing argument MLIR value.
+        from .lowering.host_tensor_ops import resolve_host_tensor_alias_value
 
-        Walks the tensor's base chain and checks ``tensor_to_origin`` names
-        against ``_param_to_value``.
-        """
-        seen: set[int] = set()
-        cur: torch.Tensor | None = t
-
-        while isinstance(cur, torch.Tensor) and id(cur) not in seen:
-            seen.add(id(cur))
-            origin = self.hf.tensor_to_origin.get(cur)
-            if origin is not None:
-                host_name = origin.host_str()
-                if host_name in self.context.param_to_value:
-                    return self.context.param_to_value[host_name]
-            cur = getattr(cur, "_base", None)
-
-        return None
+        return resolve_host_tensor_alias_value(self.context, t)
 
     def _materialize_host_tensor_alias_shape(
         self,
         base_val: ir.Value,
         alias_node: torch.fx.Node,
     ) -> ir.Value | None:
-        """Materialize a static-shape host tensor alias when shape differs.
+        from .lowering.host_tensor_ops import materialize_host_tensor_alias_shape
 
-        Currently supports flatten-style aliases by emitting
-        ``tensor.collapse_shape``.
-        """
-        from mlir.dialects import tensor as tensor_d
-        import mlir.ir as ir
-
-        base_shape = None
-        try:
-            base_ty = ir.RankedTensorType(base_val.type)
-            base_shape = [int(d) for d in base_ty.shape]
-            elem_ty = base_ty.element_type
-        except Exception:
-            return None
-
-        alias_shape = self._shape_from_node_meta(alias_node)
-        if alias_shape is None or base_shape == alias_shape:
-            return base_val
-
-        if len(alias_shape) == 1:
-            base_numel = 1
-            for d in base_shape:
-                base_numel *= d
-            if base_numel != int(alias_shape[0]):
-                return None
-            result_ty = ir.RankedTensorType.get(alias_shape, elem_ty)
-            reassociation = [list(range(len(base_shape)))]
-            return tensor_d.CollapseShapeOp(result_ty, base_val, reassociation).result
-
-        return None
+        return materialize_host_tensor_alias_shape(self.context, base_val, alias_node)
 
     def _lower_get_symnode(self, node: torch.fx.Node) -> ir.Value:
         """``_get_symnode('block_size_N')`` → integer index constant."""
@@ -596,85 +533,9 @@ class MLIRModuleBuilder:
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
 
     def _lower_tile_index(self, node: torch.fx.Node) -> ir.Value | None:
-        """``tile.index`` → 1D tensor of global offsets for the tile."""
-        from mlir.dialects import arith as arith_d
-        from mlir.dialects import tensor as tensor_d
-        import mlir.ir as ir
+        from .lowering.tile_index_ops import lower_tile_index
 
-        if not node.args:
-            return None
-
-        tile_arg = node.args[0]
-        sym_to_block_id = self._build_sym_to_block_id()
-        block_id = self._infer_block_id_from_index(tile_arg, sym_to_block_id)
-        if block_id is None and self.context.for_block_id_stack:
-            # In nested loops, symbolic metadata can be lost for tile.index.
-            # Fall back to the innermost active scf.for block id.
-            block_id = self.context.for_block_id_stack[-1]
-
-        shape = self._shape_from_node_meta(node)
-        if shape is None:
-            shape = []
-        if not shape:
-            if block_id is not None and block_id in self.context.block_id_to_size:
-                shape = [self.context.block_id_to_size[block_id]]
-            else:
-                return None
-
-        # Prefer configured tile size over stale metadata for tile.index.
-        # In nested loops, symbolic metadata can point to the wrong block and
-        # inflate extents (e.g. 64 instead of 32), which then poisons helper
-        # signatures and gather shapes.
-        if block_id is not None and block_id in self.context.block_id_to_size and shape:
-            shape[0] = int(self.context.block_id_to_size[block_id])
-
-        if (
-            block_id is not None
-            and block_id in self.context.block_id_to_upper_bound
-            and self.context.block_id_to_upper_bound[block_id] > 0
-        ):
-            shape[0] = min(
-                shape[0], int(self.context.block_id_to_upper_bound[block_id])
-            )
-
-        if len(shape) != 1:
-            raise UnsupportedOperationError(
-                "tile_index",
-                reason="Only 1D tile.index lowering is implemented",
-            )
-
-        elem_ty: ir.Type = ir.IndexType.get()
-        meta_val = node.meta.get("val")
-        if isinstance(meta_val, torch.Tensor):
-            try:
-                meta_ty = torch_dtype_to_mlir(meta_val.dtype)
-                if isinstance(meta_ty, (ir.IntegerType, ir.IndexType)):
-                    elem_ty = meta_ty
-            except Exception:
-                pass
-
-        index_ty = ir.IndexType.get()
-        result_ty = ir.RankedTensorType.get(shape, elem_ty)
-        op = tensor_d.GenerateOp(result_ty, [])
-        body = op.operation.regions[0].blocks.append(index_ty)
-
-        if block_id is not None and block_id in self.context.block_id_to_iv:
-            base = self.context.block_id_to_iv[block_id]
-        else:
-            base = self._get_index_const(0)
-
-        with ir.InsertionPoint(body):
-            iv = body.arguments[0]
-            if isinstance(elem_ty, ir.IndexType):
-                value = arith_d.AddIOp(base, iv).result
-                tensor_d.YieldOp(value)
-            else:
-                base_int = arith_d.IndexCastOp(elem_ty, base).result
-                iv_int = arith_d.IndexCastOp(elem_ty, iv).result
-                value = arith_d.AddIOp(base_int, iv_int).result
-                tensor_d.YieldOp(value)
-
-        return op.result
+        return lower_tile_index(self.context, node)
 
     def _lower_mask_to(self, node: torch.fx.Node) -> ir.Value | None:
         """Conservatively forward masked tensors when the backend has no mask IR."""
@@ -715,81 +576,14 @@ class MLIRModuleBuilder:
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, concrete)).result
 
     def _lower_full(self, node: torch.fx.Node) -> ir.Value:
-        """``full(shape, fill_val, dtype)`` → ``tensor.empty`` + ``linalg.fill``.
+        from .lowering.tensor_creation_ops import lower_full
 
-        Raises
-        ------
-        ShapeError
-            If shape is invalid
-        DynamicShapeError
-            If dynamic shapes are encountered
-        """
-        from mlir.dialects import arith as arith_d
-        from mlir.dialects import linalg as linalg_d
-        from mlir.dialects import tensor as tensor_d
-        import mlir.ir as ir
-
-        # args: shape (list/tuple of symnodes), fill_value, dtype, device
-        try:
-            shape_nodes = node.args[0]
-            fill_val = node.args[1]
-            dtype = node.args[2] if len(node.args) > 2 else torch.float32
-
-            # Extract concrete shape from shape nodes.
-            # _get_symnode nodes carry the block_id in their first arg
-            # ("block_size_N"); use _block_id_to_size for correct sizes.
-            shape = self._shape_from_nodes(shape_nodes, "full")
-
-            mlir_dtype = torch_dtype_to_mlir(dtype)
-            empty = tensor_d.EmptyOp(shape, mlir_dtype).result
-            fill_attr = (
-                ir.FloatAttr.get(mlir_dtype, float(fill_val))
-                if isinstance(mlir_dtype, ir.FloatType)
-                else ir.IntegerAttr.get(mlir_dtype, int(fill_val))
-            )
-            fill_const = arith_d.ConstantOp(mlir_dtype, fill_attr).result
-            return linalg_d.fill(fill_const, outs=[empty])
-        except (ShapeError, DynamicShapeError):
-            raise
-        except Exception as e:
-            raise NodeLoweringError(
-                node,
-                reason=str(e),
-                recovery_hint="Check tensor shapes and dtypes",
-            ) from e
+        return lower_full(self.context, node)
 
     def _lower_zeros(self, node: torch.fx.Node) -> ir.Value:
-        """``zeros(shape, dtype)`` → ``tensor.empty`` + ``linalg.fill(0)``.
+        from .lowering.tensor_creation_ops import lower_zeros
 
-        Raises
-        ------
-        ShapeError
-            If shape is invalid
-        """
-        from mlir.dialects import arith as arith_d
-        from mlir.dialects import linalg as linalg_d
-        from mlir.dialects import tensor as tensor_d
-
-        try:
-            shape_nodes = node.args[0]
-            dtype = node.args[1] if len(node.args) > 1 else torch.float32
-
-            # Extract concrete shape from shape nodes.
-            shape = self._shape_from_nodes(shape_nodes, "zeros")
-
-            mlir_dtype = torch_dtype_to_mlir(dtype)
-            empty = tensor_d.EmptyOp(shape, mlir_dtype).result
-            zero_attr = get_zero_attr(dtype)
-            zero = arith_d.ConstantOp(mlir_dtype, zero_attr).result
-            return linalg_d.fill(zero, outs=[empty])
-        except (ShapeError, DynamicShapeError):
-            raise
-        except Exception as e:
-            raise NodeLoweringError(
-                node,
-                reason=str(e),
-                recovery_hint="Check tensor shapes and dtypes",
-            ) from e
+        return lower_zeros(self.context, node)
 
     def _lower_for_loop(self, node: torch.fx.Node) -> ir.Value:
         return lower_nested_for_loop(self.context, node)
@@ -826,7 +620,11 @@ class MLIRModuleBuilder:
         # placeholder shapes in nested loop bodies are evaluated to their hint
         # values (e.g. both tile_m and tile_n evaluate to 64), making them
         # indistinguishable when resolving block_ids in _resolve_shape.
-        self._restore_symbolic_shapes_in_bodies()
+        from .support.symbolic_shape_restoration import (
+            restore_symbolic_shapes_in_bodies,
+        )
+
+        restore_symbolic_shapes_in_bodies(self.hf, self.context)
         self._refresh_aten_tensor_meta()
 
         aten_nodes: list[torch.fx.Node] = []
@@ -873,395 +671,11 @@ class MLIRModuleBuilder:
         node: torch.fx.Node,
         input_mlir_vals: list[ir.Value],
     ) -> tuple[str, list[ir.Type]] | None:
-        """Build a call-site-specific ATen helper variant using current operand types."""
-        from .aten_lowering import collect_tensor_input_positions
-        from .aten_lowering import normalized_aten_args
-        from .aten_lowering import preprocess_aten_nodes
+        from .aten_bridge.helper_rebuild import rebuild_aten_helper_for_call
 
-        if self.context.mlir_module is None:
-            return None
-
-        import mlir.ir as ir
-
-        norm_args = normalized_aten_args(node)
-        tensor_positions = collect_tensor_input_positions(node)
-        if len(tensor_positions) != len(input_mlir_vals):
-            return None
-
-        from .support.type_utils import mlir_dtype_to_torch
-
-        backups: list[tuple[torch.fx.Node, object, object]] = []
-        override_by_position: dict[int, torch.Tensor] = {}
-        try:
-            for arg_idx, mlir_val in zip(
-                tensor_positions, input_mlir_vals, strict=True
-            ):
-                arg_node = norm_args[arg_idx]
-                if not isinstance(arg_node, torch.fx.Node):
-                    continue
-
-                rty = ir.RankedTensorType(mlir_val.type)
-                shape = [int(d) for d in rty.shape]
-                elem_key = str(rty.element_type)
-                dtype = mlir_dtype_to_torch(
-                    elem_key,
-                    default=torch.int64 if elem_key == "index" else torch.float32,
-                )
-                if elem_key not in {
-                    "f32",
-                    "f64",
-                    "f16",
-                    "bf16",
-                    "i1",
-                    "i8",
-                    "i16",
-                    "i32",
-                    "i64",
-                    "index",
-                }:
-                    return None
-
-                old_val = arg_node.meta.get("val")
-                old_tm = arg_node.meta.get("tensor_meta")
-                backups.append((arg_node, old_val, old_tm))
-
-                concrete = torch.zeros(shape, dtype=dtype)
-                arg_node.meta["val"] = concrete
-                override_by_position[arg_idx] = concrete
-
-            try:
-                rebuilt_map = preprocess_aten_nodes(
-                    [node],
-                    self.context.mlir_module,
-                    self.context.block_id_to_size,
-                    self.context.block_hint_to_id,
-                    self.context.block_symint_to_id,
-                    self.context.block_id_to_upper_bound,
-                    {id(node): override_by_position},
-                )
-            except Exception as exc:
-                log.warning(
-                    "On-demand helper rebuild failed for node %s (%s): %s",
-                    node.name,
-                    node.target,
-                    exc,
-                )
-                return None
-            rebuilt = rebuilt_map.get(id(node))
-            if rebuilt is not None:
-                self.context.node_to_aten_func[id(node)] = rebuilt
-            return rebuilt
-        finally:
-            for arg_node, old_val, old_tm in backups:
-                if old_val is None:
-                    arg_node.meta.pop("val", None)
-                else:
-                    arg_node.meta["val"] = old_val
-                if old_tm is None:
-                    arg_node.meta.pop("tensor_meta", None)
-                else:
-                    arg_node.meta["tensor_meta"] = old_tm
+        return rebuild_aten_helper_for_call(self.context, node, input_mlir_vals)
 
     def _refresh_aten_tensor_meta(self) -> None:
         from .support.aten_prepass import refresh_aten_tensor_meta
 
         refresh_aten_tensor_meta(self.hf)
-
-    def _restore_symbolic_shapes_in_bodies(self) -> None:
-        """Copy symbolic meta['val'] from outer iter-args into inner body placeholders.
-
-        Inside a ``_for_loop`` body graph, placeholder meta may be evaluated to
-        hint integers instead of keeping the original symbolic SymInts (e.g.
-        str='u0').  Restoring them ensures _resolve_shape can distinguish blocks
-        by symbolic name rather than falling back to ambiguous hint values.
-
-        Additionally registers the iter-arg tensor's SymInt shape dimensions in
-        ``_block_symint_to_id`` so identity-based lookup works even when the
-        acc tensor's SymInts are different objects from the _get_symnode ones.
-        """
-        for graph_info in self.hf.device_ir.graphs:
-            for node in graph_info.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                if getattr(node.target, "__name__", "") != "_for_loop":
-                    continue
-                body_graph_id: int = node.args[0]
-                iter_arg_outer_nodes = list(node.args[3])  # outer-scope FX nodes
-                body_graph = self.hf.device_ir.graphs[body_graph_id].graph
-                body_phs = [n for n in body_graph.nodes if n.op == "placeholder"]
-                for ph, outer_node in zip(body_phs, iter_arg_outer_nodes, strict=False):
-                    if not isinstance(outer_node, torch.fx.Node):
-                        continue
-                    outer_val = outer_node.meta.get("val")
-                    if not isinstance(outer_val, torch.Tensor):
-                        continue
-                    upper_bounds = node.args[2] if len(node.args) > 2 else None
-                    # Register the outer tensor's SymInt shape dimensions so
-                    # _resolve_shape can match them by identity.  Match each
-                    # shape dimension to its block_id via the outer node's
-                    # shape-arg nodes (e.g. _get_symnode("block_size_0")).
-                    shape_arg = outer_node.args[0] if outer_node.args else None
-                    if isinstance(shape_arg, (list, tuple)):
-                        for i, shape_node in enumerate(shape_arg):
-                            if (
-                                isinstance(shape_node, torch.fx.Node)
-                                and getattr(shape_node.target, "__name__", "")
-                                == "_get_symnode"
-                                and shape_node.args
-                                and isinstance(shape_node.args[0], str)
-                                and "block_size_" in shape_node.args[0]
-                                and i < len(outer_val.shape)
-                            ):
-                                block_id = block_id_from_key(shape_node.args[0])
-                                if block_id is None:
-                                    continue
-                                dim_symint = outer_val.shape[i]
-                                if isinstance(dim_symint, torch.SymInt):
-                                    import sympy as _sympy
-
-                                    expr = getattr(
-                                        getattr(dim_symint, "node", None), "expr", None
-                                    )
-                                    if isinstance(expr, _sympy.Symbol):
-                                        self.context.block_symint_to_id[id(expr)] = (
-                                            block_id
-                                        )
-                    # Build a concrete-shaped fake tensor using config block sizes.
-                    # This replaces the ambiguous symbolic meta so _resolve_shape
-                    # sees plain Python integers and maps them correctly.
-                    if isinstance(shape_arg, (list, tuple)):
-                        concrete_shape = self._shape_from_nodes(
-                            list(shape_arg), "iter_arg"
-                        )
-                        # Tile dimensions in loop bodies must be bounded by the
-                        # loop upper bounds; block sizes can be larger.
-                        if isinstance(upper_bounds, (list, tuple)):
-                            for i, ub in enumerate(upper_bounds):
-                                if i >= len(concrete_shape):
-                                    break
-                                try:
-                                    ub_int = int(ub)
-                                except Exception:
-                                    continue
-                                if ub_int > 0:
-                                    concrete_shape[i] = min(concrete_shape[i], ub_int)
-                        concrete_val = torch.zeros(
-                            concrete_shape, dtype=outer_val.dtype
-                        )
-                        ph.meta["val"] = concrete_val
-                        # Propagate to _new_var aliases and update all nodes that
-                        # derive their shape from the placeholder (sym_size.int, loads).
-                        for body_node in body_graph.nodes:
-                            if body_node.op != "call_function":
-                                continue
-                            tname = getattr(body_node.target, "__name__", "")
-                            if (
-                                tname == "_new_var"
-                                and body_node.args
-                                and body_node.args[0] is ph
-                            ):
-                                body_node.meta["val"] = concrete_val
-                            elif tname in ("sym_size.int", "sym_size_int"):
-                                tensor_arg = (
-                                    body_node.args[0] if body_node.args else None
-                                )
-                                dim_arg = (
-                                    body_node.args[1]
-                                    if len(body_node.args) > 1
-                                    else None
-                                )
-                                if (
-                                    tensor_arg is ph
-                                    and isinstance(dim_arg, int)
-                                    and dim_arg < len(concrete_shape)
-                                ):
-                                    body_node.meta["val"] = concrete_shape[dim_arg]
-                            elif tname == "load":
-                                # Recompute load result shape using _shape_from_nodes
-                                # so extract_slice sizes match the config values.
-                                load_index_nodes = (
-                                    body_node.args[1]
-                                    if len(body_node.args) > 1
-                                    else None
-                                )
-                                if load_index_nodes is not None:
-                                    try:
-                                        load_shape = self._shape_from_nodes(
-                                            list(load_index_nodes), "load"
-                                        )
-                                        old_val = body_node.meta.get("val")
-                                        if isinstance(old_val, torch.Tensor) and len(
-                                            load_shape
-                                        ) == len(old_val.shape):
-                                            body_node.meta["val"] = torch.zeros(
-                                                load_shape, dtype=old_val.dtype
-                                            )
-                                    except Exception:
-                                        pass
-                    else:
-                        ph.meta["val"] = outer_val
-                        for body_node in body_graph.nodes:
-                            if (
-                                body_node.op == "call_function"
-                                and getattr(body_node.target, "__name__", "")
-                                == "_new_var"
-                                and body_node.args
-                                and body_node.args[0] is ph
-                            ):
-                                body_node.meta["val"] = outer_val
-
-    # ------------------------------------------------------------------
-    # Helper: infer block_id from an index FX node
-    # ------------------------------------------------------------------
-
-    def _build_sym_to_block_id(self) -> dict[str, int]:
-        return self.context.build_sym_to_block_id()
-
-    def _infer_block_id_from_index(
-        self,
-        idx_node: object,
-        sym_to_block_id: dict[str, int],
-    ) -> int | None:
-        block_id, _ = self._infer_index_block_and_bias(idx_node, sym_to_block_id)
-        return block_id
-
-    def _infer_index_block_and_bias(
-        self,
-        idx_node: object,
-        sym_to_block_id: dict[str, int],
-    ) -> tuple[int | None, int]:
-        """Infer ``(block_id, additive_bias)`` for simple tile-index expressions."""
-
-        block_id = self._infer_block_id_from_index_symbolic(idx_node, sym_to_block_id)
-        if block_id is not None:
-            return block_id, 0
-
-        if isinstance(idx_node, int):
-            return None, int(idx_node)
-
-        if not isinstance(idx_node, torch.fx.Node):
-            return None, 0
-
-        target_name = str(idx_node.target)
-        tname = getattr(idx_node.target, "__name__", "")
-        is_add = "aten.add" in target_name or tname in ("add.Tensor", "add.default")
-        if is_add and len(idx_node.args) >= 2:
-            left_block, left_bias = self._infer_index_block_and_bias(
-                idx_node.args[0], sym_to_block_id
-            )
-            right_block, right_bias = self._infer_index_block_and_bias(
-                idx_node.args[1], sym_to_block_id
-            )
-
-            if left_block is not None and right_block is None:
-                return left_block, left_bias + right_bias
-            if right_block is not None and left_block is None:
-                return right_block, right_bias + left_bias
-
-            # Shape-based fallback when symbolic provenance is lost through
-            # arithmetic wrappers (common for tile.index + constant patterns).
-            if left_block is None and right_block is None:
-                left_shape_block = self._infer_block_id_from_value_shape(
-                    idx_node.args[0]
-                )
-                right_shape_block = self._infer_block_id_from_value_shape(
-                    idx_node.args[1]
-                )
-                if left_shape_block is not None and right_shape_block is None:
-                    return left_shape_block, left_bias + right_bias
-                if right_shape_block is not None and left_shape_block is None:
-                    return right_shape_block, right_bias + left_bias
-
-        return None, 0
-
-    def _infer_block_id_from_value_shape(self, idx_node: object) -> int | None:
-        """Infer block_id from a 1D tensor index extent when symbolic info is unavailable."""
-        if not isinstance(idx_node, torch.fx.Node):
-            return None
-        val = self._get_value(idx_node)
-        if val is None:
-            return None
-
-        import mlir.ir as ir
-
-        try:
-            val_ty = ir.RankedTensorType(val.type)
-        except Exception:
-            return None
-
-        if val_ty.rank != 1:
-            return None
-
-        extent = int(val_ty.shape[0])
-        candidates = [
-            bid
-            for bid in self.context.block_id_to_iv
-            if (
-                self.context.block_id_to_upper_bound.get(bid) == extent
-                or self.context.block_id_to_size.get(bid) == extent
-            )
-        ]
-        if len(candidates) == 1:
-            return candidates[0]
-        return None
-
-    def _infer_block_id_from_index_symbolic(
-        self,
-        idx_node: object,
-        sym_to_block_id: dict[str, int],
-    ) -> int | None:
-        """Given an FX node representing a tile index, return its block_id.
-
-        We look at the ``meta["val"]`` of the node, which is a ``torch.SymInt``
-        backed by a sympy symbol of the form ``uN``.
-        """
-        if not isinstance(idx_node, torch.fx.Node):
-            return None
-        val = idx_node.meta.get("val")
-        if val is None:
-            return None
-        if isinstance(val, torch.SymInt):
-            sym_str = str(val)
-            if sym_str in sym_to_block_id:
-                return sym_to_block_id[sym_str]
-            # Fallback for cases where symbol strings are unavailable/rewritten.
-            import sympy as _sympy
-
-            val_expr = getattr(getattr(val, "node", None), "expr", None)
-            if (
-                isinstance(val_expr, _sympy.Symbol)
-                and id(val_expr) in self.context.block_symint_to_id
-            ):
-                return self.context.block_symint_to_id[id(val_expr)]
-            if hasattr(idx_node, "target"):
-                tname = getattr(idx_node.target, "__name__", "")
-                if tname == "_get_symnode" and idx_node.args:
-                    key = idx_node.args[0]
-                    if isinstance(key, str) and "block_size_" in key:
-                        return block_id_from_key(key)
-        # For sym_size.int nodes the val is a SymInt too.
-        if isinstance(val, torch.SymInt):
-            tname = getattr(idx_node.target, "__name__", "")
-            if tname in ("sym_size.int", "sym_size_int"):
-                tensor_node = idx_node.args[0]
-                dim_idx = int(idx_node.args[1])
-                tensor_val = (
-                    tensor_node.meta.get("val")
-                    if isinstance(tensor_node, torch.fx.Node)
-                    else None
-                )
-                if isinstance(tensor_val, torch.Tensor):
-                    shape_val = tensor_val.shape[dim_idx]
-                    if isinstance(shape_val, torch.SymInt):
-                        sv_expr = getattr(
-                            getattr(shape_val, "node", None), "expr", None
-                        )
-                        if (
-                            isinstance(sv_expr, _sympy.Symbol)
-                            and id(sv_expr) in self.context.block_symint_to_id
-                        ):
-                            return self.context.block_symint_to_id[id(sv_expr)]
-                        sym_str = str(shape_val)
-                        if sym_str in sym_to_block_id:
-                            return sym_to_block_id[sym_str]
-        return None
