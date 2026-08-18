@@ -73,7 +73,6 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-from typing import Any
 
 import torch
 import torch.fx
@@ -130,70 +129,6 @@ class MLIRModuleBuilder:
         self.context.lower_node_callback = self._lower_node
         self._helper_table: AtenHelperTable | None = None
 
-    @property
-    def _node_to_value(self) -> dict[torch.fx.Node, ir.Value]:
-        return self.context.node_to_value
-
-    @property
-    def _param_to_value(self) -> dict[str, ir.Value]:
-        return self.context.param_to_value
-
-    @property
-    def _block_id_to_size(self) -> dict[int, int]:
-        return self.context.block_id_to_size
-
-    @property
-    def _block_hint_to_id(self) -> dict[int, int]:
-        return self.context.block_hint_to_id
-
-    @property
-    def _block_symint_to_id(self) -> dict[int, int]:
-        return self.context.block_symint_to_id
-
-    @property
-    def _block_id_to_upper_bound(self) -> dict[int, int]:
-        return self.context.block_id_to_upper_bound
-
-    @property
-    def _block_id_to_iv(self) -> dict[int, ir.Value]:
-        return self.context.block_id_to_iv
-
-    @property
-    def _forall_insert_slices(self) -> list[tuple]:
-        return self.context.forall_insert_slices
-
-    @property
-    def _for_store_ctx_stack(self) -> list[dict[str, Any]]:
-        return self.context.for_store_ctx_stack
-
-    @property
-    def _for_block_id_stack(self) -> list[int]:
-        return self.context.for_block_id_stack
-
-    @property
-    def _mlir_module(self) -> ir.Module | None:
-        return self.context.mlir_module
-
-    @_mlir_module.setter
-    def _mlir_module(self, value: ir.Module | None) -> None:
-        self.context.mlir_module = value
-
-    @property
-    def _mlir_context(self) -> ir.Context | None:
-        return self.context.mlir_context
-
-    @_mlir_context.setter
-    def _mlir_context(self, value: ir.Context | None) -> None:
-        self.context.mlir_context = value
-
-    @property
-    def _node_to_aten_func(self) -> dict[int, tuple[str, list]]:
-        return self.context.node_to_aten_func
-
-    @_node_to_aten_func.setter
-    def _node_to_aten_func(self, value: dict[int, tuple[str, list]]) -> None:
-        self.context.node_to_aten_func = value
-
     def build(self) -> ir.Module:
         """Build and return the generated MLIR module."""
         import mlir.ir as ir
@@ -208,8 +143,8 @@ class MLIRModuleBuilder:
 
             with ir.Location.unknown(ctx):
                 module = ir.Module.create()
-                self._mlir_module = module
-                self._mlir_context = ctx
+                self.context.mlir_module = module
+                self.context.mlir_context = ctx
                 self._helper_table = AtenHelperTable(module)
                 with ir.InsertionPoint(module.body), self.hf:
                     self._resolve_block_sizes()
@@ -259,8 +194,8 @@ class MLIRModuleBuilder:
         entry = fn.add_entry_block()
         with ir.InsertionPoint(entry):
             for (name, _), arg in zip(input_params, entry.arguments, strict=True):
-                self._param_to_value[name] = arg
-            if not self._block_id_to_size:
+                self.context.param_to_value[name] = arg
+            if not self.context.block_id_to_size:
                 with self.hf:
                     self._resolve_block_sizes()
             func_d.ReturnOp([self._build_kernel_body(out_tensor)])
@@ -286,7 +221,7 @@ class MLIRModuleBuilder:
                     size = -1
             else:
                 size = int(size)
-            self._block_id_to_size[bs.block_id] = size
+            self.context.block_id_to_size[bs.block_id] = size
 
         # Build hint-value → block_id by scanning _get_symnode nodes.
         import contextlib
@@ -301,16 +236,19 @@ class MLIRModuleBuilder:
                     block_id = block_id_from_key(key)
                     if block_id is not None:
                         val = node.meta.get("val")
-                        if val is not None and block_id in self._block_id_to_size:
+                        if (
+                            val is not None
+                            and block_id in self.context.block_id_to_size
+                        ):
                             # Use sympy Symbol identity — stable because sympy caches symbols.
                             if isinstance(val, torch.SymInt):
                                 import sympy as _sympy
 
                                 expr = getattr(getattr(val, "node", None), "expr", None)
                                 if isinstance(expr, _sympy.Symbol):
-                                    self._block_symint_to_id[id(expr)] = block_id
+                                    self.context.block_symint_to_id[id(expr)] = block_id
                             with contextlib.suppress(TypeError, ValueError):
-                                self._block_hint_to_id[int(val)] = block_id
+                                self.context.block_hint_to_id[int(val)] = block_id
 
     def _resolve_block_upper_bounds(self) -> None:
         """Infer static upper bounds per block_id from ``_for_loop`` nodes."""
@@ -336,11 +274,13 @@ class MLIRModuleBuilder:
                         continue
                     if ub_int <= 0:
                         continue
-                    prev = self._block_id_to_upper_bound.get(block_id)
+                    prev = self.context.block_id_to_upper_bound.get(block_id)
                     if prev is None:
-                        self._block_id_to_upper_bound[block_id] = ub_int
+                        self.context.block_id_to_upper_bound[block_id] = ub_int
                     else:
-                        self._block_id_to_upper_bound[block_id] = min(prev, ub_int)
+                        self.context.block_id_to_upper_bound[block_id] = min(
+                            prev, ub_int
+                        )
 
     # ------------------------------------------------------------------
     # Kernel body – outer forall structure
@@ -373,7 +313,7 @@ class MLIRModuleBuilder:
         """Dispatch a single FX node to the appropriate MLIR builder."""
         if node.op == "placeholder":
             # Handled when the graph is entered (for_loop iter args).
-            return self._node_to_value.get(node)
+            return self.context.node_to_value.get(node)
 
         if node.op == "output":
             return None
@@ -412,18 +352,10 @@ class MLIRModuleBuilder:
             from .aten_lowering import normalized_aten_args
 
             if is_aten_op(node):
-                passthrough = self._lower_aten_passthrough(node)
-                if passthrough is not None:
-                    return passthrough
-
-                reduce_max = self._lower_aten_reduce_max_1d(node)
-                if reduce_max is not None:
-                    return reduce_max
-
                 entry = (
                     self._helper_table.get(id(node))
                     if self._helper_table is not None
-                    else self._node_to_aten_func.get(id(node))
+                    else self.context.node_to_aten_func.get(id(node))
                 )
                 if entry is None:
                     log.warning(
@@ -452,10 +384,6 @@ class MLIRModuleBuilder:
                     )
                     if rebuilt is not None:
                         func_name, return_types = rebuilt
-                    else:
-                        passthrough = self._lower_aten_passthrough(node)
-                        if passthrough is not None:
-                            return passthrough
 
                 if not self._helper_signature_matches(func_name, input_mlir_vals):
                     if len(input_mlir_vals) == 1 and self._helper_is_identity(
@@ -463,7 +391,11 @@ class MLIRModuleBuilder:
                     ):
                         return input_mlir_vals[0]
                     if len(input_mlir_vals) == 1 and len(return_types) == 1:
-                        reduced = self._lower_max_reduce_from_tensor(input_mlir_vals[0])
+                        from .aten_bridge.aten_ops import lower_max_reduce_from_tensor
+
+                        reduced = lower_max_reduce_from_tensor(
+                            self.context, input_mlir_vals[0]
+                        )
                         if reduced is not None and str(reduced.type) == str(
                             return_types[0]
                         ):
@@ -480,257 +412,6 @@ class MLIRModuleBuilder:
             )
 
         return None
-
-    def _lower_aten_addmm(self, node: torch.fx.Node) -> ir.Value | None:
-        """Lower ``aten.addmm`` directly to ``linalg.matmul`` when possible."""
-        from mlir.dialects import linalg as linalg_d
-
-        from .aten_lowering import normalized_aten_args
-
-        args = list(normalized_aten_args(node))
-        if len(args) < 3:
-            return None
-
-        acc = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
-        lhs = self._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
-        rhs = self._get_value(args[2]) if isinstance(args[2], torch.fx.Node) else None
-        if acc is None or lhs is None or rhs is None:
-            return None
-
-        beta = args[3] if len(args) > 3 else 1
-        alpha = args[4] if len(args) > 4 else 1
-        if beta != 1 or alpha != 1:
-            return None
-
-        return linalg_d.matmul(lhs, rhs, outs=[acc])
-
-    def _lower_aten_add_matmul_accumulate(self, node: torch.fx.Node) -> ir.Value | None:
-        """Lower ``acc + matmul(lhs, rhs)`` to ``linalg.matmul(..., outs=[acc])``.
-
-        This keeps the reduction update anchored on the loop-carried accumulator,
-        which is required by downstream scf.for iter-arg equivalence checks.
-        """
-        from .aten_lowering import normalized_aten_args
-
-        args = list(normalized_aten_args(node))
-        if len(args) < 2:
-            return None
-
-        alpha = args[2] if len(args) > 2 else 1
-        if alpha != 1:
-            return None
-
-        acc_node: torch.fx.Node | None = None
-        matmul_node: torch.fx.Node | None = None
-
-        for first, second in ((args[0], args[1]), (args[1], args[0])):
-            if not isinstance(first, torch.fx.Node) or not isinstance(
-                second, torch.fx.Node
-            ):
-                continue
-            second_name = str(second.target)
-            second_tname = getattr(second.target, "__name__", "")
-            if (
-                "aten.mm" in second_name
-                or "aten.matmul" in second_name
-                or "aten.bmm" in second_name
-                or second_tname in ("mm.default", "matmul.default", "bmm.default")
-            ):
-                acc_node = first
-                matmul_node = second
-                break
-
-        if acc_node is None or matmul_node is None:
-            return None
-
-        acc = self._get_value(acc_node)
-        if acc is None:
-            return None
-
-        mat_args = list(normalized_aten_args(matmul_node))
-        if len(mat_args) < 2:
-            return None
-
-        lhs = (
-            self._get_value(mat_args[0])
-            if isinstance(mat_args[0], torch.fx.Node)
-            else None
-        )
-        rhs = (
-            self._get_value(mat_args[1])
-            if isinstance(mat_args[1], torch.fx.Node)
-            else None
-        )
-        if lhs is None or rhs is None:
-            return None
-
-        return self._emit_matmul_like(lhs, rhs, out=acc)
-
-    def _lower_aten_add_tensor(self, node: torch.fx.Node) -> ir.Value | None:
-        """Lower elementwise ``aten.add.Tensor`` directly to ``linalg.generic``."""
-        from mlir.dialects import arith as arith_d
-        from mlir.dialects import linalg as linalg_d
-        from mlir.dialects import tensor as tensor_d
-        import mlir.ir as ir
-
-        from .aten_lowering import normalized_aten_args
-
-        args = list(normalized_aten_args(node))
-        if len(args) < 2:
-            return None
-
-        alpha = args[2] if len(args) > 2 else 1
-        if alpha != 1:
-            return None
-
-        lhs = self._get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
-        rhs = self._get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
-
-        # Tensor + scalar (or scalar + tensor): materialize a filled tensor and add.
-        if lhs is not None and rhs is None and isinstance(args[1], (int, float)):
-            lhs_ty = ir.RankedTensorType(lhs.type)
-            elem_ty = lhs_ty.element_type
-            if isinstance(elem_ty, ir.FloatType):
-                scalar_attr = ir.FloatAttr.get(elem_ty, float(args[1]))
-            elif isinstance(elem_ty, ir.IntegerType):
-                scalar_attr = ir.IntegerAttr.get(elem_ty, int(args[1]))
-            else:
-                return None
-
-            scalar_val = arith_d.ConstantOp(elem_ty, scalar_attr).result
-            rhs_empty = tensor_d.EmptyOp(list(lhs_ty.shape), elem_ty).result
-            rhs_tensor = linalg_d.fill(scalar_val, outs=[rhs_empty])
-            out = tensor_d.EmptyOp(list(lhs_ty.shape), elem_ty).result
-            return linalg_d.add(lhs, rhs_tensor, outs=[out])
-
-        if rhs is not None and lhs is None and isinstance(args[0], (int, float)):
-            rhs_ty = ir.RankedTensorType(rhs.type)
-            elem_ty = rhs_ty.element_type
-            if isinstance(elem_ty, ir.FloatType):
-                scalar_attr = ir.FloatAttr.get(elem_ty, float(args[0]))
-            elif isinstance(elem_ty, ir.IntegerType):
-                scalar_attr = ir.IntegerAttr.get(elem_ty, int(args[0]))
-            else:
-                return None
-
-            scalar_val = arith_d.ConstantOp(elem_ty, scalar_attr).result
-            lhs_empty = tensor_d.EmptyOp(list(rhs_ty.shape), elem_ty).result
-            lhs_tensor = linalg_d.fill(scalar_val, outs=[lhs_empty])
-            out = tensor_d.EmptyOp(list(rhs_ty.shape), elem_ty).result
-            return linalg_d.add(lhs_tensor, rhs, outs=[out])
-
-        if lhs is None or rhs is None:
-            return None
-
-        lhs_ty = ir.RankedTensorType(lhs.type)
-        rhs_ty = ir.RankedTensorType(rhs.type)
-        lhs_shape = [int(d) for d in lhs_ty.shape]
-        rhs_shape = [int(d) for d in rhs_ty.shape]
-        out_rank = max(len(lhs_shape), len(rhs_shape))
-        out_shape_rev: list[int] = []
-        for i in range(out_rank):
-            ld = lhs_shape[-1 - i] if i < len(lhs_shape) else 1
-            rd = rhs_shape[-1 - i] if i < len(rhs_shape) else 1
-            if ld != rd and ld != 1 and rd != 1:
-                return None
-            out_shape_rev.append(max(ld, rd))
-        out_shape = list(reversed(out_shape_rev))
-
-        lhs_elem = lhs_ty.element_type
-        rhs_elem = rhs_ty.element_type
-
-        def _promoted_elem_type() -> ir.Type | None:
-            if str(lhs_elem) == str(rhs_elem):
-                return lhs_elem
-            if isinstance(lhs_elem, ir.IntegerType) and isinstance(
-                rhs_elem, ir.IntegerType
-            ):
-                return lhs_elem if lhs_elem.width >= rhs_elem.width else rhs_elem
-            if isinstance(lhs_elem, ir.FloatType) and isinstance(
-                rhs_elem, ir.FloatType
-            ):
-                return lhs_elem if lhs_elem.width >= rhs_elem.width else rhs_elem
-            if isinstance(lhs_elem, ir.FloatType) and isinstance(
-                rhs_elem, ir.IntegerType
-            ):
-                return lhs_elem
-            if isinstance(lhs_elem, ir.IntegerType) and isinstance(
-                rhs_elem, ir.FloatType
-            ):
-                return rhs_elem
-            return None
-
-        out_elem = _promoted_elem_type()
-        if out_elem is None:
-            return None
-
-        def _cast_scalar(val: ir.Value, src: ir.Type, dst: ir.Type) -> ir.Value | None:
-            if str(src) == str(dst):
-                return val
-            if isinstance(src, ir.IntegerType) and isinstance(dst, ir.IntegerType):
-                if src.width < dst.width:
-                    return arith_d.ExtSIOp(dst, val).result
-                return arith_d.TruncIOp(dst, val).result
-            if isinstance(src, ir.IntegerType) and isinstance(dst, ir.FloatType):
-                return arith_d.SIToFPOp(dst, val).result
-            if isinstance(src, ir.FloatType) and isinstance(dst, ir.FloatType):
-                if src.width < dst.width:
-                    return arith_d.ExtFOp(dst, val).result
-                return arith_d.TruncFOp(dst, val).result
-            return None
-
-        # General broadcast-compatible tensor + tensor lowering.
-        if list(lhs_ty.shape) != list(rhs_ty.shape) or str(lhs_elem) != str(rhs_elem):
-            out_ty = ir.RankedTensorType.get(out_shape, out_elem)
-            out = tensor_d.GenerateOp(out_ty, [])
-            body = out.operation.regions[0].blocks.append(
-                *([ir.IndexType.get()] * len(out_shape))
-            )
-            with ir.InsertionPoint(body):
-                ivs = list(body.arguments)
-
-                def _indices_for_operand(op_shape: list[int]) -> list[ir.Value]:
-                    idxs: list[ir.Value] = []
-                    rank_delta = len(out_shape) - len(op_shape)
-                    for dim, size in enumerate(op_shape):
-                        if size == 1:
-                            idxs.append(self._get_index_const(0))
-                        else:
-                            idxs.append(ivs[rank_delta + dim])
-                    return idxs
-
-                lhs_val = tensor_d.ExtractOp(
-                    lhs,
-                    _indices_for_operand(lhs_shape),
-                    results=[lhs_elem],
-                ).result
-                rhs_val = tensor_d.ExtractOp(
-                    rhs,
-                    _indices_for_operand(rhs_shape),
-                    results=[rhs_elem],
-                ).result
-
-                lhs_cast = _cast_scalar(lhs_val, lhs_elem, out_elem)
-                rhs_cast = _cast_scalar(rhs_val, rhs_elem, out_elem)
-                if lhs_cast is None or rhs_cast is None:
-                    return None
-
-                if isinstance(out_elem, ir.FloatType):
-                    summed = arith_d.AddFOp(lhs_cast, rhs_cast).result
-                elif isinstance(out_elem, ir.IntegerType):
-                    summed = arith_d.AddIOp(lhs_cast, rhs_cast).result
-                else:
-                    return None
-
-                tensor_d.YieldOp(summed)
-
-            return out.result
-
-        if len(lhs_ty.shape) != len(rhs_ty.shape):
-            return None
-
-        out = tensor_d.EmptyOp(list(lhs_ty.shape), lhs_elem).result
-        return linalg_d.add(lhs, rhs, outs=[out])
 
     def _emit_matmul_like(
         self,
@@ -751,55 +432,6 @@ class MLIRModuleBuilder:
         from .lowering.matmul_ops import lower_baddbmm
 
         return lower_baddbmm(self.context, node)
-
-    def _lower_aten_relu(self, node: torch.fx.Node) -> ir.Value | None:
-        from .aten_bridge.aten_ops import lower_relu
-
-        return lower_relu(self.context, node)
-
-    def _lower_aten_passthrough(self, node: torch.fx.Node) -> ir.Value | None:
-        """Lower shape-preserving unary ATen ops as direct pass-through."""
-        from .aten_lowering import normalized_aten_args
-
-        target_name = str(node.target)
-        tname = getattr(node.target, "__name__", "")
-        passthrough_ops = (
-            "aten.alias",
-            "aten.detach",
-            "aten.clone",
-            "aten.contiguous",
-        )
-        passthrough_overloads = {
-            "alias.default",
-            "detach.default",
-            "clone.default",
-            "contiguous.default",
-        }
-
-        if (
-            not any(op in target_name for op in passthrough_ops)
-            and tname not in passthrough_overloads
-        ):
-            return None
-
-        args = list(normalized_aten_args(node))
-        if not args:
-            return None
-
-        if isinstance(args[0], torch.fx.Node):
-            return self._get_value(args[0])
-
-        return None
-
-    def _lower_aten_reduce_max_1d(self, node: torch.fx.Node) -> ir.Value | None:
-        from .aten_bridge.aten_ops import lower_reduce_max_1d
-
-        return lower_reduce_max_1d(self.context, node)
-
-    def _lower_max_reduce_from_tensor(self, inp: ir.Value) -> ir.Value | None:
-        from .aten_bridge.aten_ops import lower_max_reduce_from_tensor
-
-        return lower_max_reduce_from_tensor(self.context, inp)
 
     def _lower_call_method(self, node: torch.fx.Node) -> ir.Value | None:
         """Lower selected Tensor call-method ops.
@@ -875,8 +507,8 @@ class MLIRModuleBuilder:
         """``_host_tensor('name')`` → look up the function argument."""
         name = node.args[0]
         assert isinstance(name, str)
-        if name in self._param_to_value:
-            return self._param_to_value[name]
+        if name in self.context.param_to_value:
+            return self.context.param_to_value[name]
 
         # Alias fallback: some host-tensor names correspond to view/contiguous
         # aliases traced as separate host symbols (e.g. "z") while the backing
@@ -906,8 +538,8 @@ class MLIRModuleBuilder:
             origin = self.hf.tensor_to_origin.get(cur)
             if origin is not None:
                 host_name = origin.host_str()
-                if host_name in self._param_to_value:
-                    return self._param_to_value[host_name]
+                if host_name in self.context.param_to_value:
+                    return self.context.param_to_value[host_name]
             cur = getattr(cur, "_base", None)
 
         return None
@@ -959,7 +591,7 @@ class MLIRModuleBuilder:
         block_id = block_id_from_key(key)
         if block_id is None:
             raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
-        size = self._block_id_to_size.get(block_id, 0)
+        size = self.context.block_id_to_size.get(block_id, 0)
         idx = ir.IndexType.get()
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
 
@@ -975,17 +607,17 @@ class MLIRModuleBuilder:
         tile_arg = node.args[0]
         sym_to_block_id = self._build_sym_to_block_id()
         block_id = self._infer_block_id_from_index(tile_arg, sym_to_block_id)
-        if block_id is None and self._for_block_id_stack:
+        if block_id is None and self.context.for_block_id_stack:
             # In nested loops, symbolic metadata can be lost for tile.index.
             # Fall back to the innermost active scf.for block id.
-            block_id = self._for_block_id_stack[-1]
+            block_id = self.context.for_block_id_stack[-1]
 
         shape = self._shape_from_node_meta(node)
         if shape is None:
             shape = []
         if not shape:
-            if block_id is not None and block_id in self._block_id_to_size:
-                shape = [self._block_id_to_size[block_id]]
+            if block_id is not None and block_id in self.context.block_id_to_size:
+                shape = [self.context.block_id_to_size[block_id]]
             else:
                 return None
 
@@ -993,15 +625,17 @@ class MLIRModuleBuilder:
         # In nested loops, symbolic metadata can point to the wrong block and
         # inflate extents (e.g. 64 instead of 32), which then poisons helper
         # signatures and gather shapes.
-        if block_id is not None and block_id in self._block_id_to_size and shape:
-            shape[0] = int(self._block_id_to_size[block_id])
+        if block_id is not None and block_id in self.context.block_id_to_size and shape:
+            shape[0] = int(self.context.block_id_to_size[block_id])
 
         if (
             block_id is not None
-            and block_id in self._block_id_to_upper_bound
-            and self._block_id_to_upper_bound[block_id] > 0
+            and block_id in self.context.block_id_to_upper_bound
+            and self.context.block_id_to_upper_bound[block_id] > 0
         ):
-            shape[0] = min(shape[0], int(self._block_id_to_upper_bound[block_id]))
+            shape[0] = min(
+                shape[0], int(self.context.block_id_to_upper_bound[block_id])
+            )
 
         if len(shape) != 1:
             raise UnsupportedOperationError(
@@ -1024,8 +658,8 @@ class MLIRModuleBuilder:
         op = tensor_d.GenerateOp(result_ty, [])
         body = op.operation.regions[0].blocks.append(index_ty)
 
-        if block_id is not None and block_id in self._block_id_to_iv:
-            base = self._block_id_to_iv[block_id]
+        if block_id is not None and block_id in self.context.block_id_to_iv:
+            base = self.context.block_id_to_iv[block_id]
         else:
             base = self._get_index_const(0)
 
@@ -1160,17 +794,11 @@ class MLIRModuleBuilder:
     def _lower_for_loop(self, node: torch.fx.Node) -> ir.Value:
         return lower_nested_for_loop(self.context, node)
 
-    def _lower_for_loop_legacy(self, node: torch.fx.Node) -> ir.Value:
-        pass  # deprecated
-
     def _lower_getitem(self, node: torch.fx.Node) -> ir.Value | None:
         return lower_getitem(self.context, node)
 
     def _lower_load(self, node: torch.fx.Node) -> ir.Value:
         return lower_load(self.context, node)
-
-    def _lower_load_legacy(self, node: torch.fx.Node) -> ir.Value:
-        pass  # deprecated
 
     def _lower_store(self, node: torch.fx.Node) -> None:
         lower_store(self.context, node)
@@ -1186,7 +814,7 @@ class MLIRModuleBuilder:
     def _prebuild_aten_helpers(self, module: ir.Module) -> None:
         """Scan device IR for ATen nodes, lower them all via one torch-mlir pass.
 
-        Results are stored in ``self._node_to_aten_func`` and the helper
+        Results are stored in the context's ATen helper map and the helper
         ``func.func`` operations are inserted at the module's top level.
         """
         from .aten_bridge.aten_ops import is_custom_aten
@@ -1215,12 +843,12 @@ class MLIRModuleBuilder:
         entries = preprocess_aten_nodes(
             aten_nodes,
             module,
-            self._block_id_to_size,
-            self._block_hint_to_id,
-            self._block_symint_to_id,
-            self._block_id_to_upper_bound,
+            self.context.block_id_to_size,
+            self.context.block_hint_to_id,
+            self.context.block_symint_to_id,
+            self.context.block_id_to_upper_bound,
         )
-        self._node_to_aten_func = entries
+        self.context.node_to_aten_func = entries
         if self._helper_table is not None:
             self._helper_table.replace(entries)
 
@@ -1250,7 +878,7 @@ class MLIRModuleBuilder:
         from .aten_lowering import normalized_aten_args
         from .aten_lowering import preprocess_aten_nodes
 
-        if self._mlir_module is None:
+        if self.context.mlir_module is None:
             return None
 
         import mlir.ir as ir
@@ -1304,11 +932,11 @@ class MLIRModuleBuilder:
             try:
                 rebuilt_map = preprocess_aten_nodes(
                     [node],
-                    self._mlir_module,
-                    self._block_id_to_size,
-                    self._block_hint_to_id,
-                    self._block_symint_to_id,
-                    self._block_id_to_upper_bound,
+                    self.context.mlir_module,
+                    self.context.block_id_to_size,
+                    self.context.block_hint_to_id,
+                    self.context.block_symint_to_id,
+                    self.context.block_id_to_upper_bound,
                     {id(node): override_by_position},
                 )
             except Exception as exc:
@@ -1321,7 +949,7 @@ class MLIRModuleBuilder:
                 return None
             rebuilt = rebuilt_map.get(id(node))
             if rebuilt is not None:
-                self._node_to_aten_func[id(node)] = rebuilt
+                self.context.node_to_aten_func[id(node)] = rebuilt
             return rebuilt
         finally:
             for arg_node, old_val, old_tm in backups:
@@ -1395,7 +1023,9 @@ class MLIRModuleBuilder:
                                         getattr(dim_symint, "node", None), "expr", None
                                     )
                                     if isinstance(expr, _sympy.Symbol):
-                                        self._block_symint_to_id[id(expr)] = block_id
+                                        self.context.block_symint_to_id[id(expr)] = (
+                                            block_id
+                                        )
                     # Build a concrete-shaped fake tensor using config block sizes.
                     # This replaces the ambiguous symbolic meta so _resolve_shape
                     # sees plain Python integers and maps them correctly.
@@ -1565,10 +1195,10 @@ class MLIRModuleBuilder:
         extent = int(val_ty.shape[0])
         candidates = [
             bid
-            for bid in self._block_id_to_iv
+            for bid in self.context.block_id_to_iv
             if (
-                self._block_id_to_upper_bound.get(bid) == extent
-                or self._block_id_to_size.get(bid) == extent
+                self.context.block_id_to_upper_bound.get(bid) == extent
+                or self.context.block_id_to_size.get(bid) == extent
             )
         ]
         if len(candidates) == 1:
@@ -1600,9 +1230,9 @@ class MLIRModuleBuilder:
             val_expr = getattr(getattr(val, "node", None), "expr", None)
             if (
                 isinstance(val_expr, _sympy.Symbol)
-                and id(val_expr) in self._block_symint_to_id
+                and id(val_expr) in self.context.block_symint_to_id
             ):
-                return self._block_symint_to_id[id(val_expr)]
+                return self.context.block_symint_to_id[id(val_expr)]
             if hasattr(idx_node, "target"):
                 tname = getattr(idx_node.target, "__name__", "")
                 if tname == "_get_symnode" and idx_node.args:
@@ -1628,9 +1258,9 @@ class MLIRModuleBuilder:
                         )
                         if (
                             isinstance(sv_expr, _sympy.Symbol)
-                            and id(sv_expr) in self._block_symint_to_id
+                            and id(sv_expr) in self.context.block_symint_to_id
                         ):
-                            return self._block_symint_to_id[id(sv_expr)]
+                            return self.context.block_symint_to_id[id(sv_expr)]
                         sym_str = str(shape_val)
                         if sym_str in sym_to_block_id:
                             return sym_to_block_id[sym_str]

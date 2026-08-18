@@ -2,9 +2,8 @@
 
 Registers as a Helion compiler backend named "mlir".  The backend:
 
-- Inherits most of the compilation pipeline from TritonBackend (type
-  propagation, device IR construction, etc.) since these are largely
-  backend-agnostic.
+- Reuses Helion's backend-neutral compilation pipeline (type propagation,
+    device IR construction, etc.).
 - Replaces the final code-generation step with an MLIR module builder that
   produces Linalg-on-Tensors IR instead of Triton Python source code.
 
@@ -17,18 +16,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from helion._compiler.triton.backend import TritonBackend
+from helion import exc
+from helion._compiler.backend import Backend
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
 
 
-class MLIRBackend(TritonBackend):
+class MLIRBackend(Backend):
     """Helion backend that emits MLIR Linalg-on-Tensors IR.
 
-    Compilation (parsing, type propagation, device IR construction) reuses the
-    TritonBackend pipeline.  Only the final codegen step is replaced.
+    Compilation (parsing, type propagation, device IR construction) uses
+    Helion's backend-neutral pipeline. Only the final codegen step is replaced.
     """
 
     @property
@@ -56,6 +56,42 @@ class MLIRBackend(TritonBackend):
     ) -> object:
         # CPU has no hardware cache key; skip autotuning and use default config.
         return bound_kernel.env.config_spec.default_config()
+
+    def dtype_str(self, dtype: object) -> str:
+        import torch
+
+        dtype_names = {
+            torch.bool: "torch.bool",
+            torch.float16: "torch.float16",
+            torch.bfloat16: "torch.bfloat16",
+            torch.float32: "torch.float32",
+            torch.float64: "torch.float64",
+            torch.int8: "torch.int8",
+            torch.int16: "torch.int16",
+            torch.int32: "torch.int32",
+            torch.int64: "torch.int64",
+            torch.uint8: "torch.uint8",
+        }
+        return dtype_names.get(dtype, str(dtype))
+
+    def acc_type(self, dtype: object) -> str:
+        return self.dtype_str(dtype)
+
+    @property
+    def function_decorator(self) -> str:
+        raise exc.BackendUnsupported(self.name, "Python function decorators")
+
+    @property
+    def constexpr_type(self) -> str:
+        raise exc.BackendUnsupported(self.name, "Python constexpr annotations")
+
+    @property
+    def default_launcher_name(self) -> str:
+        raise exc.BackendUnsupported(self.name, "Python launchers")
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        raise exc.BackendUnsupported(self.name, "Python library imports")
 
     # ------------------------------------------------------------------
     # MLIR generation entry point

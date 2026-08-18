@@ -66,6 +66,15 @@ def lower_custom_aten(builder: object, node: torch.fx.Node) -> ir.Value | None:
         if lowered is not None:
             return lowered
 
+    if aten_target_matches(node, "aten.relu", "relu.default"):
+        lowered = lower_relu(builder.context, node)
+        if lowered is not None:
+            return lowered
+
+    lowered = lower_reduce_max_1d(builder.context, node)
+    if lowered is not None:
+        return lowered
+
     lowered = lower_passthrough(builder.context, node)
     if lowered is not None:
         return lowered
