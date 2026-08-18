@@ -41,7 +41,10 @@ def generate_mlir(
     settings.backend = "mlir"
 
     if config is None:
-        config = getattr(kernel, "_default_config", None)
+        # `@helion.kernel(config=...)` is normalized into `Kernel.configs`.
+        kernel_configs = getattr(kernel, "configs", None)
+        if kernel_configs:
+            config = kernel_configs[0]
 
     import torch
 
