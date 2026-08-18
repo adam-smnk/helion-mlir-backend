@@ -13,7 +13,7 @@ from .support import block_id_from_symbol
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
@@ -340,7 +340,7 @@ class BuildContext:
     @contextmanager
     def enter_for_loop(
         self, block_id: int, induction_variable: ir.Value
-    ) -> Iterator[None]:
+    ) -> Generator[None]:
         """Bind a loop induction variable and restore the previous binding."""
         previous = self.block_id_to_iv.get(block_id)
         self.block_id_to_iv[block_id] = induction_variable
@@ -356,7 +356,7 @@ class BuildContext:
                 self.block_id_to_iv[block_id] = previous
 
     @contextmanager
-    def push_store_ctx(self, store_context: dict[str, Any]) -> Iterator[None]:
+    def push_store_ctx(self, store_context: dict[str, Any]) -> Generator[None]:
         """Push and reliably remove a synthetic store context."""
         self.for_store_ctx_stack.append(store_context)
         try:

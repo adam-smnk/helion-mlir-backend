@@ -160,10 +160,14 @@ class MLIRBackend(Backend):
         """
         import torch
 
-        if not isinstance(input_tensors[0], torch.Tensor):
-            raise TypeError("input_tensors must be torch.Tensor instances")
+        if not input_tensors or not all(
+            isinstance(tensor, torch.Tensor) for tensor in input_tensors
+        ):
+            raise TypeError("input_tensors must be non-empty torch.Tensor instances")
 
         device = input_tensors[0].device
+        if any(tensor.device != device for tensor in input_tensors[1:]):
+            raise ValueError("all input tensors must be on the same device")
         if device.type != "cpu":
             raise NotImplementedError(
                 f"Only CPU device supported for execution; got {device.type}"

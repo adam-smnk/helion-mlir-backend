@@ -54,6 +54,20 @@ def abc_16x64():
 class TestExecuteMlir:
     """Tests for MLIRBackend.execute_mlir (explicit two-step API)."""
 
+    def test_execute_mlir_rejects_empty_inputs(self):
+        with pytest.raises(TypeError, match="non-empty"):
+            _backend().execute_mlir(None)
+
+    def test_execute_mlir_rejects_non_tensor_inputs(self):
+        with pytest.raises(TypeError, match="torch.Tensor"):
+            _backend().execute_mlir(None, torch.ones(2), 1)
+
+    def test_execute_mlir_rejects_mixed_devices(self):
+        cpu_tensor = torch.ones(2)
+        meta_tensor = torch.ones(2, device="meta")
+        with pytest.raises(ValueError, match="same device"):
+            _backend().execute_mlir(None, cpu_tensor, meta_tensor)
+
     def test_add_execute_mlir(self, ab_32x32):
         """Elementwise add via execute_mlir matches torch reference."""
         A, B = ab_32x32
