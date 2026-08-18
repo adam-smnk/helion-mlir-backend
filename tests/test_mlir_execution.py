@@ -333,6 +333,123 @@ class TestExecuteMlir:
 
         assert _allclose(actual, expected)
 
+    def test_grid_batched_matmul_execute_mlir(self):
+        """`hl.grid` scalar indices produce numerically correct batched matmul."""
+
+        @helion.kernel(static_shapes=True)
+        def grid_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            nb, m, k = a.shape
+            out = torch.zeros((nb, m, b.shape[2]), dtype=torch.float32, device=a.device)
+            for i in hl.grid(nb):
+                out[i, :, :] = torch.matmul(a[i, :, :], b[i, :, :])
+            return out
+
+        torch.manual_seed(7)
+        a = torch.randn(4, 32, 32)
+        b = torch.randn(4, 32, 32)
+
+        module = generate_mlir(grid_bmm, [a, b])
+        actual = _backend().execute_mlir(module, a, b, kernel_name="grid_bmm")
+
+        assert _allclose(actual, torch.bmm(a, b))
+
+    def test_tile_begin_execute_mlir(self):
+        """`tile.begin` contributes the correct per-tile offset value."""
+
+        @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[16]))
+        def tile_begin_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+            for tm in hl.tile(m):
+                out[tm, :] = x[tm, :] + tm.begin
+            return out
+
+        torch.manual_seed(11)
+        x = torch.randn(64, 32)
+
+        module = generate_mlir(
+            tile_begin_kernel, [x], config=helion.Config(block_sizes=[16])
+        )
+        actual = _backend().execute_mlir(module, x, kernel_name="tile_begin_kernel")
+
+        offsets = (torch.arange(64) // 16 * 16).to(torch.float32).unsqueeze(1)
+        assert _allclose(actual, x + offsets)
+
+    @pytest.mark.parametrize(
+        "block_sizes", [[16, 32, 64], [32, 32, 32], [16, 16, 16], [32, 64, 32]]
+    )
+    def test_nested_tile_block_sizes_execute_mlir(self, block_sizes):
+        """Repeated nested block sizes still compute a correct matmul."""
+
+        @helion.kernel(static_shapes=True)
+        def mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            k2, n = y.shape
+            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+            for tm, tn in hl.tile([m, n]):
+                acc = hl.zeros([tm, tn], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+                out[tm, tn] = acc
+            return out
+
+        torch.manual_seed(3)
+        x = torch.randn(128, 128)
+        y = torch.randn(128, 128)
+
+        module = generate_mlir(
+            mm, [x, y], config=helion.Config(block_sizes=block_sizes)
+        )
+        actual = _backend().execute_mlir(module, x, y, kernel_name="mm")
+
+        assert _allclose(actual, x @ y)
+
+    def test_transposed_rhs_matmul_execute_mlir(self):
+        """A transposed RHS lowered via linalg.contract is numerically correct."""
+
+        @helion.kernel(static_shapes=True)
+        def mm_transposed_b(x: torch.Tensor, yt: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            n, k2 = yt.shape
+            out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+            for tm, tn in hl.tile([m, n]):
+                acc = hl.zeros([tm, tn], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    acc = torch.addmm(acc, x[tm, tk], yt[tn, tk].permute(1, 0))
+                out[tm, tn] = acc
+            return out
+
+        torch.manual_seed(5)
+        x = torch.randn(64, 64)
+        yt = torch.randn(64, 64)
+
+        module = generate_mlir(
+            mm_transposed_b, [x, yt], config=helion.Config(block_sizes=[16, 32, 64])
+        )
+        actual = _backend().execute_mlir(module, x, yt, kernel_name="mm_transposed_b")
+
+        assert _allclose(actual, x @ yt.t())
+
+    def test_dtype_cast_epilogue_execute_mlir(self):
+        """An explicit `.to(bfloat16)` epilogue produces a bf16 result."""
+
+        @helion.kernel(static_shapes=True)
+        def cast_kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+            for tm, tn in hl.tile([m, n]):
+                out[tm, tn] = (x[tm, tn] * 2.0).to(torch.bfloat16)
+            return out
+
+        torch.manual_seed(13)
+        x = torch.randn(64, 64)
+
+        module = generate_mlir(cast_kernel, [x])
+        actual = _backend().execute_mlir(module, x, kernel_name="cast_kernel")
+
+        assert actual.dtype == torch.bfloat16
+        assert _allclose(actual, (x * 2.0).to(torch.bfloat16))
+
     def test_cpu_only_guard(self, ab_32x32):
         """execute_mlir raises NotImplementedError for non-CPU tensors."""
         A, B = ab_32x32

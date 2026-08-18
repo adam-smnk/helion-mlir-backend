@@ -18,6 +18,12 @@ _CUSTOM_TARGETS = (
     "aten.matmul",
     "aten.bmm",
     "aten.baddbmm",
+    "aten.permute",
+    "aten.transpose",
+    "aten.t.default",
+    "aten._to_copy",
+    "aten.to.",
+    "convert_element_type",
 )
 
 
@@ -49,6 +55,12 @@ def lower_custom_aten(builder: object, node: torch.fx.Node) -> ir.Value | None:
         lowered = lower_add_matmul_accumulate(builder.context, node)
         if lowered is not None:
             return lowered
+
+    lowered = lower_scalar_binary(builder.context, node)
+    if lowered is not None:
+        return lowered
+
+    if aten_target_matches(node, "aten.add.Tensor", "add.Tensor"):
         lowered = lower_add_tensor(builder.context, node)
         if lowered is not None:
             return lowered
@@ -70,6 +82,14 @@ def lower_custom_aten(builder: object, node: torch.fx.Node) -> ir.Value | None:
         lowered = lower_relu(builder.context, node)
         if lowered is not None:
             return lowered
+
+    lowered = lower_dtype_convert(builder.context, node)
+    if lowered is not None:
+        return lowered
+
+    lowered = lower_transpose_node(builder.context, node)
+    if lowered is not None:
+        return lowered
 
     lowered = lower_reduce_max_1d(builder.context, node)
     if lowered is not None:
@@ -106,23 +126,113 @@ def lower_passthrough(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None
 
 def lower_addmm(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower unit-scaled ``aten.addmm`` into an accumulator matmul."""
-    from mlir.dialects import linalg as linalg_d
-
     from ..aten_lowering import normalized_aten_args
+    from ..lowering import emit_matmul_like
+    from ..lowering import resolve_contraction_operand
 
     args = list(normalized_aten_args(node))
     if len(args) < 3:
         return None
     accumulator = ctx.get_value(args[0]) if isinstance(args[0], torch.fx.Node) else None
-    lhs = ctx.get_value(args[1]) if isinstance(args[1], torch.fx.Node) else None
-    rhs = ctx.get_value(args[2]) if isinstance(args[2], torch.fx.Node) else None
+    lhs, transpose_lhs = resolve_contraction_operand(ctx, args[1])
+    rhs, transpose_rhs = resolve_contraction_operand(ctx, args[2])
     if accumulator is None or lhs is None or rhs is None:
         return None
     beta = args[3] if len(args) > 3 else 1
     alpha = args[4] if len(args) > 4 else 1
     if beta != 1 or alpha != 1:
         return None
+    lowered = emit_matmul_like(
+        ctx,
+        lhs,
+        rhs,
+        out=accumulator,
+        transpose_lhs=transpose_lhs,
+        transpose_rhs=transpose_rhs,
+    )
+    if lowered is not None:
+        return lowered
+    if transpose_lhs or transpose_rhs:
+        return None
+    # Shapes recovered from tiled metadata can be imprecise; linalg.matmul still
+    # verifies them, so keep emitting it directly rather than falling back.
+    from mlir.dialects import linalg as linalg_d
+
     return linalg_d.matmul(lhs, rhs, outs=[accumulator])
+
+
+def lower_transpose_node(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """Lower a standalone permute/transpose of a tile."""
+    from ..lowering import lower_transpose
+
+    return lower_transpose(ctx, node)
+
+
+def lower_dtype_convert(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """Lower ``.to(dtype)`` / ``_to_copy`` / ``convert_element_type`` on a tile."""
+    import torch
+
+    from ..aten_lowering import normalized_aten_args
+    from ..support import torch_dtype_to_mlir
+
+    if not aten_target_matches(
+        node,
+        "aten._to_copy",
+        "aten.to.",
+        "convert_element_type",
+        "_to_copy.default",
+        "to.dtype",
+        "convert_element_type.default",
+    ):
+        return None
+
+    args = list(normalized_aten_args(node))
+    if not args or not isinstance(args[0], torch.fx.Node):
+        return None
+    source = ctx.get_value(args[0])
+    if source is None:
+        return None
+
+    dtype = next((arg for arg in args[1:] if isinstance(arg, torch.dtype)), None)
+    if dtype is None:
+        dtype = node.kwargs.get("dtype")
+    if dtype is None:
+        value = node.meta.get("val")
+        dtype = value.dtype if isinstance(value, torch.Tensor) else None
+    if dtype is None:
+        return None
+
+    return convert_tensor_element_type(ctx, source, torch_dtype_to_mlir(dtype))
+
+
+def convert_tensor_element_type(
+    ctx: BuildContext, source: ir.Value, target_type: ir.Type
+) -> ir.Value | None:
+    """Convert a tensor's element type elementwise, returning *source* if equal."""
+    from mlir.dialects import tensor as tensor_d
+    import mlir.ir as ir
+
+    source_type = ir.RankedTensorType(source.type)
+    if str(source_type.element_type) == str(target_type):
+        return source
+
+    shape = list(source_type.shape)
+    result_type = ir.RankedTensorType.get(shape, target_type)
+    generate = tensor_d.GenerateOp(result_type, [])
+    body = generate.operation.regions[0].blocks.append(
+        *([ir.IndexType.get()] * len(shape))
+    )
+    with ir.InsertionPoint(body):
+        element = tensor_d.ExtractOp(
+            source,
+            list(body.arguments),
+            results=[source_type.element_type],
+        ).result
+        converted = ctx.cast_scalar_to(element, target_type)
+        if converted is None:
+            return None
+        tensor_d.YieldOp(converted)
+    return generate.result
 
 
 def lower_add_matmul_accumulate(
@@ -160,19 +270,88 @@ def lower_add_matmul_accumulate(
     matmul_args = list(normalized_aten_args(matmul_node))
     if accumulator is None or len(matmul_args) < 2:
         return None
-    lhs = (
-        ctx.get_value(matmul_args[0])
-        if isinstance(matmul_args[0], torch.fx.Node)
-        else None
-    )
-    rhs = (
-        ctx.get_value(matmul_args[1])
-        if isinstance(matmul_args[1], torch.fx.Node)
-        else None
-    )
+    from ..lowering import resolve_contraction_operand
+
+    lhs, transpose_lhs = resolve_contraction_operand(ctx, matmul_args[0])
+    rhs, transpose_rhs = resolve_contraction_operand(ctx, matmul_args[1])
     if lhs is None or rhs is None:
         return None
-    return emit_matmul_like(ctx, lhs, rhs, out=accumulator)
+    return emit_matmul_like(
+        ctx,
+        lhs,
+        rhs,
+        out=accumulator,
+        transpose_lhs=transpose_lhs,
+        transpose_rhs=transpose_rhs,
+    )
+
+
+def lower_scalar_binary(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """Lower an elementwise binary op whose second operand is a scalar value.
+
+    Covers tile positions (``tile.begin`` and friends) and ``hl.grid`` indices,
+    which reach codegen as plain ``index`` scalars rather than tensors.
+    """
+    from mlir.dialects import linalg as linalg_d
+    from mlir.dialects import tensor as tensor_d
+    import mlir.ir as ir
+
+    from ..aten_lowering import normalized_aten_args
+
+    named_ops = {
+        "aten.add.Tensor": linalg_d.add,
+        "aten.sub.Tensor": linalg_d.sub,
+        "aten.mul.Tensor": linalg_d.mul,
+        "aten.div.Tensor": linalg_d.div,
+    }
+    operation = next(
+        (builder for name, builder in named_ops.items() if name in str(node.target)),
+        None,
+    )
+    if operation is None:
+        return None
+
+    args = list(normalized_aten_args(node))
+    if len(args) < 2 or (args[2] if len(args) > 2 else 1) != 1:
+        return None
+
+    values = [
+        ctx.get_value(arg) if isinstance(arg, torch.fx.Node) else None for arg in args
+    ]
+
+    def as_tensor(value: object) -> ir.RankedTensorType | None:
+        if value is None:
+            return None
+        try:
+            return ir.RankedTensorType(value.type)
+        except Exception:
+            return None
+
+    tensor_index = next(
+        (i for i in (0, 1) if as_tensor(values[i]) is not None),
+        None,
+    )
+    scalar_index = next(
+        (i for i in (0, 1) if values[i] is not None and as_tensor(values[i]) is None),
+        None,
+    )
+    if tensor_index is None or scalar_index is None:
+        return None
+
+    tensor_value = values[tensor_index]
+    tensor_type = as_tensor(tensor_value)
+    assert tensor_type is not None
+    element_type = tensor_type.element_type
+
+    scalar = ctx.cast_scalar_to(values[scalar_index], element_type)
+    if scalar is None:
+        return None
+
+    shape = list(tensor_type.shape)
+    filled = linalg_d.fill(scalar, outs=[tensor_d.EmptyOp(shape, element_type).result])
+    lhs, rhs = (tensor_value, filled) if tensor_index == 0 else (filled, tensor_value)
+    output = tensor_d.EmptyOp(shape, element_type).result
+    return operation(lhs, rhs, outs=[output])
 
 
 def lower_add_tensor(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:

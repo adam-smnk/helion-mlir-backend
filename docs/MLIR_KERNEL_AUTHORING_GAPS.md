@@ -5,6 +5,11 @@ against the `mlir` backend with `HELION_MLIR_PIPELINE=1` on an AMX-capable
 Xeon (Emerald Rapids). Everything below was reproduced on that setup; each item
 states the observed symptom and, where known, the root cause.
 
+> **Status update.** Blockers 1, 2, 4, 5, 6 and 7 are now resolved in
+> `helion_mlir_backend`; each is annotated **RESOLVED** below with what was done.
+> Blocker 3 (deeper reduction cache tiles) remains open and is a compiler-side
+> issue, as are the codegen quality items. Blocker 8 is a Helion frontend limit.
+
 ## Summary
 
 The backend already lowers the canonical Helion matmul idiom
@@ -50,6 +55,12 @@ missing piece is mapping the symbol to that IV, plus rank-reducing
 dimensions with 2D views inside are how blocked matmul is written in plain MLIR,
 and they are the only way to feed the contraction pre-packed, contiguous tiles.
 
+**RESOLVED.** Grid symbols are resolved through `HostFunction.expr_to_origin`
+(`GridOrigin`) rather than the `block_size_N` key, and loads/stores now emit
+rank-reducing `tensor.extract_slice` / rank-expanding
+`tensor.parallel_insert_slice` for scalar-indexed dimensions. `a[i, :, :]`
+yields a genuine 2D tile and lowers to `linalg.matmul`.
+
 ### 2. `tile.begin` is not supported
 
 ```python
@@ -59,6 +70,11 @@ a[ti.begin, tk.begin, :, :]
 raises `UnsupportedOperationError: Unsupported operation: tile_begin`. This is
 the other route to scalar block indices, so it is blocked for the same reasons
 as `hl.grid`.
+
+**RESOLVED.** `tile.begin`, `tile.end`, `tile.id`, `tile.count` and
+`tile.block_size` all lower to scalar `index` arithmetic off the enclosing loop
+induction variable. `tile.end` clamps with `arith.minsi` only when the extent is
+not an exact multiple of the block size.
 
 ### 3. Reduction cache tile is pinned to the AMX register tile
 
@@ -92,6 +108,14 @@ upper bound. Equal sizes make that lookup ambiguous and it picks the wrong one.
 At minimum this should be a hard error. Ideally the block id should be carried
 explicitly rather than re-derived from sizes.
 
+**RESOLVED.** The true cause was in index lowering, not the loop: a
+`sym_size.int` index node loses its symbolic metadata when
+`_restore_placeholder_metadata` concretizes placeholder shapes, so the block id
+fell back to size matching, which is ambiguous when sizes are equal. The block
+id of each placeholder dimension is now recorded while the symbols are still
+live and used directly, so equal tile sizes resolve exactly. A hard error also
+guards the remaining size-matching fallback.
+
 ### 5. dtype-cast epilogue fails
 
 ```python
@@ -109,6 +133,11 @@ The outlined ATen helper is built for a stale default block shape (64x64) and
 `_rebuild_aten_helper_for_call` does not recover. This forces f32 outputs and
 blocks any mixed-precision epilogue.
 
+**RESOLVED.** `.to(dtype)` (both the `call_method` and the
+`aten._to_copy` / `prims.convert_element_type` forms) is lowered directly to an
+elementwise `arith` conversion instead of an outlined helper, and a store into a
+narrower output inserts the cast implicitly.
+
 ### 6. In-kernel transpose / permute of a tile fails
 
 ```python
@@ -117,6 +146,11 @@ torch.addmm(acc, x[tm, tk], yt[tn, tk].permute(1, 0))
 
 fails during `MLIR inlining`. A transposed-B matmul is the cheapest way to make
 the RHS AMX tile rows contiguous, and it is not expressible.
+
+**RESOLVED.** A `permute` / `transpose` / `t` that only swaps the two innermost
+dimensions and feeds a contraction is folded into `linalg.contract` with
+indexing maps encoding the transpose. A standalone transpose lowers to
+`linalg.transpose`.
 
 ### 7. Mixed-precision contraction takes the fallback path
 
@@ -133,6 +167,10 @@ goes through `batch_import_and_lower`. It happens to produce the right IR, but
 the fast path should accept it explicitly: `linalg.matmul` supports mixed
 precision natively and this is *the* shape the AMX strategy looks for
 (`is_amx_bf16_contraction` requires bf16/bf16/f32).
+
+**RESOLVED.** `emit_matmul_like` now accepts a wider accumulator than its
+operands (bf16/bf16 -> f32, f16/f16 -> f32, i8/i8 -> i32) and keeps emitting
+`linalg.matmul` / `linalg.batch_matmul` directly.
 
 ### 8. Helion itself rejects 4D matmul
 
@@ -165,24 +203,24 @@ consistent with the bottleneck being the innermost loop rather than the blocking
 
 ## Requested support, in priority order
 
-1. **`hl.grid` / scalar block indices**, including rank-reducing load and store
-   (`a[i, kb, :, :]`, `out[i, j, :, :] = acc`). Unlocks user-written block
-   packing, multi-level tiling with fixed tile sizes, and 2D views of blocked
-   tensors.
-2. **`tile.begin`** (equivalent to 1, via the tile API).
+Items 1, 2, 4, 5, 6 and 7 are implemented; item 3 is the remaining compiler-side
+blocker and items 8 and 9 remain open.
+
+1. ~~**`hl.grid` / scalar block indices**~~ — done, including rank-reducing load
+   and store (`a[i, kb, :, :]`, `out[i, j, :, :] = acc`).
+2. ~~**`tile.begin`**~~ — done, along with `tile.end`, `tile.id`, `tile.count`
+   and `tile.block_size`.
 3. **Deeper reduction cache tiles** (`TK > 32`), i.e. keep the register-level
    `K` loop accumulator memory-backed so AMX conversion still applies.
-4. **Hard error (not silent miscompile) on ambiguous block sizes**, and ideally
-   removal of the distinctness requirement.
-5. **dtype conversion ops in the epilogue**: `aten.to` / `aten._to_copy` /
-   `prims.convert_element_type` on a tile, and implicit cast on store.
-6. **Transpose / permute of a loaded tile** (`.t()`, `.permute`,
-   `.transpose(0, 1)`), which also gives access to
-   `linalg.matmul_transpose_b`.
-7. **Direct mixed-precision path in `emit_matmul_like`** (bf16/bf16 -> f32,
-   f16/f16 -> f32, i8/i8 -> i32) instead of falling back to the ATen bridge.
+   *Still open — compiler side.*
+4. ~~**Hard error on ambiguous block sizes**~~ — done, and the distinctness
+   requirement is removed: equal tile sizes now lower correctly.
+5. ~~**dtype conversion ops in the epilogue**~~ — done, including implicit cast
+   on store.
+6. ~~**Transpose / permute of a loaded tile**~~ — done via `linalg.contract`
+   indexing maps, with `linalg.transpose` for standalone uses.
+7. ~~**Direct mixed-precision path in `emit_matmul_like`**~~ — done.
 8. **`view` / `reshape` on host tensors inside the kernel** so a packed tensor
-   can be re-interpreted without a separate host-side pass.
-
-Items 1–3 are what separate the current ~4%-of-peak matmul from something
-competitive; the rest are correctness and expressiveness.
+   can be re-interpreted without a separate host-side pass. *Still open.*
+9. **4D matmul in Helion itself** (frontend limitation, see item 8 above).
+   *Still open.*

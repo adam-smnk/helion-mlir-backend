@@ -61,7 +61,7 @@ def _restore_placeholder_metadata(
         _propagate_new_var(body_graph, placeholder, outer_value)
         return
 
-    _register_symbolic_shape_ids(shape_arg, outer_value, context)
+    _register_symbolic_shape_ids(shape_arg, outer_value, context, placeholder)
     concrete_shape = context.shape_from_nodes(list(shape_arg), "iter_arg")
     if isinstance(upper_bounds, (list, tuple)):
         for index, bound in enumerate(upper_bounds):
@@ -80,6 +80,7 @@ def _register_symbolic_shape_ids(
     shape_arg: list | tuple,
     outer_value: torch.Tensor,
     context: BuildContext,
+    placeholder: torch.fx.Node,
 ) -> None:
     import sympy
 
@@ -92,6 +93,9 @@ def _register_symbolic_shape_ids(
         block_id = block_id_from_key(key)
         if block_id is None:
             continue
+        # Placeholder metadata is concretized below, so remember which block each
+        # dimension came from while the symbols are still available.
+        context.placeholder_dim_to_block_id[(id(placeholder), index)] = block_id
         dimension = outer_value.shape[index]
         expression = getattr(getattr(dimension, "node", None), "expr", None)
         if isinstance(dimension, torch.SymInt) and isinstance(expression, sympy.Symbol):

@@ -82,3 +82,68 @@ def lower_tile_index(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
         tensor_d.YieldOp(value)
 
     return operation.result
+
+
+def scalar_tile_value(ctx: BuildContext, block_id: int, kind: str) -> ir.Value | None:
+    """Build the scalar ``index`` value for a grid or tile position op."""
+    from mlir.dialects import arith as arith_d
+
+    size = ctx.block_id_to_size.get(block_id)
+    upper_bound = ctx.block_id_to_upper_bound.get(block_id)
+
+    if kind == "block_size":
+        return None if size is None else ctx.index_const(int(size))
+
+    if kind == "tile_count":
+        if not size or size <= 0 or not upper_bound or upper_bound <= 0:
+            return None
+        return ctx.index_const(-(-int(upper_bound) // int(size)))
+
+    induction_variable = ctx.block_id_to_iv.get(block_id)
+    if induction_variable is None:
+        return None
+
+    if kind in ("grid", "tile_begin"):
+        return induction_variable
+
+    if kind == "tile_end":
+        if not size or size <= 0:
+            return None
+        end = arith_d.AddIOp(induction_variable, ctx.index_const(int(size))).result
+        # Only the last tile can overrun, and only when the extent is known.
+        if upper_bound and upper_bound > 0 and int(upper_bound) % int(size):
+            end = arith_d.MinSIOp(end, ctx.index_const(int(upper_bound))).result
+        return end
+
+    if kind == "tile_id":
+        if not size or size <= 0:
+            return None
+        if int(size) == 1:
+            return induction_variable
+        return arith_d.DivUIOp(induction_variable, ctx.index_const(int(size))).result
+
+    return None
+
+
+def lower_tile_scalar_op(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """Lower ``tile.begin`` / ``tile.end`` / ``tile.id`` / ``tile.count``."""
+    from ..support import block_id_from_key
+
+    kind = getattr(node.target, "__name__", "")
+    info = ctx.node_symbol_info(node)
+    block_id = info[0] if info is not None else None
+
+    if block_id is None and node.args:
+        tile_argument = node.args[0]
+        if isinstance(tile_argument, torch.fx.Node) and tile_argument.args:
+            block_id = block_id_from_key(tile_argument.args[0])
+        if block_id is None:
+            block_id = ctx.infer_block_id_from_index(
+                tile_argument, ctx.build_sym_to_block_id()
+            )
+    if block_id is None and ctx.for_block_id_stack:
+        block_id = ctx.for_block_id_stack[-1]
+    if block_id is None:
+        return None
+
+    return scalar_tile_value(ctx, block_id, kind)

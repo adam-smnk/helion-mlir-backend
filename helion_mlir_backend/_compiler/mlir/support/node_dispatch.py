@@ -38,6 +38,11 @@ def lower_helion_node(
         "sym_size.int": builder._lower_sym_size,
         "sym_size_int": builder._lower_sym_size,
         "tile_index": builder._lower_tile_index,
+        "tile_begin": builder._lower_tile_scalar_op,
+        "tile_end": builder._lower_tile_scalar_op,
+        "tile_id": builder._lower_tile_scalar_op,
+        "tile_count": builder._lower_tile_scalar_op,
+        "tile_block_size": builder._lower_tile_scalar_op,
         "_mask_to": builder._lower_mask_to,
     }
     lowerer = lowerers.get(target_name)
