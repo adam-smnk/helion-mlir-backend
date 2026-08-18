@@ -39,6 +39,9 @@ class BuildContext:
     block_id_to_upper_bound: dict[int, int] = field(default_factory=dict)
 
     block_id_to_iv: dict[int, ir.Value] = field(default_factory=dict)
+    placeholder_dim_to_block_id: dict[tuple[int, int], int] = field(
+        default_factory=dict
+    )
     forall_insert_slices: list[tuple] = field(default_factory=list)
     for_store_ctx_stack: list[dict[str, Any]] = field(default_factory=list)
     for_block_id_stack: list[int] = field(default_factory=list)
@@ -100,6 +103,43 @@ class BuildContext:
                 if isinstance(value.type, ir.IndexType):
                     return value
         return arith_d.IndexCastOp(ir.IndexType.get(), value).result
+
+    def cast_scalar_to(self, value: ir.Value, target: ir.Type) -> ir.Value | None:
+        """Convert a scalar MLIR value to the requested element type."""
+        from mlir.dialects import arith as arith_d
+        import mlir.ir as ir
+
+        source = value.type
+        if str(source) == str(target):
+            return value
+        if isinstance(source, ir.IndexType):
+            if isinstance(target, ir.IntegerType):
+                return arith_d.IndexCastOp(target, value).result
+            if isinstance(target, ir.FloatType):
+                integer = arith_d.IndexCastOp(ir.IntegerType.get_signless(64), value)
+                return arith_d.SIToFPOp(target, integer.result).result
+            return None
+        if isinstance(source, ir.IntegerType) and isinstance(target, ir.IndexType):
+            return arith_d.IndexCastOp(target, value).result
+        if isinstance(source, ir.IntegerType) and isinstance(target, ir.IntegerType):
+            if source.width == target.width:
+                return value
+            operation = (
+                arith_d.ExtSIOp if source.width < target.width else arith_d.TruncIOp
+            )
+            return operation(target, value).result
+        if isinstance(source, ir.IntegerType) and isinstance(target, ir.FloatType):
+            return arith_d.SIToFPOp(target, value).result
+        if isinstance(source, ir.FloatType) and isinstance(target, ir.FloatType):
+            if source.width == target.width:
+                return value
+            operation = (
+                arith_d.ExtFOp if source.width < target.width else arith_d.TruncFOp
+            )
+            return operation(target, value).result
+        if isinstance(source, ir.FloatType) and isinstance(target, ir.IntegerType):
+            return arith_d.FPToSIOp(target, value).result
+        return None
 
     def shape_from_node_meta(self, node: object) -> list[int] | None:
         """Extract a concrete tensor shape from FX metadata."""
@@ -188,6 +228,49 @@ class BuildContext:
     def build_sym_to_block_id(self) -> dict[str, int]:
         """Build symbolic ``uN`` names from the active Helion block sizes."""
         return {f"u{block.block_id}": block.block_id for block in self.env.block_sizes}
+
+    def symbol_info(self, value: object) -> tuple[int, str] | None:
+        """Resolve a SymInt to ``(block_id, kind)`` using Helion symbol origins."""
+        from .support import symbol_origin_info
+
+        return symbol_origin_info(self.host_function, value)
+
+    def node_symbol_info(self, node: object) -> tuple[int, str] | None:
+        """Resolve an FX node's SymInt metadata to ``(block_id, kind)``."""
+        import torch
+        import torch.fx
+
+        if not isinstance(node, torch.fx.Node):
+            return None
+        value = node.meta.get("val")
+        if not isinstance(value, torch.SymInt):
+            return None
+        return self.symbol_info(value)
+
+    def is_scalar_index_node(self, node: object) -> bool:
+        """Return whether an index node denotes a scalar position, not a tile."""
+        from .support import SCALAR_SYMBOL_KINDS
+
+        info = self.node_symbol_info(node)
+        return info is not None and info[1] in SCALAR_SYMBOL_KINDS
+
+    def has_symint_operand(self, node: object) -> bool:
+        """Return whether any operand is a symbolic scalar.
+
+        torch-mlir cannot import SymInt operands, so these nodes are lowered
+        directly instead of through a generated helper.
+        """
+        import torch
+        import torch.fx
+
+        if not isinstance(node, torch.fx.Node):
+            return False
+        arguments = list(node.args) + list(node.kwargs.values())
+        return any(
+            isinstance(argument, torch.fx.Node)
+            and isinstance(argument.meta.get("val"), torch.SymInt)
+            for argument in arguments
+        )
 
     def infer_block_id_from_index(
         self, index_node: object, sym_to_block_id: dict[str, int]
@@ -287,17 +370,23 @@ class BuildContext:
         if not isinstance(index_node, torch.fx.Node):
             return None
         value = index_node.meta.get("val")
-        if not isinstance(value, torch.SymInt):
-            return None
-        symbol = str(value)
-        if symbol in sym_to_block_id:
-            return sym_to_block_id[symbol]
-        expression = getattr(getattr(value, "node", None), "expr", None)
-        if (
-            isinstance(expression, sympy.Symbol)
-            and id(expression) in self.block_symint_to_id
-        ):
-            return self.block_symint_to_id[id(expression)]
+        if isinstance(value, torch.SymInt):
+            # Symbol origins are authoritative; the uN name heuristic below is a
+            # fallback and mis-maps grid symbols, whose names are unrelated to
+            # block ids.
+            origin_info = self.symbol_info(value)
+            if origin_info is not None:
+                return origin_info[0]
+            symbol = str(value)
+            if symbol in sym_to_block_id:
+                return sym_to_block_id[symbol]
+            expression = getattr(getattr(value, "node", None), "expr", None)
+            if (
+                isinstance(expression, sympy.Symbol)
+                and id(expression) in self.block_symint_to_id
+            ):
+                return self.block_symint_to_id[id(expression)]
+
         target_name = getattr(index_node.target, "__name__", "")
         if target_name == "_get_symnode" and index_node.args:
             return block_id_from_key(index_node.args[0])
@@ -311,10 +400,23 @@ class BuildContext:
         tensor_value = tensor_node.meta.get("val")
         if not isinstance(tensor_value, torch.Tensor):
             return None
-        dimension = tensor_value.shape[int(index_node.args[1])]
+        dimension_index = int(index_node.args[1])
+        # The node's own metadata may have been replaced by a concrete hint, so
+        # recover the block recorded when the shape was still symbolic.
+        recorded = self.placeholder_dim_to_block_id.get(
+            (id(tensor_node), dimension_index)
+        )
+        if recorded is not None:
+            return recorded
+        dimension = tensor_value.shape[dimension_index]
+        dimension_origin = self.symbol_info(dimension)
+        if dimension_origin is not None:
+            return dimension_origin[0]
         dimension_expression = getattr(getattr(dimension, "node", None), "expr", None)
         if isinstance(dimension_expression, sympy.Symbol):
-            return self.block_symint_to_id.get(id(dimension_expression))
+            resolved = self.block_symint_to_id.get(id(dimension_expression))
+            if resolved is not None:
+                return resolved
         return sym_to_block_id.get(str(dimension))
 
     def lower_graph(self, graph: torch.fx.Graph) -> ir.Value | None:

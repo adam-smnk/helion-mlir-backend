@@ -12,8 +12,10 @@ compilation pipeline:
 from __future__ import annotations
 
 from .aten_prepass import refresh_aten_tensor_meta
+from .block_ids import SCALAR_SYMBOL_KINDS
 from .block_ids import block_id_from_key
 from .block_ids import block_id_from_symbol
+from .block_ids import symbol_origin_info
 from .errors import DynamicShapeError
 from .errors import ModuleBuilderError
 from .errors import NodeLoweringError
@@ -29,6 +31,7 @@ from .type_utils import torch_dtype_to_mlir
 from .type_utils import torch_tensor_to_mlir_type
 
 __all__ = [
+    "SCALAR_SYMBOL_KINDS",
     "DynamicShapeError",
     "ModuleBuilderError",
     "NodeLoweringError",
@@ -43,6 +46,7 @@ __all__ = [
     "refresh_aten_tensor_meta",
     "restore_symbolic_shapes_in_bodies",
     "safe_int_conversion",
+    "symbol_origin_info",
     "torch_dtype_to_mlir",
     "torch_tensor_to_mlir_type",
 ]

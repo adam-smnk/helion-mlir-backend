@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .aten_helper_table import AtenHelperTable
 from .aten_ops import aten_target_matches
+from .aten_ops import convert_tensor_element_type
 from .aten_ops import is_custom_aten
 from .aten_ops import lower_custom_aten
 from .aten_ops import lower_max_reduce_from_tensor
@@ -15,6 +16,7 @@ __all__ = [
     "AtenHelperTable",
     "aten_target_matches",
     "batch_import_and_lower",
+    "convert_tensor_element_type",
     "is_custom_aten",
     "lower_custom_aten",
     "lower_max_reduce_from_tensor",

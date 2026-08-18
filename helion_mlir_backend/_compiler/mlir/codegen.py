@@ -441,6 +441,28 @@ class MLIRModuleBuilder:
         if method in ("contiguous", "clone", "detach"):
             return base_val
 
+        if method == "to":
+            from .aten_bridge import convert_tensor_element_type
+            from .support import torch_dtype_to_mlir
+
+            dtype = next(
+                (arg for arg in node.args[1:] if isinstance(arg, torch.dtype)),
+                node.kwargs.get("dtype"),
+            )
+            if dtype is None:
+                value = node.meta.get("val")
+                dtype = value.dtype if isinstance(value, torch.Tensor) else None
+            if dtype is None:
+                return base_val
+            return convert_tensor_element_type(
+                self.context, base_val, torch_dtype_to_mlir(dtype)
+            )
+
+        if method in ("t", "permute", "transpose"):
+            from .lowering import lower_transpose
+
+            return lower_transpose(self.context, node)
+
         if method in ("view", "reshape"):
             base_shape = self._shape_from_node_meta(base)
             result_shape = self._shape_from_node_meta(node)
@@ -483,18 +505,34 @@ class MLIRModuleBuilder:
         return lower_host_tensor(self.context, node)
 
     def _lower_get_symnode(self, node: torch.fx.Node) -> ir.Value:
-        """``_get_symnode('block_size_N')`` → integer index constant."""
+        """``_get_symnode(key)`` → block-size constant or scalar grid/tile index."""
         from mlir.dialects import arith as arith_d
         import mlir.ir as ir
+
+        from .lowering import scalar_tile_value
 
         key: str = node.args[0]
         # Parse "block_size_N" to get block_id N.
         block_id = block_id_from_key(key)
-        if block_id is None:
-            raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
-        size = self.context.block_id_to_size.get(block_id, 0)
-        idx = ir.IndexType.get()
-        return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
+        if block_id is not None:
+            size = self.context.block_id_to_size.get(block_id, 0)
+            idx = ir.IndexType.get()
+            return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
+
+        # `hl.grid` and tile position symbols carry no block_size_ prefix; they
+        # resolve to a scalar index through their Helion symbol origin.
+        info = self.context.node_symbol_info(node)
+        if info is not None:
+            resolved = scalar_tile_value(self.context, info[0], info[1])
+            if resolved is not None:
+                return resolved
+
+        raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
+
+    def _lower_tile_scalar_op(self, node: torch.fx.Node) -> ir.Value | None:
+        from .lowering import lower_tile_scalar_op
+
+        return lower_tile_scalar_op(self.context, node)
 
     def _lower_tile_index(self, node: torch.fx.Node) -> ir.Value | None:
         from .lowering import lower_tile_index
@@ -591,6 +629,8 @@ class MLIRModuleBuilder:
             for node in graph_info.graph.nodes:
                 if is_aten_op(node):
                     if is_custom_aten(node):
+                        continue
+                    if self.context.has_symint_operand(node):
                         continue
                     aten_nodes.append(node)
 

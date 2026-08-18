@@ -22,6 +22,23 @@ def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     return container_value
 
 
+def _cast_store_value(ctx: BuildContext, value: ir.Value, target: ir.Value) -> ir.Value:
+    """Convert a stored tile to the destination element type when they differ."""
+    import mlir.ir as ir
+
+    from ..aten_bridge import convert_tensor_element_type
+
+    try:
+        value_type = ir.RankedTensorType(value.type)
+        target_type = ir.RankedTensorType(target.type)
+    except Exception:
+        return value
+    if str(value_type.element_type) == str(target_type.element_type):
+        return value
+    converted = convert_tensor_element_type(ctx, value, target_type.element_type)
+    return converted if converted is not None else value
+
+
 def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     """Record or apply a Helion store in the active loop context."""
     from mlir.dialects import tensor as tensor_d
@@ -31,6 +48,11 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     value_node = node.args[2]
     value = ctx.get_value(value_node)
     assert value is not None, f"No value for store value node {value_node}"
+
+    target_value = ctx.get_value(node.args[0])
+    if target_value is not None:
+        value = _cast_store_value(ctx, value, target_value)
+
     ndim = len(ir.RankedTensorType(value.type).shape)
 
     if ctx.for_store_ctx_stack:
@@ -65,12 +87,28 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
 
     sym_to_block_id = ctx.build_sym_to_block_id()
     offsets: list[ir.Value] = []
-    for dimension, index_node in enumerate(index_nodes):
-        if dimension >= ndim:
+    static_sizes: list[int] = []
+    value_shape = list(ir.RankedTensorType(value.type).shape)
+    value_dim = 0
+    for index_node in index_nodes:
+        if ctx.is_scalar_index_node(index_node):
+            scalar_offset = ctx.get_value(index_node)
+            offsets.append(
+                ctx.cast_to_index(scalar_offset)
+                if scalar_offset is not None
+                else ctx.index_const(0)
+            )
+            static_sizes.append(1)
+            continue
+
+        if value_dim >= len(value_shape):
             break
         block_id = ctx.infer_block_id_from_index(index_node, sym_to_block_id)
         if block_id is not None and block_id in ctx.block_id_to_iv:
             offsets.append(ctx.block_id_to_iv[block_id])
         else:
             offsets.append(ctx.index_const(0))
-    ctx.forall_insert_slices.append((value, offsets))
+        static_sizes.append(value_shape[value_dim])
+        value_dim += 1
+
+    ctx.forall_insert_slices.append((value, offsets, static_sizes))

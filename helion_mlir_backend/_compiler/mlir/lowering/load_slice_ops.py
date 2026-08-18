@@ -52,6 +52,15 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     sym_to_block_id = ctx.build_sym_to_block_id()
     used_block_ids: set[int] = set()
     forced: dict[int, int] = {}
+
+    # `hl.grid` indices and `tile.begin`-style positions select a single element
+    # along their dimension, which is then dropped from the loaded tile.
+    scalar_dims = {
+        dimension
+        for dimension, index_node in enumerate(index_nodes)
+        if dimension < ndim and ctx.is_scalar_index_node(index_node)
+    }
+
     if ctx.for_store_ctx_stack:
         store_context = ctx.for_store_ctx_stack[-1]
         inner_block_id = int(store_context.get("block_id", -1))
@@ -84,6 +93,19 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     for dimension, index_node in enumerate(index_nodes):
         if dimension >= ndim:
             break
+
+        if dimension in scalar_dims:
+            scalar_offset = ctx.get_value(index_node)
+            offsets.append(
+                ctx.cast_to_index(scalar_offset)
+                if scalar_offset is not None
+                else ctx.index_const(0)
+            )
+            sizes.append(1)
+            continue
+
+        # Result metadata omits scalar-indexed dimensions, so realign the index.
+        result_index = dimension - sum(1 for d in scalar_dims if d < dimension)
         index_extent: int | None = None
         if isinstance(index_node, torch.fx.Node):
             index_value = ctx.get_value(index_node)
@@ -106,12 +128,12 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             allow_fallback
             and block_id is None
             and result_sizes is not None
-            and dimension < len(result_sizes)
+            and result_index < len(result_sizes)
         ):
             matching = [
                 candidate
                 for candidate in ctx.block_id_to_iv
-                if ctx.block_id_to_size.get(candidate) == result_sizes[dimension]
+                if ctx.block_id_to_size.get(candidate) == result_sizes[result_index]
                 and candidate not in used_block_ids
             ]
             if len(matching) == 1:
@@ -145,19 +167,22 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             if (
                 not is_forced
                 and result_sizes is not None
-                and dimension < len(result_sizes)
+                and result_index < len(result_sizes)
             ):
-                sizes.append(min(configured, result_sizes[dimension], extent))
+                sizes.append(min(configured, result_sizes[result_index], extent))
             else:
                 sizes.append(min(configured, extent))
         elif index_extent is not None:
             sizes.append(min(index_extent, extent))
-        elif result_sizes is not None and dimension < len(result_sizes):
-            sizes.append(min(result_sizes[dimension], extent))
+        elif result_sizes is not None and result_index < len(result_sizes):
+            sizes.append(min(result_sizes[result_index], extent))
         else:
             sizes.append(extent)
 
-    result_type = ir.RankedTensorType.get(sizes, tensor_type.element_type)
+    result_shape = [
+        size for dimension, size in enumerate(sizes) if dimension not in scalar_dims
+    ]
+    result_type = ir.RankedTensorType.get(result_shape, tensor_type.element_type)
     return tensor_d.ExtractSliceOp(
         result_type,
         tensor_value,

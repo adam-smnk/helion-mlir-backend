@@ -53,9 +53,12 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
         ctx.lower_root_graphs(shared_out)
         in_parallel = scf_d.InParallelOp()
         with ir.InsertionPoint(in_parallel.block):
-            for value, offsets in ctx.forall_insert_slices:
+            for value, offsets, *rest in ctx.forall_insert_slices:
                 source_type = ir.RankedTensorType(value.type)
-                rank = len(source_type.shape)
+                static_sizes = (
+                    list(rest[0]) if rest and rest[0] else list(source_type.shape)
+                )
+                rank = len(static_sizes)
                 tensor_d.ParallelInsertSliceOp(
                     value,
                     shared_out,
@@ -63,7 +66,7 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
                     [],
                     [],
                     static_offsets=[ir.ShapedType.get_dynamic_size()] * rank,
-                    static_sizes=list(source_type.shape),
+                    static_sizes=static_sizes,
                     static_strides=[1] * rank,
                 )
 
@@ -116,6 +119,8 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if ub_val is not None:
         ub_val = ctx.cast_to_index(ub_val)
     ub_for_match = ub_static
+    # The block id from the node is authoritative; only re-derive it when that id
+    # is already bound to an enclosing loop.
     if block_id in ctx.block_id_to_iv:
         candidates = [
             bid
@@ -126,7 +131,21 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             and ub_for_match % size == 0
         ]
         if candidates:
-            block_id = max(candidates, key=lambda bid: ctx.block_id_to_size[bid])
+            largest = max(ctx.block_id_to_size[bid] for bid in candidates)
+            tied = [bid for bid in candidates if ctx.block_id_to_size[bid] == largest]
+            if len(tied) > 1:
+                raise NodeLoweringError(
+                    node,
+                    reason=(
+                        f"Ambiguous block id for nested loop: block ids {sorted(tied)} "
+                        f"all have size {largest}"
+                    ),
+                    recovery_hint=(
+                        "Use distinct block_sizes for nested tile dimensions; equal "
+                        "sizes cannot be told apart and would silently miscompile"
+                    ),
+                )
+            block_id = tied[0]
     step = ctx.block_id_to_size.get(block_id, ub_static if ub_static is not None else 1)
     body_graph_info = ctx.host_function.device_ir.graphs[body_graph_id]
     body_graph = body_graph_info.graph
@@ -301,6 +320,6 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if synthetic_store_ctx is not None and synthetic_iter_index is not None:
         final_tile = for_op.results[synthetic_iter_index]
         ctx.forall_insert_slices.append(
-            (final_tile, synthetic_store_ctx["flush_offsets"])
+            (final_tile, synthetic_store_ctx["flush_offsets"], None)
         )
     return for_op
