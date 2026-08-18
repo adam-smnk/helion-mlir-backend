@@ -224,3 +224,182 @@ blocker and items 8 and 9 remain open.
    can be re-interpreted without a separate host-side pass. *Still open.*
 9. **4D matmul in Helion itself** (frontend limitation, see item 8 above).
    *Still open.*
+
+## Re-verification after the fixes
+
+Re-ran the reproducers against the updated backend while attempting to write a
+packed/blocked bf16 matmul. Result: **block packing is still not expressible**,
+and end-to-end matmul performance is unchanged (peak 935 GFLOP/s at 8 threads,
+same as before; `torch.mm` ~3.9 TFLOP/s).
+
+| Case | Before | Now |
+| --- | --- | --- |
+| Equal tile sizes `[64, 64, 32]`, `[32, 128, 32]` | silently wrong | **correct** |
+| `hl.grid` batched matmul, no K loop | `ValueNotFoundError` | builds; fails JIT via blocker 3 |
+| Scalar block index + tiled K reduction | n/a | **MLIR assertion abort** |
+| Transposed RHS in a contraction | inlining failure | builds; **numerically wrong** |
+| `.to(torch.bfloat16)` epilogue | `func.call` type mismatch | builds; **fails JIT** |
+| Nested `hl.grid` | n/a | `ValueNotFoundError: node: u5` |
+
+### A. Scalar block index combined with a tiled K reduction — hard crash
+
+This is *the* pattern a blocked matmul needs: a unit-step loop over block
+indices with an inner reduction over `K`.
+
+```python
+for i in hl.grid(nb):
+    acc = hl.zeros([bm, bn], dtype=torch.float32)
+    for tk in hl.tile(kk):
+        acc = torch.addmm(acc, a[i, :, tk], b[i, tk, :])
+    out[i, :, :] = acc
+```
+
+```
+mlir/lib/Dialect/MemRef/IR/MemRefOps.cpp:3083:
+SubViewOp::inferResultType: Assertion `staticSizes.size() == rank &&
+"staticSizes length mismatch"' failed.
+```
+
+It aborts the process rather than raising. A rank-reducing slice mixing one
+scalar index with one tile index appears to build a `subview` whose static-size
+list is the reduced rank while the source rank is unreduced.
+
+#### Reproducer
+
+Run with `HELION_MLIR_PIPELINE=1`. The first snippet has no matmul and fails
+earlier with a readable verifier error, so it is the better one to fix against;
+the second is the same root cause surfacing as an abort after bufferization.
+
+```python
+# repro_a1.py -- scalar grid index + tiled slice, copy only
+from __future__ import annotations
+import torch, helion, helion.language as hl
+import helion_mlir_backend  # noqa: F401
+
+@helion.kernel(static_shapes=True, backend="mlir",
+               config=helion.Config(block_sizes=[32]))
+def copy_slices(a):
+    nb, m, kk = a.shape
+    out = torch.empty_like(a)
+    for i in hl.grid(nb):
+        for tk in hl.tile(kk):
+            out[i, :, tk] = a[i, :, tk]
+    return out
+
+copy_slices(torch.randn(2, 64, 128).to(torch.bfloat16))
+```
+
+```
+RuntimeError: MLIR inlining failed: Failure while executing pass pipeline:
+error: unknown: expected 3 offset values, got 2
+ note: see current operation: "tensor.parallel_insert_slice"(%8, %arg2, %arg1, %3)
+   <{operandSegmentSizes = array<i32: 1, 1, 2, 0, 0>,
+     static_offsets = array<i64: -9223372036854775808, -9223372036854775808>,
+     static_sizes = array<i64: 1, 128>,
+     static_strides = array<i64: 1, 1>}>
+   : (tensor<1x128xbf16>, tensor<2x64x128xbf16>, index, index) -> ()
+```
+
+The destination is rank 3 but the insert carries only 2 offsets/sizes/strides.
+The scalar-index dimension is dropped from the slice metadata instead of being
+kept as an offset with size 1, so the rank-reduced tile is never expanded back
+to the destination rank.
+
+```python
+# repro_a2.py -- same shape, through a contraction; aborts instead of erroring
+from __future__ import annotations
+import torch, helion, helion.language as hl
+import helion_mlir_backend  # noqa: F401
+
+@helion.kernel(static_shapes=True, backend="mlir",
+               config=helion.Config(block_sizes=[32]))
+def batched_mm(a, b):
+    nb, m, kk = a.shape
+    n = b.shape[2]
+    out = torch.empty((nb, m, n), dtype=torch.float32, device=a.device)
+    for i in hl.grid(nb):
+        acc = hl.zeros([m, n], dtype=torch.float32)
+        for tk in hl.tile(kk):
+            acc = torch.addmm(acc, a[i, :, tk], b[i, tk, :])
+        out[i, :, :] = acc
+    return out
+
+batched_mm(torch.randn(2, 64, 128).to(torch.bfloat16),
+           torch.randn(2, 128, 64).to(torch.bfloat16))
+```
+
+```
+mlir/lib/Dialect/MemRef/IR/MemRefOps.cpp:3083:
+SubViewOp::inferResultType: Assertion `staticSizes.size() == rank &&
+"staticSizes length mismatch"' failed.
+```
+
+Replacing `hl.grid` with `ti.begin` from an outer `hl.tile(..., block_size=1)`
+reproduces both.
+
+Variants that use a
+4D packed layout instead fail earlier:
+
+- `a[i, tk, :, :]` (grid index + tile index on a rank-4 tensor) →
+  `ArrayRef<AffineExpr>::operator[]: Assertion 'Index < Length'` abort.
+- `a[i, tk.begin, :, :]` → builds, but the K loop is **silently dropped**: the
+  emitted IR contains a single `extract_slice` at offset 0 and no `scf.for`, so
+  the kernel would compute only the first K block.
+- `for kb in hl.grid(nbk)` nested inside `for i, j in hl.grid(...)` →
+  `ValueNotFoundError: Value not found for node: u5`. Nested grid loops resolve
+  the outer indices but not the inner one.
+
+### B. Transposed RHS is numerically wrong
+
+```python
+acc = torch.addmm(acc, x[tm, tk], yt[tn, tk].permute(1, 0))
+```
+
+now compiles, but the result is NaN in 96.6% of elements. Since the transpose
+is folded into `linalg.contract` indexing maps, the maps are likely permuted on
+the wrong operand or the accumulator map is not updated to match.
+
+### C. bf16 epilogue still cannot be compiled
+
+```python
+out = torch.empty((m, n), dtype=torch.bfloat16, ...)
+out[tile_m, tile_n] = acc.to(torch.bfloat16)
+```
+
+The stale-helper-shape error is gone, but the kernel now fails at JIT with
+`LLVM Translation failed for operation: omp.wsloop` / `omp.parallel`. Reproduced
+with `[64, 4096, 32]` and `[128, 1024, 32]`.
+
+### D. Block packing is expressible but not usable
+
+Exactly one packing shape compiles: a whole-panel copy indexed by an `hl.grid`
+scalar (`helion_block_pack.py`).
+
+```python
+for j in hl.grid(panels):
+    out[j, :, :] = source[:, j, :]
+```
+
+Tiling inside the grid body (`for j in hl.grid(...): for tk in hl.tile(...)`)
+aborts with case A, and tiling all three dimensions of the 3D view
+(`for tj, tk, tn in hl.tile([...])`) also aborts, so parallelism can only come
+from the panel count and the per-panel copy cannot be blocked or vectorized by
+the author.
+
+The result is far too slow to be worth using: ~10 GB/s at 512x512 with 8
+threads, and at 4096x4096 a single pack does not complete in a reasonable time
+at all — versus the ~1-2 ms a 64 MB read+write repack should take. Packing that
+costs more than the matmul defeats the purpose, so the packing path is a dead
+end until case A is fixed and the copy can be tiled.
+
+### Revised priorities1. **Fix A** — scalar block index plus a tiled reduction. Without it, `hl.grid`
+   and `tile.begin` cannot be used for anything except a batched matmul with the
+   whole `K` in one contraction, which blocker 3 then rejects. Blockers 1 and 2
+   are therefore only nominally resolved: no blocked matmul can be written.
+2. **Blocker 3** — deeper reduction cache tiles. Unchanged, and it is what caps
+   the current kernel at ~4% of AMX peak (accumulator round-trips to cache every
+   32 elements of `K`).
+3. **Fix B** — the transposed-RHS miscompile is a correctness bug and should
+   probably be disabled until fixed.
+4. **Fix C** — bf16 epilogue.
+5. Nested `hl.grid` index resolution.
