@@ -68,15 +68,6 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         rank = int(store_context.get("rank", ndim))
         if 0 <= inner_dimension < rank:
             forced[inner_dimension] = inner_block_id
-            outer_candidates = [
-                block_id
-                for block_id in ctx.block_id_to_iv
-                if block_id != inner_block_id
-            ]
-            if len(outer_candidates) == 1:
-                for dimension in range(rank):
-                    if dimension != inner_dimension:
-                        forced[dimension] = outer_candidates[0]
 
     result_value = node.meta.get("val")
     result_sizes: list[int] | None = None
@@ -103,10 +94,6 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         if isinstance(index_node, slice):
             offsets.append(ctx.index_const(0))
             extent = int(tensor_type.shape[dimension])
-            if result_sizes is not None:
-                result_index = dimension - sum(1 for d in scalar_dims if d < dimension)
-                if result_index < len(result_sizes):
-                    extent = min(extent, int(result_sizes[result_index]))
             sizes.append(extent)
             continue
 
@@ -170,14 +157,7 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             upper_bound = ctx.block_id_to_upper_bound.get(block_id)
             if upper_bound is not None and upper_bound > 0:
                 configured = min(configured, upper_bound)
-            if (
-                not is_forced
-                and result_sizes is not None
-                and result_index < len(result_sizes)
-            ):
-                sizes.append(min(configured, result_sizes[result_index], extent))
-            else:
-                sizes.append(min(configured, extent))
+            sizes.append(min(configured, extent))
         elif index_extent is not None:
             sizes.append(min(index_extent, extent))
         elif result_sizes is not None and result_index < len(result_sizes):
@@ -186,25 +166,12 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             sizes.append(extent)
 
     if scalar_dims:
-        expanded_sizes: list[int] = [1] * ndim
-        result_index = 0
-        for dimension in range(ndim):
-            if dimension in scalar_dims:
-                expanded_sizes[dimension] = 1
-            elif result_index < len(sizes):
-                expanded_sizes[dimension] = sizes[result_index]
-                result_index += 1
-            else:
-                expanded_sizes[dimension] = int(tensor_type.shape[dimension])
-        sizes = expanded_sizes
-        if result_sizes is not None and len(result_sizes) < ndim:
-            sizes = [1] * (ndim - len(result_sizes)) + result_sizes
+        sizes = sizes[:ndim]
+        sizes.extend(int(tensor_type.shape[d]) for d in range(len(sizes), ndim))
 
     result_shape = [
         extent for dimension, extent in enumerate(sizes) if dimension not in scalar_dims
     ]
-    if result_sizes is not None and len(result_sizes) < ndim:
-        result_shape = result_sizes
     if not result_shape:
         result_shape = [1]
     result_type = ir.RankedTensorType.get(result_shape, tensor_type.element_type)

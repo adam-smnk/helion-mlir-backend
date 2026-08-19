@@ -37,23 +37,33 @@ from torch import Tensor
 import helion_mlir_backend  # noqa: F401
 
 
-@helion.kernel(static_shapes=True, backend="mlir")
+@helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[1, 32, 32]),
+)
 def pack_b_panels(b3: Tensor) -> Tensor:
     """``[K, N/BN, BN]`` -> ``[N/BN, K, BN]``, one contiguous panel per column block."""
     k, nbn, bn = b3.shape
     out = torch.empty((nbn, k, bn), dtype=b3.dtype, device=b3.device)
     for j in hl.grid(nbn):
-        out[j, :, :] = b3[:, j, :]
+        for tk in hl.tile(k):
+            out[j, tk, :] = b3[tk, j, :]
     return out
 
 
-@helion.kernel(static_shapes=True, backend="mlir")
+@helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[1, 32, 32]),
+)
 def pack_a_panels(a3: Tensor) -> Tensor:
     """``[M, K/BK, BK]`` -> ``[K/BK, M, BK]``, one contiguous panel per K block."""
     m, nbk, bk = a3.shape
     out = torch.empty((nbk, m, bk), dtype=a3.dtype, device=a3.device)
     for kb in hl.grid(nbk):
-        out[kb, :, :] = a3[:, kb, :]
+        for tm in hl.tile(m):
+            out[kb, tm, :] = a3[tm, kb, :]
     return out
 
 
