@@ -1,4 +1,4 @@
-"""Block-packing kernels for the Helion MLIR backend.
+"""Experimental block-packing kernels for the Helion MLIR backend.
 
 Repacks the operands of an ``[M, K] x [K, N]`` matmul into panel-major layouts
 so that each cache tile the matmul consumes is contiguous:
@@ -12,16 +12,15 @@ so that each cache tile the matmul consumes is contiguous:
 The ``A`` side is only needed for a fully blocked layout; ``a.view(M/BM, BM, K)``
 is already free and block-row contiguous.
 
-These are written against the only packing shape the backend currently accepts:
-a whole-panel copy indexed by an ``hl.grid`` scalar. Tiling inside the grid body
-(``for j in hl.grid(nbn): for tk in hl.tile(k): ...``) aborts in MLIR, see
-docs/MLIR_KERNEL_AUTHORING_GAPS.md, so parallelism comes from the panel count
-alone -- keep ``BN``/``BK`` small enough that there are at least as many panels
-as threads.
+These are written against the only packing shape that currently compiles: a
+whole-panel copy indexed by an ``hl.grid`` scalar. Multi-level tiled variants
+still fail in the backend, and this whole-panel variant currently fails the
+correctness check. This file is therefore a small reproducer/smoke benchmark,
+not a production packing path.
 
-The packed operands cannot be consumed by a matmul kernel yet: that needs a
-scalar block index combined with a tiled ``K`` reduction, which currently
-crashes. Once that is fixed these kernels drop straight into the matmul.
+The packed operands are not used by helion_matmul_bf16.py: the tiled packing
+forms needed for a fast pack still crash, and whole-K matmul currently hits the
+deeper AMX reduction-cache-tile issue.
 """
 
 from __future__ import annotations
@@ -74,12 +73,12 @@ def pack_a(a: Tensor, block_k: int) -> Tensor:
     return pack_a_panels(a.view(m, k // block_k, block_k).contiguous())
 
 
-def _benchmark(name: str, operation: object, iters: int = 20) -> float:
+def _benchmark(name: str, operation: object, iters: int = 3) -> float:
     """Return the median per-call time in milliseconds."""
-    for _ in range(5):
+    for _ in range(1):
         operation()
     timings_ms = []
-    for _ in range(7):
+    for _ in range(3):
         start = time.perf_counter()
         for _ in range(iters):
             operation()
@@ -93,9 +92,9 @@ def main() -> None:
     if os.environ.get("HELION_MLIR_PIPELINE") != "1":
         raise RuntimeError("Set HELION_MLIR_PIPELINE=1 to use the vectorizing pipeline")
 
-    size = int(os.environ.get("HELION_PACK_SIZE", "4096"))
-    block_n = int(os.environ.get("HELION_PACK_BLOCK_N", "64"))
-    block_k = int(os.environ.get("HELION_PACK_BLOCK_K", "64"))
+    size = int(os.environ.get("HELION_PACK_SIZE", "512"))
+    block_n = int(os.environ.get("HELION_PACK_BLOCK_N", "32"))
+    block_k = int(os.environ.get("HELION_PACK_BLOCK_K", "32"))
     threads = int(os.environ.get("OMP_NUM_THREADS", "64"))
     torch.set_num_threads(threads)
     torch.manual_seed(0)
