@@ -188,7 +188,16 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         if isinstance(index_nodes, (list, tuple)) and target_rank_matches:
             if target_val is not None:
                 assert target_type is not None
-                full_shape = list(target_type.shape)
+                full_shape = [1] * len(index_nodes)
+                for dim, idx_node in enumerate(index_nodes):
+                    if dim < len(target_type.shape) and not ctx.is_scalar_index_node(
+                        idx_node
+                    ):
+                        full_shape[dim] = int(target_type.shape[dim])
+                    elif ctx.is_scalar_index_node(idx_node):
+                        full_shape[dim] = 1
+                    elif dim < len(target_type.shape):
+                        full_shape[dim] = int(target_type.shape[dim])
                 elem_ty = target_type.element_type
             else:
                 if isinstance(value_meta, torch.Tensor):
@@ -197,7 +206,12 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                 else:
                     value_shape = [1 for _ in index_nodes]
                     elem_ty = torch_dtype_to_mlir(torch.float32)
-                full_shape = list(value_shape)
+                full_shape = [1] * len(index_nodes)
+                for dim in range(len(index_nodes)):
+                    if dim < len(value_shape):
+                        full_shape[dim] = value_shape[dim]
+                    else:
+                        full_shape[dim] = 1
             rank = len(full_shape)
             sym_to_block_id = ctx.build_sym_to_block_id()
             dim_block_ids: list[int | None] = []
@@ -206,6 +220,10 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                 if dim >= rank:
                     break
                 dim_bid = ctx.infer_block_id_from_index(idx_node, sym_to_block_id)
+                if dim_bid is None and ctx.is_scalar_index_node(idx_node):
+                    info = ctx.node_symbol_info(idx_node)
+                    if info is not None:
+                        dim_bid = info[0]
                 dim_block_ids.append(dim_bid)
                 if dim_bid == block_id:
                     inner_dim = dim
@@ -219,6 +237,11 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                 outer_bids = [bid for bid in active_outer_block_ids if bid != block_id]
                 fallback_outer_bid = outer_bids[0] if outer_bids else None
                 for dim, dim_size in enumerate(full_shape):
+                    idx_node = index_nodes[dim] if dim < len(index_nodes) else None
+                    if idx_node is not None and ctx.is_scalar_index_node(idx_node):
+                        tile_shape.append(1)
+                        flush_offsets.append(ctx.index_const(0))
+                        continue
                     dim_bid = dim_block_ids[dim]
                     if dim == inner_dim or dim_bid == block_id:
                         tile_shape.append(ub_static if ub_static is not None else step)

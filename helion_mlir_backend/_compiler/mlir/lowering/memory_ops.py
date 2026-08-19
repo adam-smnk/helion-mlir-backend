@@ -67,19 +67,28 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
             and block_id in ctx.block_id_to_iv
         ):
             source_type = ir.RankedTensorType(value.type)
+            source_rank = len(source_type.shape)
+            scalar_offsets = [
+                ctx.block_id_to_iv[block_id]
+                if dimension == inner_dim
+                else ctx.index_const(0)
+                for dimension in range(rank)
+            ]
+            static_sizes = list(source_type.shape)
+            if source_rank < rank:
+                static_sizes = [1] * (rank - source_rank) + static_sizes
+            if len(static_sizes) < rank:
+                static_sizes = static_sizes + [1] * (rank - len(static_sizes))
+            elif len(static_sizes) > rank:
+                static_sizes = static_sizes[:rank]
             updated = tensor_d.InsertSliceOp(
                 value,
                 current,
-                [
-                    ctx.block_id_to_iv[block_id]
-                    if dimension == inner_dim
-                    else ctx.index_const(0)
-                    for dimension in range(rank)
-                ],
+                scalar_offsets,
                 [],
                 [],
                 static_offsets=[ir.ShapedType.get_dynamic_size()] * rank,
-                static_sizes=list(source_type.shape),
+                static_sizes=static_sizes,
                 static_strides=[1] * rank,
             ).result
             context["current"] = updated
@@ -90,6 +99,15 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     static_sizes: list[int] = []
     value_shape = list(ir.RankedTensorType(value.type).shape)
     value_dim = 0
+    target_rank = len(index_nodes)
+    if target_value is not None:
+        target_rank = max(
+            len(index_nodes), len(ir.RankedTensorType(target_value.type).shape)
+        )
+    else:
+        target_shape = ctx.shape_from_node_meta(node.args[0])
+        if target_shape is not None:
+            target_rank = max(target_rank, len(target_shape))
     for index_node in index_nodes:
         if ctx.is_scalar_index_node(index_node):
             scalar_offset = ctx.get_value(index_node)
@@ -101,6 +119,15 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
             static_sizes.append(1)
             continue
 
+        if isinstance(index_node, slice):
+            offsets.append(ctx.index_const(0))
+            if value_dim < len(value_shape):
+                static_sizes.append(value_shape[value_dim])
+                value_dim += 1
+            else:
+                static_sizes.append(1)
+            continue
+
         if value_dim >= len(value_shape):
             break
         block_id = ctx.infer_block_id_from_index(index_node, sym_to_block_id)
@@ -110,5 +137,19 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
             offsets.append(ctx.index_const(0))
         static_sizes.append(value_shape[value_dim])
         value_dim += 1
+
+    if len(offsets) < target_rank:
+        offsets.extend(ctx.index_const(0) for _ in range(target_rank - len(offsets)))
+        static_sizes.extend([1] * (target_rank - len(static_sizes)))
+    elif len(offsets) > target_rank:
+        offsets = offsets[:target_rank]
+        static_sizes = static_sizes[:target_rank]
+
+    if (
+        target_rank > len(value_shape)
+        and len(value_shape) + (target_rank - len(value_shape)) == target_rank
+    ):
+        reduction = target_rank - len(value_shape)
+        static_sizes = [1] * reduction + value_shape
 
     ctx.forall_insert_slices.append((value, offsets, static_sizes))

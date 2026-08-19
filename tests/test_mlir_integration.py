@@ -266,6 +266,97 @@ class TestScalarBlockIndices:
         # The store expands back to the full rank.
         assert "tensor<32x32xf32> into tensor<4x32x32xf32>" in ir_str
 
+    def test_scalar_grid_tile_slice_preserves_rank_metadata(self):
+        """Scalar grid indices with a tiled slice must keep explicit size-1 offsets."""
+
+        @helion.kernel(static_shapes=True)
+        def copy_slices(a: torch.Tensor) -> torch.Tensor:
+            nb, m, kk = a.shape
+            out = torch.empty_like(a)
+            for i in hl.grid(nb):
+                for tk in hl.tile(kk):
+                    out[i, :, tk] = a[i, :, tk]
+            return out
+
+        a = torch.randn(2, 64, 128, dtype=torch.float32)
+        module = generate_mlir(copy_slices, [a], config=helion.Config(block_sizes=[32]))
+        module.operation.verify()
+        ir_str = str(module)
+
+        assert "tensor.extract_slice" in ir_str
+        assert "tensor.parallel_insert_slice" in ir_str
+        assert "1x" in ir_str or "tensor<1" in ir_str
+
+    def test_nested_grid_indices_lower_each_dimension(self):
+        """Nested grid indices select the corresponding two outer dimensions."""
+
+        @helion.kernel(static_shapes=True)
+        def nested_grid_copy(a: torch.Tensor) -> torch.Tensor:
+            nb, nc, m = a.shape
+            out = torch.zeros_like(a)
+            for i in hl.grid(nb):
+                for j in hl.grid(nc):
+                    out[i, j, :] = a[i, j, :]
+            return out
+
+        module = generate_mlir(
+            nested_grid_copy,
+            [torch.randn(2, 3, 8)],
+            config=helion.Config(block_sizes=[4, 4, 8]),
+        )
+        module.operation.verify()
+        ir_str = str(module)
+
+        assert "scf.forall" in ir_str
+        assert "tensor.extract_slice" in ir_str
+        assert "tensor.parallel_insert_slice" in ir_str
+
+    def test_grid_index_with_tiled_reduction_lowers(self):
+        """A scalar grid index remains valid through a tiled K reduction."""
+
+        @helion.kernel(static_shapes=True)
+        def grid_tiled_k(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            nb, m, k = a.shape
+            out = torch.zeros((nb, m, b.shape[2]), dtype=torch.float32, device=a.device)
+            for i in hl.grid(nb):
+                acc = hl.zeros([m, b.shape[2]], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    acc = torch.addmm(acc, a[i, :, tk], b[i, tk, :])
+                out[i, :, :] = acc
+            return out
+
+        module = generate_mlir(
+            grid_tiled_k,
+            [torch.randn(2, 8, 16), torch.randn(2, 16, 8)],
+            config=helion.Config(block_sizes=[4, 4, 8]),
+        )
+        module.operation.verify()
+        ir_str = str(module)
+
+        assert "scf.forall" in ir_str
+        assert "scf.for" in ir_str
+        assert "linalg.matmul" in ir_str
+
+    def test_static_view_and_reshape_change_shape(self):
+        """Static shape-changing view and reshape lower through tensor.reshape."""
+
+        @helion.kernel(static_shapes=True)
+        def reshape_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros((16, 8), dtype=x.dtype, device=x.device)
+            reshaped = x.view(16, 8)
+            for _ in hl.tile(16):
+                out[:, :] = reshaped
+            return out
+
+        module = generate_mlir(
+            reshape_kernel,
+            [torch.randn(8, 16)],
+            config=helion.Config(block_sizes=[8, 16]),
+        )
+        module.operation.verify()
+        ir_str = str(module)
+        assert "tensor<16x8xf32>" in ir_str
+
     def test_tile_begin_uses_induction_variable(self):
         """`tile.begin` lowers to the enclosing loop induction variable."""
 

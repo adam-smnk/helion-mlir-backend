@@ -78,17 +78,13 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                     if dimension != inner_dimension:
                         forced[dimension] = outer_candidates[0]
 
-    from ..aten_lowering import _resolve_dims
-
     result_value = node.meta.get("val")
     result_sizes: list[int] | None = None
     if isinstance(result_value, torch.Tensor):
-        result_sizes = _resolve_dims(
-            result_value.shape,
-            ctx.block_id_to_size,
-            ctx.block_hint_to_id,
-            ctx.block_symint_to_id,
-        )
+        result_sizes = [int(dim) for dim in result_value.shape]
+        if len(result_sizes) < ndim:
+            scalar_count = ndim - len(result_sizes)
+            scalar_dims = set(sorted(scalar_dims)[:scalar_count])
 
     for dimension, index_node in enumerate(index_nodes):
         if dimension >= ndim:
@@ -102,6 +98,16 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                 else ctx.index_const(0)
             )
             sizes.append(1)
+            continue
+
+        if isinstance(index_node, slice):
+            offsets.append(ctx.index_const(0))
+            extent = int(tensor_type.shape[dimension])
+            if result_sizes is not None:
+                result_index = dimension - sum(1 for d in scalar_dims if d < dimension)
+                if result_index < len(result_sizes):
+                    extent = min(extent, int(result_sizes[result_index]))
+            sizes.append(extent)
             continue
 
         # Result metadata omits scalar-indexed dimensions, so realign the index.
@@ -179,9 +185,28 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         else:
             sizes.append(extent)
 
+    if scalar_dims:
+        expanded_sizes: list[int] = [1] * ndim
+        result_index = 0
+        for dimension in range(ndim):
+            if dimension in scalar_dims:
+                expanded_sizes[dimension] = 1
+            elif result_index < len(sizes):
+                expanded_sizes[dimension] = sizes[result_index]
+                result_index += 1
+            else:
+                expanded_sizes[dimension] = int(tensor_type.shape[dimension])
+        sizes = expanded_sizes
+        if result_sizes is not None and len(result_sizes) < ndim:
+            sizes = [1] * (ndim - len(result_sizes)) + result_sizes
+
     result_shape = [
-        size for dimension, size in enumerate(sizes) if dimension not in scalar_dims
+        extent for dimension, extent in enumerate(sizes) if dimension not in scalar_dims
     ]
+    if result_sizes is not None and len(result_sizes) < ndim:
+        result_shape = result_sizes
+    if not result_shape:
+        result_shape = [1]
     result_type = ir.RankedTensorType.get(result_shape, tensor_type.element_type)
     return tensor_d.ExtractSliceOp(
         result_type,
