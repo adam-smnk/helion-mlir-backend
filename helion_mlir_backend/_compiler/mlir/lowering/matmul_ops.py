@@ -142,12 +142,30 @@ def _emit_contract(
 def resolve_contraction_operand(
     ctx: BuildContext, argument: object
 ) -> tuple[ir.Value | None, bool]:
-    """Resolve a contraction operand, folding an innermost transpose into it."""
+    """Resolve a contraction operand, lowering any pending subscript views first."""
+    from .subscript_ops import lower_subscript
     from .transpose_ops import is_transpose_node
     from .transpose_ops import swaps_last_two_dims
 
     if not isinstance(argument, torch.fx.Node):
         return None, False
+
+    value = ctx.get_value(argument)
+    if value is None and str(getattr(argument.target, "__name__", "")) == "subscript":
+        value = lower_subscript(ctx, argument)
+        if value is not None:
+            ctx.set_value(argument, value)
+
+    if value is None and argument.args:
+        base = argument.args[0]
+        if isinstance(base, torch.fx.Node) and ctx.get_value(base) is None:
+            lowered = (
+                lower_subscript(ctx, base)
+                if str(getattr(base.target, "__name__", "")) == "subscript"
+                else None
+            )
+            if lowered is not None:
+                ctx.set_value(base, lowered)
 
     if is_transpose_node(argument) and swaps_last_two_dims(argument):
         base = argument.args[0] if argument.args else None
@@ -155,7 +173,7 @@ def resolve_contraction_operand(
         if base_value is not None:
             return base_value, True
 
-    return ctx.get_value(argument), False
+    return value, False
 
 
 def lower_matmul(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:

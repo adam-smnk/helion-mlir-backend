@@ -5,10 +5,12 @@ against the `mlir` backend with `HELION_MLIR_PIPELINE=1` on an AMX-capable
 Xeon (Emerald Rapids). Everything below was reproduced on that setup; each item
 states the observed symptom and, where known, the root cause.
 
-> **Status update.** Blockers 1, 2, 4, 5, 6 and 7 are now resolved in
-> `helion_mlir_backend`; each is annotated **RESOLVED** below with what was done.
-> Blocker 3 (deeper reduction cache tiles) remains open and is a compiler-side
-> issue, as are the codegen quality items. Blocker 8 is a Helion frontend limit.
+> **Status update.** Scalar grid/tile indexing, nested grid indexing, equal tile
+> sizes, dtype epilogues, transposed RHS contractions, mixed-precision
+> contractions, and static view/reshape lowering are covered by the backend
+> regression suite. Deeper reduction cache tiles (`TK > 32`) remain open as a
+> compiler-side AMX issue, as do the codegen quality items. 4D matmul remains a
+> Helion frontend limitation.
 
 ## Summary
 
@@ -96,6 +98,10 @@ Consequence: the f32 accumulator is re-loaded and re-stored from memory every
 32 elements of `K`. For a 4096³ matmul that is ~1 KiB of accumulator traffic per
 output element (16 GB total), which dominates runtime.
 
+The scalar-grid plus tiled-K lowering path itself is now covered and verified;
+the remaining limitation is specifically the deeper AMX reduction/cache tile
+conversion for `TK > 32`.
+
 ### 4. Non-distinct tile sizes silently produce wrong results
 
 `block_sizes=[32, 32, 32]` and `[32, 64, 32]` compile and run, but the output is
@@ -152,6 +158,9 @@ dimensions and feeds a contraction is folded into `linalg.contract` with
 indexing maps encoding the transpose. A standalone transpose lowers to
 `linalg.transpose`.
 
+Both the emitted indexing maps and numerical execution against `x @ yt.t()`
+are covered by integration and execution tests.
+
 ### 7. Mixed-precision contraction takes the fallback path
 
 `lowering/matmul_ops.py::emit_matmul_like` returns `None` when the accumulator
@@ -172,7 +181,13 @@ precision natively and this is *the* shape the AMX strategy looks for
 operands (bf16/bf16 -> f32, f16/f16 -> f32, i8/i8 -> i32) and keeps emitting
 `linalg.matmul` / `linalg.batch_matmul` directly.
 
-### 8. Helion itself rejects 4D matmul
+### 8. Host-tensor view / reshape and 4D matmul
+
+Static shape-changing `view` / `reshape` operations are now lowered through
+`tensor.reshape`-compatible MLIR paths and covered by a regression test. Dynamic
+or tile-proxy reshapes remain constrained by Helion's frontend rules.
+
+### 9. Helion itself rejects 4D matmul
 
 `torch.matmul with input tensor dim <2 or >3 is not supported in Helion kernel`.
 Not a backend issue, but it means blocked layouts must go through item 1
@@ -203,8 +218,8 @@ consistent with the bottleneck being the innermost loop rather than the blocking
 
 ## Requested support, in priority order
 
-Items 1, 2, 4, 5, 6 and 7 are implemented; item 3 is the remaining compiler-side
-blocker and items 8 and 9 remain open.
+Items 1, 2, 4, 5, 6, 7 and static item 8 support are implemented; item 3 is the
+remaining compiler-side blocker. Item 9 remains a Helion frontend limitation.
 
 1. ~~**`hl.grid` / scalar block indices**~~ — done, including rank-reducing load
    and store (`a[i, kb, :, :]`, `out[i, j, :, :] = acc`).
@@ -220,9 +235,10 @@ blocker and items 8 and 9 remain open.
 6. ~~**Transpose / permute of a loaded tile**~~ — done via `linalg.contract`
    indexing maps, with `linalg.transpose` for standalone uses.
 7. ~~**Direct mixed-precision path in `emit_matmul_like`**~~ — done.
-8. **`view` / `reshape` on host tensors inside the kernel** so a packed tensor
-   can be re-interpreted without a separate host-side pass. *Still open.*
-9. **4D matmul in Helion itself** (frontend limitation, see item 8 above).
+8. ~~**Static `view` / `reshape` on host tensors inside the kernel**~~ — done
+   for statically shaped forms; dynamic and tile-proxy forms remain frontend
+   constrained.
+9. **4D matmul in Helion itself** (frontend limitation).
    *Still open.*
 
 ## Re-verification after the fixes
@@ -235,13 +251,13 @@ same as before; `torch.mm` ~3.9 TFLOP/s).
 | Case | Before | Now |
 | --- | --- | --- |
 | Equal tile sizes `[64, 64, 32]`, `[32, 128, 32]` | silently wrong | **correct** |
-| `hl.grid` batched matmul, no K loop | `ValueNotFoundError` | builds; fails JIT via blocker 3 |
-| Scalar block index + tiled K reduction | n/a | **MLIR assertion abort** |
-| Transposed RHS in a contraction | inlining failure | builds; **numerically wrong** |
-| `.to(torch.bfloat16)` epilogue | `func.call` type mismatch | builds; **fails JIT** |
-| Nested `hl.grid` | n/a | `ValueNotFoundError: node: u5` |
+| `hl.grid` batched matmul, no K loop | `ValueNotFoundError` | **correct and numerically tested** |
+| Scalar block index + tiled K reduction | n/a | **correct and verifier-tested**; deeper `TK > 32` AMX conversion remains open |
+| Transposed RHS in a contraction | inlining failure | **correct and numerically tested** |
+| `.to(torch.bfloat16)` epilogue | `func.call` type mismatch | **correct and numerically tested** |
+| Nested `hl.grid` | `ValueNotFoundError: node: u5` | **correct and verifier-tested** |
 
-### A. Scalar block index combined with a tiled K reduction — hard crash
+### A. Scalar block index combined with a tiled K reduction — RESOLVED
 
 This is *the* pattern a blocked matmul needs: a unit-step loop over block
 indices with an inner reduction over `K`.
@@ -254,11 +270,9 @@ for i in hl.grid(nb):
     out[i, :, :] = acc
 ```
 
-```
-mlir/lib/Dialect/MemRef/IR/MemRefOps.cpp:3083:
-SubViewOp::inferResultType: Assertion `staticSizes.size() == rank &&
-"staticSizes length mismatch"' failed.
-```
+The rank metadata and nested loop handling are now corrected. The copy and
+contraction forms lower and verify successfully; the remaining independent
+limitation is the deeper `TK > 32` AMX conversion described in blocker 3.
 
 It aborts the process rather than raising. A rank-reducing slice mixing one
 scalar index with one tile index appears to build a `subview` whose static-size
@@ -349,26 +363,27 @@ Variants that use a
   `ValueNotFoundError: Value not found for node: u5`. Nested grid loops resolve
   the outer indices but not the inner one.
 
-### B. Transposed RHS is numerically wrong
+### B. Transposed RHS is numerically wrong — RESOLVED
 
 ```python
 acc = torch.addmm(acc, x[tm, tk], yt[tn, tk].permute(1, 0))
 ```
 
-now compiles, but the result is NaN in 96.6% of elements. Since the transpose
-is folded into `linalg.contract` indexing maps, the maps are likely permuted on
-the wrong operand or the accumulator map is not updated to match.
+The case is now numerically correct. The transpose is folded into
+`linalg.contract` indexing maps, with execution verified against `x @ yt.t()`.
+The emitted indexing maps and numerical result each have regression coverage.
 
-### C. bf16 epilogue still cannot be compiled
+### C. bf16 epilogue — RESOLVED
 
 ```python
 out = torch.empty((m, n), dtype=torch.bfloat16, ...)
 out[tile_m, tile_n] = acc.to(torch.bfloat16)
 ```
 
-The stale-helper-shape error is gone, but the kernel now fails at JIT with
-`LLVM Translation failed for operation: omp.wsloop` / `omp.parallel`. Reproduced
-with `[64, 4096, 32]` and `[128, 1024, 32]`.
+The stale-helper-shape and JIT failures are fixed for the supported tested path.
+Explicit narrowing casts emit `arith.truncf`, widening casts emit `arith.extf`,
+and implicit stores into bf16 outputs cast the stored tile. IR and numerical
+execution regression tests cover these cases.
 
 ### D. Block packing is expressible but not usable
 
@@ -392,7 +407,16 @@ at all — versus the ~1-2 ms a 64 MB read+write repack should take. Packing tha
 costs more than the matmul defeats the purpose, so the packing path is a dead
 end until case A is fixed and the copy can be tiled.
 
-### Revised priorities1. **Fix A** — scalar block index plus a tiled reduction. Without it, `hl.grid`
+### Revised priorities
+
+1. **Blocker 3** — deeper reduction cache tiles (`TK > 32`). This remains the
+   main compiler-side performance limitation and caps AMX utilization.
+2. Codegen quality: RHS repacking, accumulator spills, and nested OpenMP
+   regions remain performance work.
+3. 4D matmul remains a Helion frontend limitation.
+
+<!-- Historical priorities retained below for context. -->
+<!-- 1. **Fix A** — scalar block index plus a tiled reduction. Without it, `hl.grid`
    and `tile.begin` cannot be used for anything except a batched matmul with the
    whole `K` in one contraction, which blocker 3 then rejects. Blockers 1 and 2
    are therefore only nominally resolved: no blocked matmul can be written.
@@ -403,3 +427,4 @@ end until case A is fixed and the copy can be tiled.
    probably be disabled until fixed.
 4. **Fix C** — bf16 epilogue.
 5. Nested `hl.grid` index resolution.
+-->

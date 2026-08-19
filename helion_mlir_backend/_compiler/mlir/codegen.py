@@ -466,16 +466,34 @@ class MLIRModuleBuilder:
         if method in ("view", "reshape"):
             base_shape = self._shape_from_node_meta(base)
             result_shape = self._shape_from_node_meta(node)
-            if (
-                base_shape is not None
-                and result_shape is not None
-                and base_shape == result_shape
-            ):
+            if base_shape is None or result_shape is None:
+                return None
+            if base_shape == result_shape:
                 return base_val
-            raise UnsupportedOperationError(
-                method,
-                reason="Shape-changing call_method view/reshape lowering not implemented yet",
+            if any(dim <= 0 for dim in result_shape):
+                raise UnsupportedOperationError(
+                    method,
+                    reason="Only statically shaped view/reshape operations are supported",
+                )
+            from mlir.dialects import arith as arith_d
+            from mlir.dialects import tensor as tensor_d
+            import mlir.ir as ir
+
+            result_type = ir.RankedTensorType.get(
+                result_shape, ir.RankedTensorType(base_val.type).element_type
             )
+            shape_type = ir.RankedTensorType.get(
+                [len(result_shape)], ir.IntegerType.get_signless(32)
+            )
+            shape_values = [
+                arith_d.ConstantOp(
+                    ir.IntegerType.get_signless(32),
+                    ir.IntegerAttr.get(ir.IntegerType.get_signless(32), dim),
+                ).result
+                for dim in result_shape
+            ]
+            shape = tensor_d.FromElementsOp(shape_type, shape_values).result
+            return tensor_d.ReshapeOp(result_type, base_val, shape).result
 
         if method == "flatten":
             raise UnsupportedOperationError(
@@ -610,7 +628,7 @@ class MLIRModuleBuilder:
         Results are stored in the context's ATen helper map and the helper
         ``func.func`` operations are inserted at the module's top level.
         """
-        from .aten_bridge import is_custom_aten
+        from .aten_bridge import aten_target_matches
         from .aten_lowering import is_aten_op
         from .aten_lowering import preprocess_aten_nodes
 
@@ -628,7 +646,15 @@ class MLIRModuleBuilder:
         for graph_info in self.hf.device_ir.graphs:
             for node in graph_info.graph.nodes:
                 if is_aten_op(node):
-                    if is_custom_aten(node):
+                    if aten_target_matches(
+                        node,
+                        "aten.mm",
+                        "aten.matmul",
+                        "aten.bmm",
+                        "mm.default",
+                        "matmul.default",
+                        "bmm.default",
+                    ):
                         continue
                     if self.context.has_symint_operand(node):
                         continue

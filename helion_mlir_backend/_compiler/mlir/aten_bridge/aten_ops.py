@@ -14,13 +14,18 @@ if TYPE_CHECKING:
 
 _CUSTOM_TARGETS = (
     "aten.addmm",
+    "aten.baddbmm",
     "aten.mm",
     "aten.matmul",
     "aten.bmm",
-    "aten.baddbmm",
+    "mm.default",
+    "matmul.default",
+    "bmm.default",
     "aten.permute",
     "aten.transpose",
     "aten.t.default",
+    "aten.view",
+    "aten.reshape",
     "aten._to_copy",
     "aten.to.",
     "convert_element_type",
@@ -28,10 +33,34 @@ _CUSTOM_TARGETS = (
 
 
 def aten_target_matches(node: torch.fx.Node, *names: str) -> bool:
-    """Match ATen targets by canonical name or FX overload short name."""
-    target_name = str(node.target)
-    overload_name = getattr(node.target, "__name__", "")
-    return any(name in target_name or overload_name == name for name in names)
+    """Match ATen targets by canonical name or equivalent runtime FX alias."""
+    target_name = str(node.target).lower()
+    overload_name = str(getattr(node.target, "__name__", "")).lower()
+    target_variants = {
+        target_name,
+        overload_name,
+        target_name.replace("aten.", ""),
+        target_name.replace("torch.", ""),
+        target_name.replace(".default", ""),
+        overload_name.replace(".default", ""),
+    }
+    for name in names:
+        normalized = name.lower()
+        if normalized in target_variants:
+            return True
+        if normalized.replace("aten.", "") in target_variants:
+            return True
+        if normalized.replace(".default", "") in target_variants:
+            return True
+        if normalized.replace("aten.", "").replace(".default", "") in {
+            s.replace(".default", "") for s in target_variants
+        }:
+            return True
+        base = normalized.replace("aten.", "").replace(".default", "")
+        for variant in target_variants:
+            if base in variant:
+                return True
+    return False
 
 
 def is_custom_aten(node: torch.fx.Node) -> bool:
@@ -41,6 +70,17 @@ def is_custom_aten(node: torch.fx.Node) -> bool:
 
 def lower_custom_aten(builder: object, node: torch.fx.Node) -> ir.Value | None:
     """Try the registered custom ATen lowerers in precedence order."""
+    if aten_target_matches(
+        node,
+        "aten.view",
+        "aten.reshape",
+        "view.default",
+        "reshape.default",
+    ):
+        lowered = lower_static_reshape(builder.context, node)
+        if lowered is not None:
+            return lowered
+
     if aten_target_matches(node, "aten.addmm", "addmm.default"):
         lowered = lower_addmm(builder.context, node)
         if lowered is not None:
@@ -70,8 +110,11 @@ def lower_custom_aten(builder: object, node: torch.fx.Node) -> ir.Value | None:
         "aten.mm",
         "aten.matmul",
         "aten.bmm",
+        "mm",
         "mm.default",
+        "matmul",
         "matmul.default",
+        "bmm",
         "bmm.default",
     ):
         lowered = builder._lower_aten_matmul(node)
@@ -100,6 +143,44 @@ def lower_custom_aten(builder: object, node: torch.fx.Node) -> ir.Value | None:
         return lowered
 
     return None
+
+
+def lower_static_reshape(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """Lower statically shaped ATen view/reshape without a helper function."""
+    from mlir.dialects import arith as arith_d
+    from mlir.dialects import tensor as tensor_d
+    import mlir.ir as ir
+
+    from ..aten_lowering import normalized_aten_args
+
+    args = list(normalized_aten_args(node))
+    if not args or not isinstance(args[0], torch.fx.Node):
+        return None
+    source = ctx.get_value(args[0])
+    result_shape = ctx.shape_from_node_meta(node)
+    if source is None or result_shape is None or not result_shape:
+        return None
+    if any(dim <= 0 for dim in result_shape):
+        return None
+    source_type = ir.RankedTensorType(source.type)
+    if _shape_product(source_type.shape) != _shape_product(result_shape):
+        return None
+    result_type = ir.RankedTensorType.get(result_shape, source_type.element_type)
+    i32 = ir.IntegerType.get_signless(32)
+    shape_type = ir.RankedTensorType.get([len(result_shape)], i32)
+    shape_values = [
+        arith_d.ConstantOp(i32, ir.IntegerAttr.get(i32, dim)).result
+        for dim in result_shape
+    ]
+    shape = tensor_d.FromElementsOp(shape_type, shape_values).result
+    return tensor_d.ReshapeOp(result_type, source, shape).result
+
+
+def _shape_product(shape: object) -> int:
+    product = 1
+    for dim in shape:
+        product *= int(dim)
+    return product
 
 
 def lower_passthrough(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch.fx
+
 if TYPE_CHECKING:
     import mlir.ir as ir
-    import torch.fx
 
     from ..build_context import BuildContext
 
@@ -83,6 +84,61 @@ def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
             ).result
             tensor_d.YieldOp(gathered)
         return generate.result
+
+    scalar_index_dims: list[int] = []
+    for dimension, spec in enumerate(index_candidates[: source_type.rank]):
+        if isinstance(spec, torch.fx.Node) and ctx.is_scalar_index_node(spec):
+            scalar_index_dims.append(dimension)
+
+    if scalar_index_dims:
+        offsets: list[ir.Value] = []
+        sizes: list[int] = []
+        for dimension in range(source_type.rank):
+            spec = (
+                index_candidates[dimension]
+                if dimension < len(index_candidates)
+                else slice(None)
+            )
+            if spec is None:
+                offsets.append(ctx.index_const(0))
+                sizes.append(int(source_type.shape[dimension]))
+                continue
+            if (
+                isinstance(spec, slice)
+                and spec.start is None
+                and spec.stop is None
+                and spec.step is None
+            ):
+                offsets.append(ctx.index_const(0))
+                sizes.append(int(source_type.shape[dimension]))
+                continue
+            if isinstance(spec, torch.fx.Node) and ctx.is_scalar_index_node(spec):
+                scalar_offset = ctx.get_value(spec)
+                offsets.append(
+                    ctx.cast_to_index(scalar_offset)
+                    if scalar_offset is not None
+                    else ctx.index_const(0)
+                )
+                sizes.append(1)
+                continue
+            return None
+
+        result_shape = [
+            extent
+            for dimension, extent in enumerate(sizes)
+            if dimension not in scalar_index_dims
+        ]
+        result_type = ir.RankedTensorType.get(result_shape, element_type)
+        return tensor_d.ExtractSliceOp(
+            result_type,
+            source_value,
+            offsets,
+            [],
+            [],
+            static_offsets=[ir.ShapedType.get_dynamic_size()] * len(offsets),
+            static_sizes=sizes,
+            static_strides=[1] * len(offsets),
+        ).result
 
     if any(isinstance(spec, (int, float)) for spec in index_candidates):
         return None
