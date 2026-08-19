@@ -113,7 +113,7 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         block_id, index_bias = ctx.infer_index_block_and_bias(
             index_node, sym_to_block_id
         )
-        if is_forced:
+        if is_forced and block_id is None:
             block_id = forced[dimension]
             index_bias = 0
         allow_fallback = isinstance(index_node, torch.fx.Node)

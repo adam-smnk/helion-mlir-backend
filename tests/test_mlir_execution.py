@@ -374,6 +374,25 @@ class TestExecuteMlir:
             b.view(64, 2, 32).permute(1, 0, 2).contiguous(),
         )
 
+    @pytest.mark.parametrize("size", [64, 128])
+    def test_packed_rhs_matmul_execute_mlir(self, size):
+        """A packed RHS remains numerically correct through tiled matmul consumption."""
+        from helion_block_packed_f32_repro import matmul_packed_b_f32
+        from helion_block_packed_f32_repro import pack_b_panels_f32
+        from helion_block_packed_f32_repro import unpack_panel_major
+
+        torch.manual_seed(43)
+        block_n = 32
+        a = torch.randn(size, size)
+        b = torch.randn(size, size)
+        b3 = b.view(size, size // block_n, block_n).contiguous()
+
+        packed_b = pack_b_panels_f32(b3)
+        panel_result = matmul_packed_b_f32(a, packed_b)
+        actual = unpack_panel_major(panel_result)
+
+        assert _allclose(actual, torch.mm(a, b))
+
     def test_nested_grid_copy_execute_mlir(self):
         """Nested unit-step grid indices preserve both outer dimensions."""
 

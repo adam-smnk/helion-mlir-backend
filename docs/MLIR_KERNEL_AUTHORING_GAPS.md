@@ -367,7 +367,8 @@ With `OMP_NUM_THREADS=4`, the 4096x4096 pack also completes under `timeout 30`:
 `pack B` is ~2.38 ms and `pack A` is ~2.48 ms, around 27-28 GB/s per operand on
 the shared node.
 
-Consuming the packed RHS in a matmul remains incorrect. The formulation
+Consuming the packed RHS in a matmul is now numerically correct for exact K-tile
+boundaries. The formulation
 
 ```python
 for j in hl.grid(nbn):
@@ -378,9 +379,16 @@ for j in hl.grid(nbn):
       out[j, tile_m, :] = acc
 ```
 
-miscomputes at 512x512 with ~96% mismatched elements for `bn` in `{32, 64,
-128}`. So packing itself is now useful as a standalone operation, but the
-packed-layout matmul consumer still needs backend work.
+is covered by the f32 reproducer and execution regression tests. The fix keeps
+explicit source tile symbols authoritative when lowering loads inside a
+synthetic accumulator store context; previously the A slice used the outer
+panel IV for both dimensions, effectively loading `A[panel, panel]` instead of
+`A[tile_k, tile_m]`.
+
+Ragged K tails in a tiled contraction remain open: with `K=96` and `TK=64`,
+the final iteration currently still emits a fixed 64-wide contraction instead
+of a 32-wide tail. The packed-RHS regression therefore covers exact K-tile
+sizes, while existing copy tests cover ragged slice metadata separately.
 
 The no-explicit-K-loop matmul variant was also retried:
 
