@@ -363,6 +363,24 @@ Those variants remain unsupported, but the two-level panel/tile kernels used by
 `helion_block_pack.py` are now functional. With `OMP_NUM_THREADS=1`,
 `HELION_MLIR_PIPELINE=1`, and the MLIR Python bindings configured, the default
 512x512 benchmark completes under 30 seconds and passes its numerical checks.
+With `OMP_NUM_THREADS=4`, the 4096x4096 pack also completes under `timeout 30`:
+`pack B` is ~2.38 ms and `pack A` is ~2.48 ms, around 27-28 GB/s per operand on
+the shared node.
+
+Consuming the packed RHS in a matmul remains incorrect. The formulation
+
+```python
+for j in hl.grid(nbn):
+   for tile_m in hl.tile(m):
+      acc = hl.zeros([tile_m, bn], dtype=torch.float32)
+      for tile_k in hl.tile(k):
+         acc = torch.addmm(acc, x[tile_m, tile_k], packed_b[j, tile_k, :])
+      out[j, tile_m, :] = acc
+```
+
+miscomputes at 512x512 with ~96% mismatched elements for `bn` in `{32, 64,
+128}`. So packing itself is now useful as a standalone operation, but the
+packed-layout matmul consumer still needs backend work.
 
 The no-explicit-K-loop matmul variant was also retried:
 
