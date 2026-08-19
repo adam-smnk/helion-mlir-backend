@@ -99,11 +99,11 @@ Consequence: the f32 accumulator is re-loaded and re-stored from memory every
 output element (16 GB total), which dominates runtime.
 
 The scalar-grid plus tiled-K lowering path itself is covered for the full-slice
-contraction form. A scalar grid dimension combined with a trailing tiled slice
-still produces malformed static sizes in some nested forms (for example, an
-`8`-element axis becoming a `64`-element slice) and can abort during
-bufferization. That rank/extent propagation issue remains separate from the
-deeper AMX reduction/cache tile conversion for `TK > 32`.
+contraction form. Source-rank static sizes for scalar-plus-tiled slices are now
+correctly emitted and are covered by IR regression tests. Native execution of
+some scalar-grid plus tiled-slice forms still has a separate runtime/bufferization
+failure and remains open, independently of the deeper AMX reduction/cache tile
+conversion for `TK > 32`.
 
 ### 4. Non-distinct tile sizes silently produce wrong results
 
@@ -255,7 +255,7 @@ same as before; `torch.mm` ~3.9 TFLOP/s).
 | --- | --- | --- |
 | Equal tile sizes `[64, 64, 32]`, `[32, 128, 32]` | silently wrong | **correct** |
 | `hl.grid` batched matmul, no K loop | `ValueNotFoundError` | **correct and numerically tested** |
-| Scalar block index + tiled K reduction | n/a | full-slice form **correct and verifier-tested**; tiled-slice extent propagation remains open |
+| Scalar block index + tiled K reduction | n/a | full-slice form **correct and verifier-tested**; scalar-plus-tiled native execution remains open |
 | Transposed RHS in a contraction | inlining failure | **correct and numerically tested** |
 | `.to(torch.bfloat16)` epilogue | `func.call` type mismatch | **correct and numerically tested** |
 | Nested `hl.grid` | `ValueNotFoundError: node: u5` | **correct and verifier-tested** |
@@ -273,10 +273,10 @@ for i in hl.grid(nb):
     out[i, :, :] = acc
 ```
 
-Nested loop block IDs and full-slice rank metadata are now corrected. The
-full-slice contraction form lowers and verifies successfully. Mixed scalar-grid
-and trailing tiled-slice forms still need extent propagation fixes and are
-tracked separately from the deeper `TK > 32` AMX conversion.
+Nested loop block IDs and source-rank slice metadata are now corrected. The
+full-slice contraction form lowers and verifies successfully, and the expected
+`1x64x32` source-rank metadata is regression-tested. Mixed scalar-grid and
+trailing tiled-slice native execution still needs a runtime/bufferization fix.
 
 ### B. Transposed RHS is numerically wrong — RESOLVED
 
@@ -300,17 +300,27 @@ Explicit narrowing casts emit `arith.truncf`, widening casts emit `arith.extf`,
 and implicit stores into bf16 outputs cast the stored tile. IR and numerical
 execution regression tests cover these cases.
 
-### D. Block packing remains a smoke test, not a usable path
+### D. Block packing — RESOLVED for nested panel/tile copies
 
-Exactly one packing shape compiles and reaches execution: a whole-panel copy
-indexed by an `hl.grid` scalar (`helion_block_pack.py`).
+The packing kernels now use a nested panel-grid plus inner tile loop. This
+avoids one giant whole-panel extract/insert operation and exposes bounded
+vector-shaped copies to the MLIR pipeline:
+
+```python
+for panel in hl.grid(panel_count):
+   for tile_k in hl.tile(k):
+      out[panel, tile_k, :] = source[tile_k, panel, :]
+```
+
+The A-panel kernel uses the analogous M-tile form. Both kernels are numerically
+covered by execution tests against `permute(...).contiguous()` references.
 
 ```python
 for j in hl.grid(panels):
     out[j, :, :] = source[:, j, :]
 ```
 
-After the scalar-index fixes, the obvious multi-level tiled variants were retried:
+The former whole-panel and fully multi-dimensional variants were retried:
 
 ```python
 for j in hl.grid(nbn):
@@ -349,16 +359,10 @@ A standalone
 `source.permute(1, 0, 2).contiguous()` is rejected by Helion before the backend
 (`NoDeviceLoopsInKernel`).
 
-So parallelism can only come from the panel count, and the per-panel copy is
-lowered as extract/insert rather than as a tileable linalg transpose/copy.
-With the current backend this whole-panel copy also fails the correctness check
-at 512x512 (`~99%` mismatched elements), so it is a reproducer rather than a
-usable packing kernel.
-
-The result is not usable: it either fails numerics (whole-panel copy), aborts
-(3D/4D tiled copy), or fails module creation (nested grid+tile copy). Packing is
-a dead end until a tiled copy/transpose form lowers to something the compiler
-can tile and vectorize correctly.
+Those variants remain unsupported, but the two-level panel/tile kernels used by
+`helion_block_pack.py` are now functional. With `OMP_NUM_THREADS=1`,
+`HELION_MLIR_PIPELINE=1`, and the MLIR Python bindings configured, the default
+512x512 benchmark completes under 30 seconds and passes its numerical checks.
 
 The no-explicit-K-loop matmul variant was also retried:
 

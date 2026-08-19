@@ -353,6 +353,27 @@ class TestExecuteMlir:
 
         assert _allclose(actual, torch.bmm(a, b))
 
+    def test_block_packing_kernels_execute_mlir(self):
+        """Nested tiled A/B panel packing matches contiguous PyTorch references."""
+        from helion_block_pack import pack_a
+        from helion_block_pack import pack_b
+
+        torch.manual_seed(41)
+        a = torch.randn(64, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 64, dtype=torch.bfloat16)
+
+        packed_a = pack_a(a, 32)
+        packed_b = pack_b(b, 32)
+
+        torch.testing.assert_close(
+            packed_a,
+            a.view(64, 2, 32).permute(1, 0, 2).contiguous(),
+        )
+        torch.testing.assert_close(
+            packed_b,
+            b.view(64, 2, 32).permute(1, 0, 2).contiguous(),
+        )
+
     def test_nested_grid_copy_execute_mlir(self):
         """Nested unit-step grid indices preserve both outer dimensions."""
 
@@ -375,6 +396,30 @@ class TestExecuteMlir:
         actual = _backend().execute_mlir(module, a, kernel_name="nested_grid_copy")
 
         assert _allclose(actual, a + 1.0)
+
+    @pytest.mark.parametrize("shape", [(2, 3, 8), (3, 2, 10)])
+    def test_grid_tile_slice_execute_mlir(self, shape):
+        """Scalar grid plus exact/ragged trailing tile slices stay numerical."""
+
+        @helion.kernel(static_shapes=True)
+        def grid_tile_copy(a: torch.Tensor) -> torch.Tensor:
+            nb, nc, m = a.shape
+            out = torch.zeros_like(a)
+            for i in hl.grid(nb):
+                for tm in hl.tile(m):
+                    out[i, :, tm] = a[i, :, tm] * 2.0 + 1.0
+            return out
+
+        torch.manual_seed(sum(shape))
+        a = torch.randn(*shape)
+        module = generate_mlir(
+            grid_tile_copy,
+            [a],
+            config=helion.Config(block_sizes=[1, 1, 4]),
+        )
+        actual = _backend().execute_mlir(module, a, kernel_name="grid_tile_copy")
+
+        assert _allclose(actual, a * 2.0 + 1.0)
 
     def test_tile_begin_execute_mlir(self):
         """`tile.begin` contributes the correct per-tile offset value."""

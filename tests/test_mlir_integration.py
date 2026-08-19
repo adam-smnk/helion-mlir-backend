@@ -286,6 +286,7 @@ class TestScalarBlockIndices:
         assert "tensor.extract_slice" in ir_str
         assert "tensor.parallel_insert_slice" in ir_str
         assert "1x" in ir_str or "tensor<1" in ir_str
+        assert "tensor<64x32xf32>" in ir_str
 
     def test_nested_grid_indices_lower_each_dimension(self):
         """Nested grid indices select the corresponding two outer dimensions."""
