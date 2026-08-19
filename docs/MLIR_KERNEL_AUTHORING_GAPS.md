@@ -98,9 +98,12 @@ Consequence: the f32 accumulator is re-loaded and re-stored from memory every
 32 elements of `K`. For a 4096³ matmul that is ~1 KiB of accumulator traffic per
 output element (16 GB total), which dominates runtime.
 
-The scalar-grid plus tiled-K lowering path itself is now covered and verified;
-the remaining limitation is specifically the deeper AMX reduction/cache tile
-conversion for `TK > 32`.
+The scalar-grid plus tiled-K lowering path itself is covered for the full-slice
+contraction form. A scalar grid dimension combined with a trailing tiled slice
+still produces malformed static sizes in some nested forms (for example, an
+`8`-element axis becoming a `64`-element slice) and can abort during
+bufferization. That rank/extent propagation issue remains separate from the
+deeper AMX reduction/cache tile conversion for `TK > 32`.
 
 ### 4. Non-distinct tile sizes silently produce wrong results
 
@@ -252,7 +255,7 @@ same as before; `torch.mm` ~3.9 TFLOP/s).
 | --- | --- | --- |
 | Equal tile sizes `[64, 64, 32]`, `[32, 128, 32]` | silently wrong | **correct** |
 | `hl.grid` batched matmul, no K loop | `ValueNotFoundError` | **correct and numerically tested** |
-| Scalar block index + tiled K reduction | n/a | **correct and verifier-tested**; deeper `TK > 32` AMX conversion remains open |
+| Scalar block index + tiled K reduction | n/a | full-slice form **correct and verifier-tested**; tiled-slice extent propagation remains open |
 | Transposed RHS in a contraction | inlining failure | **correct and numerically tested** |
 | `.to(torch.bfloat16)` epilogue | `func.call` type mismatch | **correct and numerically tested** |
 | Nested `hl.grid` | `ValueNotFoundError: node: u5` | **correct and verifier-tested** |
@@ -270,9 +273,10 @@ for i in hl.grid(nb):
     out[i, :, :] = acc
 ```
 
-The rank metadata and nested loop handling are now corrected. The copy and
-contraction forms lower and verify successfully; the remaining independent
-limitation is the deeper `TK > 32` AMX conversion described in blocker 3.
+Nested loop block IDs and full-slice rank metadata are now corrected. The
+full-slice contraction form lowers and verifies successfully. Mixed scalar-grid
+and trailing tiled-slice forms still need extent propagation fixes and are
+tracked separately from the deeper `TK > 32` AMX conversion.
 
 ### B. Transposed RHS is numerically wrong — RESOLVED
 

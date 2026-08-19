@@ -353,6 +353,29 @@ class TestExecuteMlir:
 
         assert _allclose(actual, torch.bmm(a, b))
 
+    def test_nested_grid_copy_execute_mlir(self):
+        """Nested unit-step grid indices preserve both outer dimensions."""
+
+        @helion.kernel(static_shapes=True)
+        def nested_grid_copy(a: torch.Tensor) -> torch.Tensor:
+            nb, nc, m = a.shape
+            out = torch.zeros_like(a)
+            for i in hl.grid(nb):
+                for j in hl.grid(nc):
+                    out[i, j, :] = a[i, j, :] + 1.0
+            return out
+
+        torch.manual_seed(31)
+        a = torch.randn(2, 3, 8)
+        module = generate_mlir(
+            nested_grid_copy,
+            [a],
+            config=helion.Config(block_sizes=[1, 1, 8]),
+        )
+        actual = _backend().execute_mlir(module, a, kernel_name="nested_grid_copy")
+
+        assert _allclose(actual, a + 1.0)
+
     def test_tile_begin_execute_mlir(self):
         """`tile.begin` contributes the correct per-tile offset value."""
 

@@ -84,6 +84,7 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     import torch.fx
 
     from ..support import NodeLoweringError
+    from ..support import block_id_from_key
     from ..support import torch_dtype_to_mlir
 
     body_graph_id = node.args[0]
@@ -118,37 +119,52 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         )
     if ub_val is not None:
         ub_val = ctx.cast_to_index(ub_val)
-    ub_for_match = ub_static
-    # The block id from the node is authoritative; only re-derive it when that id
-    # is already bound to an enclosing loop.
-    if block_id in ctx.block_id_to_iv:
-        candidates = [
-            bid
-            for bid, size in ctx.block_id_to_size.items()
-            if bid not in ctx.block_id_to_iv
-            and size > 0
-            and ub_for_match is not None
-            and ub_for_match % size == 0
-        ]
-        if candidates:
-            largest = max(ctx.block_id_to_size[bid] for bid in candidates)
-            tied = [bid for bid in candidates if ctx.block_id_to_size[bid] == largest]
-            if len(tied) > 1:
-                raise NodeLoweringError(
-                    node,
-                    reason=(
-                        f"Ambiguous block id for nested loop: block ids {sorted(tied)} "
-                        f"all have size {largest}"
-                    ),
-                    recovery_hint=(
-                        "Use distinct block_sizes for nested tile dimensions; equal "
-                        "sizes cannot be told apart and would silently miscompile"
-                    ),
-                )
-            block_id = tied[0]
-    step = ctx.block_id_to_size.get(block_id, ub_static if ub_static is not None else 1)
     body_graph_info = ctx.host_function.device_ir.graphs[body_graph_id]
     body_graph = body_graph_info.graph
+
+    # Helion can reuse the enclosing grid block id on a nested loop node. The
+    # body still contains the inner scalar symbol, whose origin is authoritative.
+    if block_id in ctx.block_id_to_iv:
+        body_block_ids = {
+            info[0]
+            for body_node in body_graph.nodes
+            if (info := ctx.node_symbol_info(body_node)) is not None
+            and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
+            and info[0] not in ctx.block_id_to_iv
+        }
+        body_block_ids.update(
+            body_block_id
+            for body_node in body_graph.nodes
+            if getattr(body_node.target, "__name__", "") == "_get_symnode"
+            and body_node.args
+            and (body_block_id := block_id_from_key(body_node.args[0])) is not None
+            and body_block_id not in ctx.block_id_to_iv
+        )
+        if len(body_block_ids) == 1:
+            block_id = next(iter(body_block_ids))
+        elif not body_block_ids:
+            candidates = [
+                bid
+                for bid, size in ctx.block_id_to_size.items()
+                if bid not in ctx.block_id_to_iv
+                and size > 0
+                and ub_static is not None
+                and ub_static % size == 0
+            ]
+            if candidates:
+                largest = max(ctx.block_id_to_size[bid] for bid in candidates)
+                tied = [
+                    bid for bid in candidates if ctx.block_id_to_size[bid] == largest
+                ]
+                if len(tied) == 1:
+                    block_id = tied[0]
+    body_scalar_kinds = {
+        info[1]
+        for body_node in body_graph.nodes
+        if (info := ctx.node_symbol_info(body_node)) is not None
+    }
+    is_grid_loop = "grid" in body_scalar_kinds
+    step = ctx.block_id_to_size.get(block_id, ub_static if ub_static is not None else 1)
     output_node = next(n for n in body_graph.nodes if n.op == "output")
     out_args = output_node.args[0]
     if not isinstance(out_args, (list, tuple)):
@@ -175,6 +191,11 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         index_nodes = store_node.args[1]
         value_node = store_node.args[2]
         target_val = ctx.get_value(target_node)
+        target_meta = (
+            target_node.meta.get("val")
+            if isinstance(target_node, torch.fx.Node)
+            else None
+        )
         value_meta = (
             value_node.meta.get("val")
             if isinstance(value_node, torch.fx.Node)
@@ -200,7 +221,10 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                         full_shape[dim] = int(target_type.shape[dim])
                 elem_ty = target_type.element_type
             else:
-                if isinstance(value_meta, torch.Tensor):
+                if isinstance(target_meta, torch.Tensor):
+                    value_shape = [int(d) for d in target_meta.shape]
+                    elem_ty = torch_dtype_to_mlir(target_meta.dtype)
+                elif isinstance(value_meta, torch.Tensor):
                     value_shape = [int(d) for d in value_meta.shape]
                     elem_ty = torch_dtype_to_mlir(value_meta.dtype)
                 else:
@@ -238,22 +262,34 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                 fallback_outer_bid = outer_bids[0] if outer_bids else None
                 for dim, dim_size in enumerate(full_shape):
                     idx_node = index_nodes[dim] if dim < len(index_nodes) else None
-                    if idx_node is not None and ctx.is_scalar_index_node(idx_node):
-                        tile_shape.append(1)
-                        flush_offsets.append(ctx.index_const(0))
-                        continue
                     dim_bid = dim_block_ids[dim]
                     if dim == inner_dim or dim_bid == block_id:
                         tile_shape.append(ub_static if ub_static is not None else step)
                         flush_offsets.append(ctx.index_const(0))
-                    elif (
+                        continue
+                    if idx_node is not None and ctx.is_scalar_index_node(idx_node):
+                        tile_shape.append(1)
+                        scalar_value = (
+                            ctx.block_id_to_iv.get(dim_bid)
+                            if isinstance(dim_bid, int)
+                            else None
+                        )
+                        if scalar_value is None:
+                            scalar_value = ctx.get_value(idx_node)
+                        flush_offsets.append(
+                            scalar_value
+                            if scalar_value is not None
+                            else ctx.index_const(0)
+                        )
+                        continue
+                    if (
                         isinstance(dim_bid, int)
                         and dim_bid in active_outer_block_ids
                         and dim_bid in ctx.block_id_to_size
                     ):
                         tile_shape.append(ctx.block_id_to_size[dim_bid])
                         flush_offsets.append(ctx.block_id_to_iv[dim_bid])
-                    elif (
+                    elif not is_grid_loop and (
                         fallback_outer_bid is not None
                         and fallback_outer_bid in ctx.block_id_to_size
                     ):
@@ -342,7 +378,33 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         scf_d.YieldOp(yield_vals)
     if synthetic_store_ctx is not None and synthetic_iter_index is not None:
         final_tile = for_op.results[synthetic_iter_index]
-        ctx.forall_insert_slices.append(
-            (final_tile, synthetic_store_ctx["flush_offsets"], None)
-        )
+        if ctx.for_store_ctx_stack:
+            parent_ctx = ctx.for_store_ctx_stack[-1]
+            parent_current = parent_ctx.get("current")
+            if parent_current is not None:
+                parent_type = ir.RankedTensorType(parent_current.type)
+                tile_type = ir.RankedTensorType(final_tile.type)
+                offsets = list(synthetic_store_ctx["flush_offsets"])
+                if len(offsets) != parent_type.rank:
+                    offsets = offsets[: parent_type.rank]
+                    offsets.extend(
+                        ctx.index_const(0)
+                        for _ in range(parent_type.rank - len(offsets))
+                    )
+                updated = tensor_d.InsertSliceOp(
+                    final_tile,
+                    parent_current,
+                    offsets,
+                    [],
+                    [],
+                    static_offsets=[ir.ShapedType.get_dynamic_size()]
+                    * parent_type.rank,
+                    static_sizes=[int(dim) for dim in tile_type.shape],
+                    static_strides=[1] * parent_type.rank,
+                ).result
+                parent_ctx["current"] = updated
+        else:
+            ctx.forall_insert_slices.append(
+                (final_tile, synthetic_store_ctx["flush_offsets"], None)
+            )
     return for_op
