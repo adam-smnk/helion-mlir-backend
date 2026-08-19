@@ -390,6 +390,29 @@ the final iteration currently still emits a fixed 64-wide contraction instead
 of a 32-wide tail. The packed-RHS regression therefore covers exact K-tile
 sizes, while existing copy tests cover ragged slice metadata separately.
 
+A standalone f32 reproducer is available in `helion_block_packed_f32_repro.py`.
+With `SIZE=128`, `BLOCK_M=32`, `BLOCK_N=32`, `BLOCK_K=64`,
+`OMP_NUM_THREADS=4`, and `HELION_MLIR_PIPELINE=1`, it now passes both the pack
+and packed-matmul numerical checks under `timeout 30`.
+
+The analogous bf16 packed-RHS consumer is still blocked in AMX lowering. At
+512x512 with exact `K=512`, `TK=32`, and `BN` in `{32, 64, 128}`, the packed
+bf16 consumer fails JIT with:
+
+```
+LLVM Translation failed for operation: builtin.unrealized_conversion_cast
+```
+
+The non-packed transposed-RHS bf16 tiled form also remains incorrect in the
+benchmark pattern (`~96%` mismatched elements at 512x512):
+
+```python
+acc = torch.addmm(acc, x[tile_m, tile_k], yt[tile_n, tile_k].permute(1, 0))
+```
+
+So the only currently correct bf16 high-performance path is still the row-major
+explicit-`K=32` loop in `helion_matmul_bf16.py`.
+
 The no-explicit-K-loop matmul variant was also retried:
 
 ```python
