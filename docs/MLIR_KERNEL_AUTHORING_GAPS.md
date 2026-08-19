@@ -274,95 +274,6 @@ The rank metadata and nested loop handling are now corrected. The copy and
 contraction forms lower and verify successfully; the remaining independent
 limitation is the deeper `TK > 32` AMX conversion described in blocker 3.
 
-It aborts the process rather than raising. A rank-reducing slice mixing one
-scalar index with one tile index appears to build a `subview` whose static-size
-list is the reduced rank while the source rank is unreduced.
-
-#### Reproducer
-
-Run with `HELION_MLIR_PIPELINE=1`. The first snippet has no matmul and fails
-earlier with a readable verifier error, so it is the better one to fix against;
-the second is the same root cause surfacing as an abort after bufferization.
-
-```python
-# repro_a1.py -- scalar grid index + tiled slice, copy only
-from __future__ import annotations
-import torch, helion, helion.language as hl
-import helion_mlir_backend  # noqa: F401
-
-@helion.kernel(static_shapes=True, backend="mlir",
-               config=helion.Config(block_sizes=[32]))
-def copy_slices(a):
-    nb, m, kk = a.shape
-    out = torch.empty_like(a)
-    for i in hl.grid(nb):
-        for tk in hl.tile(kk):
-            out[i, :, tk] = a[i, :, tk]
-    return out
-
-copy_slices(torch.randn(2, 64, 128).to(torch.bfloat16))
-```
-
-```
-RuntimeError: MLIR inlining failed: Failure while executing pass pipeline:
-error: unknown: expected 3 offset values, got 2
- note: see current operation: "tensor.parallel_insert_slice"(%8, %arg2, %arg1, %3)
-   <{operandSegmentSizes = array<i32: 1, 1, 2, 0, 0>,
-     static_offsets = array<i64: -9223372036854775808, -9223372036854775808>,
-     static_sizes = array<i64: 1, 128>,
-     static_strides = array<i64: 1, 1>}>
-   : (tensor<1x128xbf16>, tensor<2x64x128xbf16>, index, index) -> ()
-```
-
-The destination is rank 3 but the insert carries only 2 offsets/sizes/strides.
-The scalar-index dimension is dropped from the slice metadata instead of being
-kept as an offset with size 1, so the rank-reduced tile is never expanded back
-to the destination rank.
-
-```python
-# repro_a2.py -- same shape, through a contraction; aborts instead of erroring
-from __future__ import annotations
-import torch, helion, helion.language as hl
-import helion_mlir_backend  # noqa: F401
-
-@helion.kernel(static_shapes=True, backend="mlir",
-               config=helion.Config(block_sizes=[32]))
-def batched_mm(a, b):
-    nb, m, kk = a.shape
-    n = b.shape[2]
-    out = torch.empty((nb, m, n), dtype=torch.float32, device=a.device)
-    for i in hl.grid(nb):
-        acc = hl.zeros([m, n], dtype=torch.float32)
-        for tk in hl.tile(kk):
-            acc = torch.addmm(acc, a[i, :, tk], b[i, tk, :])
-        out[i, :, :] = acc
-    return out
-
-batched_mm(torch.randn(2, 64, 128).to(torch.bfloat16),
-           torch.randn(2, 128, 64).to(torch.bfloat16))
-```
-
-```
-mlir/lib/Dialect/MemRef/IR/MemRefOps.cpp:3083:
-SubViewOp::inferResultType: Assertion `staticSizes.size() == rank &&
-"staticSizes length mismatch"' failed.
-```
-
-Replacing `hl.grid` with `ti.begin` from an outer `hl.tile(..., block_size=1)`
-reproduces both.
-
-Variants that use a
-4D packed layout instead fail earlier:
-
-- `a[i, tk, :, :]` (grid index + tile index on a rank-4 tensor) →
-  `ArrayRef<AffineExpr>::operator[]: Assertion 'Index < Length'` abort.
-- `a[i, tk.begin, :, :]` → builds, but the K loop is **silently dropped**: the
-  emitted IR contains a single `extract_slice` at offset 0 and no `scf.for`, so
-  the kernel would compute only the first K block.
-- `for kb in hl.grid(nbk)` nested inside `for i, j in hl.grid(...)` →
-  `ValueNotFoundError: Value not found for node: u5`. Nested grid loops resolve
-  the outer indices but not the inner one.
-
 ### B. Transposed RHS is numerically wrong — RESOLVED
 
 ```python
@@ -385,27 +296,75 @@ Explicit narrowing casts emit `arith.truncf`, widening casts emit `arith.extf`,
 and implicit stores into bf16 outputs cast the stored tile. IR and numerical
 execution regression tests cover these cases.
 
-### D. Block packing is expressible but not usable
+### D. Block packing remains a smoke test, not a usable path
 
-Exactly one packing shape compiles: a whole-panel copy indexed by an `hl.grid`
-scalar (`helion_block_pack.py`).
+Exactly one packing shape compiles and reaches execution: a whole-panel copy
+indexed by an `hl.grid` scalar (`helion_block_pack.py`).
 
 ```python
 for j in hl.grid(panels):
     out[j, :, :] = source[:, j, :]
 ```
 
-Tiling inside the grid body (`for j in hl.grid(...): for tk in hl.tile(...)`)
-aborts with case A, and tiling all three dimensions of the 3D view
-(`for tj, tk, tn in hl.tile([...])`) also aborts, so parallelism can only come
-from the panel count and the per-panel copy cannot be blocked or vectorized by
-the author.
+After the scalar-index fixes, the obvious multi-level tiled variants were retried:
 
-The result is far too slow to be worth using: ~10 GB/s at 512x512 with 8
-threads, and at 4096x4096 a single pack does not complete in a reasonable time
-at all — versus the ~1-2 ms a 64 MB read+write repack should take. Packing that
-costs more than the matmul defeats the purpose, so the packing path is a dead
-end until case A is fixed and the copy can be tiled.
+```python
+for j in hl.grid(nbn):
+   for kk in hl.grid(k):
+      for nn in hl.grid(bn):
+         out[j, kk, nn] = source[kk, j, nn]
+```
+
+fails during nested loop lowering because all nested grid dimensions have block
+size 1 (`Ambiguous block id for nested loop: block ids [1, 2] all have size 1`).
+
+```python
+for panel in hl.grid(nbn):
+   for tile_k, tile_n in hl.tile([k, bn]):
+      out[panel, tile_k, tile_n] = source[tile_k, panel, tile_n]
+```
+
+fails during module creation (`Check that kernel has static_shapes=True and all
+ops are in hl.tile() loops`). A pure 3D tiled transpose:
+
+```python
+for tile_panel, tile_k, tile_n in hl.tile([nbn, k, bn]):
+   out[tile_panel, tile_k, tile_n] = source[tile_k, tile_panel, tile_n]
+```
+
+segfaults (`status=139`) at 512x512. Pure 4D tiled layouts also abort in MLIR
+with allocator corruption (`malloc(): unsorted double linked list corrupted`):
+
+```python
+for tile_panel, tile_k_block, tile_k, tile_n in hl.tile([nbs, kbs, bk, bn]):
+   out[tile_panel, tile_k_block, tile_k, tile_n] = \
+      source[tile_k_block, tile_k, tile_panel, tile_n]
+```
+
+A standalone
+`source.permute(1, 0, 2).contiguous()` is rejected by Helion before the backend
+(`NoDeviceLoopsInKernel`).
+
+So parallelism can only come from the panel count, and the per-panel copy is
+lowered as extract/insert rather than as a tileable linalg transpose/copy.
+With the current backend this whole-panel copy also fails the correctness check
+at 512x512 (`~99%` mismatched elements), so it is a reproducer rather than a
+usable packing kernel.
+
+The result is not usable: it either fails numerics (whole-panel copy), aborts
+(3D/4D tiled copy), or fails module creation (nested grid+tile copy). Packing is
+a dead end until a tiled copy/transpose form lowers to something the compiler
+can tile and vectorize correctly.
+
+The no-explicit-K-loop matmul variant was also retried:
+
+```python
+for tile_m, tile_n in hl.tile([m, n]):
+   out[tile_m, tile_n] = torch.mm(x[tile_m, :], y[:, tile_n])
+```
+
+It fails at JIT with the same deeper reduction-cache-tile issue:
+`LLVM Translation failed for operation: builtin.unrealized_conversion_cast`.
 
 ### Revised priorities
 
