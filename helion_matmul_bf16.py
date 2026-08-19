@@ -35,8 +35,6 @@ if TYPE_CHECKING:
 
 
 SIZE = 4096
-# Distinct by construction: the MLIR backend maps loop indices back to block
-# ids by matching block sizes, so equal tile sizes make that mapping ambiguous.
 TILE_M = int(os.environ.get("HELION_MATMUL_TILE_M", "128"))
 TILE_N = int(os.environ.get("HELION_MATMUL_TILE_N", "1024"))
 TILE_K = int(os.environ.get("HELION_MATMUL_TILE_K", "32"))
@@ -68,8 +66,8 @@ def matmul_bf16_mlir(x: Tensor, y: Tensor) -> Tensor:
     keeps the accumulator at 512 KiB and still yields 128 tiles, two per thread
     at 64 threads.
 
-    The result stays f32: that is the native AMX accumulator type, and a bf16
-    epilogue currently trips the backend's ATen helper rebuild.
+    The result stays f32: that is the native AMX accumulator type, and the bf16
+    epilogue path still fails JIT for this AMX loop shape.
     """
     m, k = x.shape
     k2, n = y.shape
@@ -120,10 +118,6 @@ def check_numerics(name: str, actual: Tensor, reference_f32: Tensor) -> None:
 def main() -> None:
     if os.environ.get("HELION_MLIR_PIPELINE") != "1":
         raise RuntimeError("Set HELION_MLIR_PIPELINE=1 to use the vectorizing pipeline")
-    if len({TILE_M, TILE_N, TILE_K}) != 3:
-        raise ValueError(
-            "MLIR tile sizes must be distinct to preserve loop-index mapping"
-        )
     if any(tile % AMX_PARALLEL_TILE for tile in (TILE_M, TILE_N)):
         raise ValueError(
             f"TILE_M/TILE_N must be multiples of {AMX_PARALLEL_TILE} for AMX bf16"

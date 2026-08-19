@@ -1,4 +1,4 @@
-"""Experimental block-packing kernels for the Helion MLIR backend.
+"""Block-packing kernels for the Helion MLIR backend.
 
 Repacks the operands of an ``[M, K] x [K, N]`` matmul into panel-major layouts
 so that each cache tile the matmul consumes is contiguous:
@@ -12,14 +12,11 @@ so that each cache tile the matmul consumes is contiguous:
 The ``A`` side is only needed for a fully blocked layout; ``a.view(M/BM, BM, K)``
 is already free and block-row contiguous.
 
-These are written against the only packing shape that currently compiles: a
-whole-panel copy indexed by an ``hl.grid`` scalar. Multi-level tiled variants
-still fail in the backend, and this whole-panel variant currently fails the
-correctness check. This file is therefore a small reproducer/smoke benchmark,
-not a production packing path.
+These use a nested panel-grid plus K-tile loop so the copy is exposed to MLIR as
+bounded vector-shaped chunks rather than one large extract/insert.
 
-The packed operands are not used by helion_matmul_bf16.py: the tiled packing
-forms needed for a fast pack still crash, and whole-K matmul currently hits the
+The packed operands are not used by helion_matmul_bf16.py yet: the packed-RHS
+matmul formulation currently miscomputes, and whole-K matmul still hits the
 deeper AMX reduction-cache-tile issue.
 """
 
