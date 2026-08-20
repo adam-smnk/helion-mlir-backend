@@ -423,10 +423,119 @@ for tile_m, tile_n in hl.tile([m, n]):
 It fails at JIT with the same deeper reduction-cache-tile issue:
 `LLVM Translation failed for operation: builtin.unrealized_conversion_cast`.
 
+### E. bf16 AMX optimization: what packing bought, and the remaining ceiling
+
+Packing the RHS into contiguous `[N/BN, K, BN]` panels is worth ~3x, but **not**
+because it removes the VNNI repack. The repack is still emitted, still inside the
+K loop, and still redundant. What packing changed is the *cost* of that repack:
+the row-major kernel gathered `vector<16xbf16>` from a memref with row stride `N`
+(32 cache lines, half-used), while the packed kernel reads contiguous
+`vector<32xbf16>` from the panel.
+
+The final IR keeps two accumulators in AMX tile registers across K, with the VNNI
+conversion in a nested loop:
+
+```
+^bb6(%160: i64, %161: !llvm.x86_amx, %162: !llvm.x86_amx):   // K loop
+  ^bb8: ... llvm.shufflevector %202, %192 [0, 32, 1, 33, 2, 34, 3, 35, ...]
+  ^bb10: 3 x tileloadd64 ... 2 x tdpbf16ps
+  llvm.br ^bb6(%267, %261, %266)
+```
+
+`tilezero` runs before the loop and `tilestored64` only after it, so the
+accumulators do not spill. Note the shuffles are named `llvm.shufflevector` after
+LLVM lowering, not `vector.shuffle`; grepping for the MLIR spelling gives a false
+negative.
+
+Because the B repack sits inside the `tile_m` loop, each B tile is re-converted
+`M / PACK_TILE_M` times. Hoisting it, or accepting a pre-VNNI-packed operand,
+would remove that redundancy.
+
+The second limit is instruction-level parallelism: there are only **two**
+accumulator chains (`%161`, `%162`), each serially dependent across K.
+`tdpbf16ps` has roughly 52-cycle latency against 16-cycle throughput, so at least
+four independent accumulators are needed to saturate the unit.
+
+The accumulator count is `(TM/16) * (BN/16)`, and both are pinned:
+
+| variant | result |
+| --- | --- |
+| `TM = 32` | JIT failure, `vector.contract` survives |
+| `TM = 64` | `SubViewOp::inferResultType` assertion abort |
+| `BN = 64` / `BN = 128` | assertion abort |
+| `TK > 32` (incl. whole-K) | blocker 3, JIT failure |
+| bf16 output epilogue | JIT failure |
+
+Thread scaling is essentially linear (336 / 746 / 1438 GFLOP/s at 1 / 2 / 4
+threads), so this is latency-bound per core, not bandwidth-bound. M-blocking the
+grid to `(m_block, n_panel)` was therefore worth only a few percent, but it is
+kept because it raises the parallel work item count from 128 to 1024, which
+matters at 64 threads.
+
+### F. Split-K: exact failure mode
+
+Split-K is the natural way to add accumulator chains without raising `TM`/`BN`,
+and the shapes it produces are correct. Before the AMX rewrite, the base kernel
+has 2 and the split-K kernel has 4 `vector.contract` ops, all of the same
+AMX-friendly shape:
+
+```
+vector<16x32xbf16>, vector<32x16xbf16> into vector<16x16xf32>
+```
+
+Despite that, split-K fails:
+
+```
+error: LLVM Translation failed for operation: builtin.unrealized_conversion_cast
+error: LLVM Translation failed for operation: omp.wsloop
+```
+
+some `vector.contract` ops are simply not converted to AMX.
+
+Two things were ruled out:
+
+- **It is not the final `acc0 + acc1` reduction.** A diagnostic variant that
+  keeps both chains but stores only `acc0`, with no vector add consuming the
+  accumulators, fails identically.
+- **C-tile duplication does not avoid it.** Writing the partials to separate
+  output slices (`out[0, ...] = acc0`, `out[1, ...] = acc1`) so the reduction
+  happens outside the kernel hits a different backend failure:
+  `mlir/lib/IR/PatternMatch.cpp: RewriterBase::eraseOp: Assertion`
+  `mayBeGraphRegion(*op->getParentRegion()) && "expected that op has no uses"`.
+
+So the blocker is that the AMX conversion handles only a single contraction chain
+per loop body; two independent loop-carried accumulators in one `scf.for` are not
+converted, regardless of how they are consumed.
+
+### G. Unpack cannot be written as a Helion kernel
+
+The packed matmul produces `[M/BM, N/BN, BM, BN]`. Converting that to row-major
+`[M, N]` needs a `[M/BM, BM, N/BN, BN]` result, which then `view`s to `[M, N]`
+for free. Every formulation of that store indexes a rank-4 destination as
+`(scalar, tile, scalar, full)`, and all of them fail:
+
+| formulation | result |
+| --- | --- |
+| matmul writes `out[m_block, tile_m, panel_n, :]` directly | wrong results (97% mismatch), then segfault |
+| separate kernel, `hl.grid([mbc, np]) / hl.tile(bm)` | segfault |
+| separate kernel, `hl.grid(mbc) / hl.tile([bm, np])` | module creation failure |
+
+Writing the matmul output directly in `[M/BM, BM, N/BN, BN]` order is the most
+valuable of these: it would make the unpack a free `view` and remove a whole pass
+over the output. Until the interleaved scalar/tile store works, unpack stays an
+eager `permute().contiguous()` (~2.3 ms at 4K, 4 threads).
+
 ### Revised priorities
 
-1. **Blocker 3** — deeper reduction cache tiles (`TK > 32`). This remains the
-   main compiler-side performance limitation and caps AMX utilization.
+1. **`TM > 16` / `BN > 32` register tiles for packed bf16** — currently a JIT
+   failure or an MLIR assertion abort. This gates AMX ILP and is the main cap on
+   the packed kernel.
+2. **Multiple accumulator chains per loop body** (split-K, section F). Either
+   path would raise ILP; both are backend failures today.
+3. **Hoist the VNNI repack out of the `tile_m` loop**, or accept a pre-packed
+   VNNI operand. Today each B tile is re-shuffled `M / PACK_TILE_M` times.
+4. **Blocker 3** — deeper reduction cache tiles (`TK > 32`). This remains a
+   compiler-side performance limitation and caps AMX utilization.
 2. Codegen quality: RHS repacking, accumulator spills, and nested OpenMP
    regions remain performance work.
 3. 4D matmul remains a Helion frontend limitation.

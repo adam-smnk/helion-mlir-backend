@@ -18,6 +18,7 @@ contraction on an amx_tile target and lowers it to `tdpbf16ps`.
 
 from __future__ import annotations
 
+import logging
 import os
 import statistics
 import time
@@ -30,6 +31,9 @@ from torch import Tensor
 
 import helion_mlir_backend  # noqa: F401
 
+# Helion probes tile shapes during tracing and torch logs the recovered failures.
+logging.getLogger("torch._subclasses.fake_tensor").setLevel(logging.CRITICAL)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -41,6 +45,9 @@ TILE_K = int(os.environ.get("HELION_MATMUL_TILE_K", "32"))
 PACK_TILE_M = int(os.environ.get("HELION_MATMUL_PACK_TILE_M", "16"))
 PACK_TILE_N = int(os.environ.get("HELION_MATMUL_PACK_TILE_N", "32"))
 PACK_TILE_K = int(os.environ.get("HELION_MATMUL_PACK_TILE_K", "32"))
+# Cache-level M block; the packed grid iterates (m_block, n_panel) so an A block
+# stays resident while all N panels stream past it.
+PACK_BLOCK_M = int(os.environ.get("HELION_MATMUL_PACK_BLOCK_M", "512"))
 WARMUP_ITERS = 5
 BENCHMARK_ITERS = 20
 SAMPLES = 7
@@ -105,24 +112,39 @@ def matmul_bf16_mlir(x: Tensor, y: Tensor) -> Tensor:
     backend="mlir",
     config=helion.Config(block_sizes=[PACK_TILE_M, PACK_TILE_K]),
 )
-def matmul_bf16_packed_b_mlir(x: Tensor, packed_b: Tensor) -> Tensor:
-    """Compute ``A @ B`` from panel-major packed RHS as ``[N/BN, M, BN]``."""
-    m, k = x.shape
+def matmul_bf16_packed_b_mlir(a3: Tensor, packed_b: Tensor) -> Tensor:
+    """Blocked ``A @ B`` from ``[M/BM, BM, K]`` and packed RHS ``[N/BN, K, BN]``.
+
+    `PACK_TILE_M`/`PACK_TILE_N` are pinned to 16x32: larger register tiles either
+    fail AMX conversion or abort in MLIR, so the inner contraction is exactly two
+    `tdpbf16ps` accumulator chains held in AMX tile registers across the K loop.
+    """
+    m_blocks, block_m, k = a3.shape
     panels_n, k2, block_n = packed_b.shape
     assert k == k2, "matmul dimension mismatch"
 
-    out = torch.empty((panels_n, m, block_n), dtype=torch.float32, device=x.device)
-    for panel_n in hl.grid(panels_n):
-        for tile_m in hl.tile(m):
+    out = torch.empty(
+        (m_blocks, panels_n, block_m, block_n),
+        dtype=torch.float32,
+        device=a3.device,
+    )
+    for m_block, panel_n in hl.grid([m_blocks, panels_n]):
+        for tile_m in hl.tile(block_m):
             acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
                 acc = torch.addmm(
                     acc,
-                    x[tile_m, tile_k],
+                    a3[m_block, tile_m, tile_k],
                     packed_b[panel_n, tile_k, :],
                 )
-            out[panel_n, tile_m, :] = acc
+            out[m_block, panel_n, tile_m, :] = acc
     return out
+
+
+def pack_a_host_shape(a: Tensor) -> Tensor:
+    """View ``A`` as ``[M/BM, BM, K]``; row-major A makes this a free reshape."""
+    m, k = a.shape
+    return a.view(m // PACK_BLOCK_M, PACK_BLOCK_M, k)
 
 
 def pack_b_host_shape(b: Tensor) -> Tensor:
@@ -131,10 +153,24 @@ def pack_b_host_shape(b: Tensor) -> Tensor:
     return b.view(k, n // PACK_TILE_N, PACK_TILE_N).contiguous()
 
 
-def unpack_panel_major(panel_out: Tensor) -> Tensor:
-    """Convert ``[N/BN, M, BN]`` back to row-major ``[M, N]`` on the host."""
-    panels_n, m, block_n = panel_out.shape
-    return panel_out.permute(1, 0, 2).contiguous().view(m, panels_n * block_n)
+def unpack_blocked(blocked_out: Tensor) -> Tensor:
+    """Convert ``[M/BM, N/BN, BM, BN]`` back to row-major ``[M, N]``.
+
+    Eager torch, not a Helion kernel: the required store pattern indexes a rank-4
+    destination as (scalar, tile, scalar, full), which the MLIR backend either
+    miscompiles or crashes on.
+    """
+    m_blocks, panels_n, block_m, block_n = blocked_out.shape
+    return (
+        blocked_out.permute(0, 2, 1, 3)
+        .contiguous()
+        .view(m_blocks * block_m, panels_n * block_n)
+    )
+
+
+def matmul_bf16_packed_end_to_end(a3: Tensor, b3: Tensor) -> Tensor:
+    """Full packed path returning row-major ``[M, N]``, as ``torch.mm`` does."""
+    return unpack_blocked(matmul_bf16_packed_b_mlir(a3, pack_b_panels_bf16(b3)))
 
 
 def benchmark(name: str, operation: Callable[[], object]) -> float:
@@ -186,6 +222,10 @@ def main() -> None:
         raise ValueError(f"PACK_TILE_K must be {AMX_REDUCTION_TILE} for AMX bf16")
     if PACK_TILE_N != AMX_PARALLEL_TILE:
         raise ValueError(f"PACK_TILE_N must be {AMX_PARALLEL_TILE} for AMX bf16")
+    if SIZE % PACK_BLOCK_M or PACK_BLOCK_M % PACK_TILE_M:
+        raise ValueError(
+            f"PACK_BLOCK_M must divide {SIZE} and be a multiple of PACK_TILE_M"
+        )
     if any(SIZE % tile for tile in (TILE_M, TILE_N, TILE_K)):
         raise ValueError(
             f"Tile sizes must divide {SIZE} for this fixed-shape benchmark"
@@ -206,7 +246,8 @@ def main() -> None:
     print(
         f"bf16 {SIZE}x{SIZE} @ {SIZE}x{SIZE} -> f32; "
         f"row-major tiles={TILE_M}x{TILE_N}x{TILE_K}; "
-        f"packed tiles={PACK_TILE_M}x{PACK_TILE_N}x{PACK_TILE_K}"
+        f"packed block_m={PACK_BLOCK_M} "
+        f"tiles={PACK_TILE_M}x{PACK_TILE_N}x{PACK_TILE_K}"
     )
     print(
         f"{tiles_m * tiles_n} output tiles over {threads} threads; "
@@ -214,14 +255,15 @@ def main() -> None:
     )
 
     b3 = pack_b_host_shape(b)
+    a3 = pack_a_host_shape(a)
     compile_start = time.perf_counter()
     packed_b = pack_b_panels_bf16(b3)
-    helion_panel_result = matmul_bf16_packed_b_mlir(a, packed_b)
+    helion_blocked_result = matmul_bf16_packed_b_mlir(a3, packed_b)
     compile_ms = (time.perf_counter() - compile_start) * 1_000
     print(f"Helion first call    {compile_ms:8.3f} ms (includes pack + MLIR JIT)")
 
     reference = a.to(torch.float32) @ b.to(torch.float32)
-    helion_result = unpack_panel_major(helion_panel_result)
+    helion_result = unpack_blocked(helion_blocked_result)
     check_numerics("Helion packed (f32)", helion_result, reference)
     row_major_result = matmul_bf16_mlir(a, b)
     check_numerics("Helion row-major", row_major_result, reference)
@@ -230,25 +272,32 @@ def main() -> None:
     check_numerics("PyTorch eager (bf16)", torch.mm(a, b), reference)
 
     with torch.inference_mode():
-        pack_ms = benchmark("Helion pack B", lambda: pack_b_panels_bf16(b3))
+        pack_ms = benchmark("1 pack B (helion)", lambda: pack_b_panels_bf16(b3))
         packed_matmul_ms = benchmark(
-            "Helion packed matmul",
-            lambda: matmul_bf16_packed_b_mlir(a, packed_b),
+            "2 matmul (helion)",
+            lambda: matmul_bf16_packed_b_mlir(a3, packed_b),
         )
+        unpack_ms = benchmark(
+            "3 unpack (eager)",
+            lambda: unpack_blocked(helion_blocked_result),
+        )
+        # Comparable with torch.mm: all three stages, result row-major [M, N].
         packed_total_ms = benchmark(
-            "Helion packed total",
-            lambda: matmul_bf16_packed_b_mlir(a, pack_b_panels_bf16(b3)),
+            "packed e2e (1+2+3)",
+            lambda: matmul_bf16_packed_end_to_end(a3, b3),
         )
         row_major_ms = benchmark("Helion row-major", lambda: matmul_bf16_mlir(a, b))
         eager_ms = benchmark("PyTorch eager", lambda: torch.mm(a, b))
 
     flops = 2 * SIZE**3
-    print(f"Helion pack B        {pack_ms:8.3f} ms")
-    print(f"Helion packed matmul {flops / (packed_matmul_ms * 1e6):8.1f} GFLOP/s")
-    print(f"Helion packed total  {flops / (packed_total_ms * 1e6):8.1f} GFLOP/s")
+    stage_sum_ms = pack_ms + packed_matmul_ms + unpack_ms
+    print(f"stage sum            {stage_sum_ms:8.3f} ms")
+    print(f"e2e minus stage sum  {packed_total_ms - stage_sum_ms:8.3f} ms (alloc/cold)")
+    print(f"matmul only          {flops / (packed_matmul_ms * 1e6):8.1f} GFLOP/s")
+    print(f"packed e2e           {flops / (packed_total_ms * 1e6):8.1f} GFLOP/s")
     print(f"Helion row-major     {flops / (row_major_ms * 1e6):8.1f} GFLOP/s")
     print(f"PyTorch eager        {flops / (eager_ms * 1e6):8.1f} GFLOP/s")
-    print(f"Packed / PyTorch     {eager_ms / packed_total_ms:8.3f}x")
+    print(f"packed e2e / PyTorch {eager_ms / packed_total_ms:8.3f}x")
 
 
 if __name__ == "__main__":
