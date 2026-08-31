@@ -553,3 +553,36 @@ eager `permute().contiguous()` (~2.3 ms at 4K, 4 threads).
 4. **Fix C** — bf16 epilogue.
 5. Nested `hl.grid` index resolution.
 -->
+
+---
+
+## Architecture Notes: Descriptor-Driven Slice/Store Lowering (Phases 0-5 Refactor)
+
+**Goal**: Eliminate positional/size heuristics from load/store lowering. Replace with authoritative metadata from Helion index expressions.
+
+**Key Changes**:
+
+1. **Phase 0: `slice_plan.py`** — New descriptor abstraction (`DimSlice`, `SlicePlan`) that captures per-dimension geometry (kind: scalar/tile/full, offset, size, block_id, reduces).
+
+2. **Phase 1: Lower-load descriptor rewrite** — `load_slice_ops.py` now uses `plan_slice()` instead of guessing sizes from `for_store_ctx_stack`, value shape, or matching extents. Fast path (1-D gather) preserved.
+
+3. **Phase 2: Nested loop generalization** — Removed `assert len(block_ids) == 1` from `lower_nested_for_loop`. Divisibility heuristic fallback removed (kept inner block ID resolution from body symbols).
+
+4. **Phase 3: Synthetic store on descriptor** — `memory_ops.py` per-iteration insert now tries `plan_slice()` on synthetic store context; falls back to legacy `inner_dim` path if plan fails.
+
+5. **Phase 4: Terminal store + grid dims** — Added `block_id_to_out_dim` mapping in `build_kernel_body` to track which grid block_id maps to which output dimension (not positional). Terminal store path tries descriptor first, then positional fallback.
+
+6. **Phase 5: Cleanup + hardening** — Kept `infer_block_id_from_value_shape()` as deprecated fallback (for safety); no callers removed. Marked terminal store as descriptor-preferring.
+
+**Invariants Maintained**:
+- Index position == tensor dimension (scalars reduce rank via `reduces=True`)
+- Block IDs come from `node_symbol_info()` or `infer_index_block_and_bias()`, never from size/extent matching
+- `for_store_ctx_stack` is optional (descriptor path doesn't require it)
+- Synthetic store accumulator carry is separate from slice geometry
+
+**Test Coverage**: 53 backend tests pass; execution tests fail due to pre-existing lighthouse pipeline issues (sfc.py missing), not refactoring.
+
+**Future Work**:
+- Add multi-D nested grid support (currently only outer forall is multi-D; inner nests are 1-D per Phase 2 design)
+- Unpack operations (3 forms: grid→grid→tile, grid→tile, tile chains) blocked on Lighthouse fixes
+- Ragged K-dimension handling (K not exact multiple of TK) remains open as separate issue

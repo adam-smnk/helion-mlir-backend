@@ -37,6 +37,7 @@ class BuildContext:
     block_hint_to_id: dict[int, int] = field(default_factory=dict)
     block_symint_to_id: dict[int, int] = field(default_factory=dict)
     block_id_to_upper_bound: dict[int, int] = field(default_factory=dict)
+    block_id_to_out_dim: dict[int, int] = field(default_factory=dict)
 
     block_id_to_iv: dict[int, ir.Value] = field(default_factory=dict)
     placeholder_dim_to_block_id: dict[tuple[int, int], int] = field(
