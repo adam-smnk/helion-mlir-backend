@@ -459,6 +459,97 @@ class TestExecuteMlir:
 
         assert _allclose(actual, src)
 
+    def test_scalar_grid_index_transpose_execute_mlir(self):
+        """``.transpose()`` on a value loaded via a scalar ``hl.grid`` index.
+
+        Exercises the ATen-helper prebuild path for a permute/transpose op
+        whose input is a scalar-index-reduced load (previously mismatched
+        rank against Helion's own tracked shape).
+        """
+
+        @helion.kernel(static_shapes=True)
+        def grid_load_transpose(src: torch.Tensor) -> torch.Tensor:
+            nb, m, n = src.shape
+            out = torch.empty((nb, n, m), dtype=src.dtype, device=src.device)
+            for i in hl.grid(nb):
+                out[i, :, :] = src[i, :, :].transpose(0, 1)
+            return out
+
+        torch.manual_seed(61)
+        src = torch.randn(3, 5, 7)
+        module = generate_mlir(
+            grid_load_transpose,
+            [src],
+            config=helion.Config(block_sizes=[1]),
+        )
+        actual = _backend().execute_mlir(module, src, kernel_name="grid_load_transpose")
+
+        assert _allclose(actual, src.transpose(1, 2))
+
+    def test_grid_combined_2d_tile_explicit_transpose_execute_mlir(self):
+        """``grid -> tile([a, b])`` with an explicit ``.permute()`` reconciling
+        a transposed store — the Helion-idiomatic way to write an unpack that
+        reorders dimensions between load and store (as opposed to relying on
+        differing index order, which is not valid Helion semantics)."""
+
+        @helion.kernel(static_shapes=True)
+        def unpack_combined_tile_transpose(src: torch.Tensor) -> torch.Tensor:
+            mb, np_, bm, bn = src.shape
+            out = torch.empty((mb, bm, np_, bn), dtype=src.dtype, device=src.device)
+            for m_block in hl.grid(mb):
+                for tm, tp in hl.tile([bm, np_]):
+                    loaded = src[m_block, tp, tm, :]
+                    out[m_block, tm, tp, :] = loaded.permute(1, 0, 2)
+            return out
+
+        torch.manual_seed(67)
+        src = torch.randn(2, 3, 4, 8)
+        module = generate_mlir(
+            unpack_combined_tile_transpose,
+            [src],
+            config=helion.Config(block_sizes=[1, 4, 1]),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="unpack_combined_tile_transpose"
+        )
+
+        assert _allclose(actual, src.permute(0, 2, 1, 3).contiguous())
+
+    def test_grid_combined_tile_separate_reduction_execute_mlir(self):
+        """``grid -> tile([m, n]) -> tile(k)`` batched matmul: the combined
+        tile's own loop node never carries an accumulator (Helion always
+        gives a reduction its own separate, single-block loop nested inside),
+        so this validates that pattern executes correctly end to end."""
+
+        @helion.kernel(static_shapes=True)
+        def batched_matmul_grid_combined_tile(
+            a: torch.Tensor, b: torch.Tensor
+        ) -> torch.Tensor:
+            nb, m, k = a.shape
+            _, k2, n = b.shape
+            out = torch.zeros((nb, m, n), dtype=torch.float32, device=a.device)
+            for i in hl.grid(nb):
+                for tm, tn in hl.tile([m, n]):
+                    acc = hl.zeros([tm, tn], dtype=torch.float32)
+                    for tk in hl.tile(k):
+                        acc = torch.addmm(acc, a[i, tm, tk], b[i, tk, tn])
+                    out[i, tm, tn] = acc
+            return out
+
+        torch.manual_seed(71)
+        a = torch.randn(2, 8, 8)
+        b = torch.randn(2, 8, 8)
+        module = generate_mlir(
+            batched_matmul_grid_combined_tile,
+            [a, b],
+            config=helion.Config(block_sizes=[1, 4, 4, 4]),
+        )
+        actual = _backend().execute_mlir(
+            module, a, b, kernel_name="batched_matmul_grid_combined_tile"
+        )
+
+        assert _allclose(actual, torch.bmm(a, b))
+
     @pytest.mark.parametrize("size", [64, 128])
     def test_packed_rhs_matmul_execute_mlir(self, size):
         """A packed RHS remains numerically correct through tiled matmul consumption."""

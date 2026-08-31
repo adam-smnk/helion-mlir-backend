@@ -525,6 +525,25 @@ def _resolve_fx_literal(node: torch.fx.Node) -> object:
     return _MISSING_LITERAL
 
 
+def _is_scalar_load_index(index_node: object) -> bool:
+    """Return whether a Helion load index denotes a scalar position.
+
+    A scalar position (grid index, ``tile.begin``/``tile.end``/``tile.id``, or
+    a literal int) drops that dimension from the loaded value's rank, same as
+    Helion's own ``node.meta['val']`` and ``ctx.is_scalar_index_node`` convention
+    used elsewhere. A tile index (``block_size_N`` key) or a full slice keeps
+    the dimension.
+    """
+    if isinstance(index_node, int):
+        return True
+    if not isinstance(index_node, torch.fx.Node):
+        return False
+    if getattr(index_node.target, "__name__", "") == "_get_symnode" and index_node.args:
+        key = index_node.args[0]
+        return not (isinstance(key, str) and key.startswith("block_size_"))
+    return False
+
+
 def _fake_tensor_from_load_node(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int],
@@ -583,6 +602,11 @@ def _fake_tensor_from_load_node(
         if dim >= len(src_shape):
             break
 
+        if _is_scalar_load_index(idx_node):
+            # Dropped from the result's rank, matching Helion's own
+            # rank-reduction convention (the load's real node.meta['val']).
+            continue
+
         extent = src_shape[dim]
         block_id = _block_id_from_load_index(idx_node, block_symint_to_id)
 
@@ -600,7 +624,7 @@ def _fake_tensor_from_load_node(
 
     if out_shape:
         return torch.zeros(out_shape, dtype=source.dtype)
-    return None
+    return torch.zeros([], dtype=source.dtype)
 
 
 def _evaluate_fake_aten_node(
