@@ -332,6 +332,17 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         block_ids = [block_id]
     else:
         if iter_arg_nodes:
+            # Defensive only: Helion's device IR never attaches a carried
+            # accumulator directly to a combined multi-dim tile's own
+            # ``_for_loop`` node (verified empirically) — every dimension in
+            # a combined ``hl.tile([a, b])`` is parallel by construction, and
+            # a genuine reduction always gets its own separate, single-block
+            # ``_for_loop`` nested inside (fully supported, see
+            # ``_find_descendant_store``). Host tensors read inside a
+            # combined tile are re-materialized via ``_host_tensor`` and never
+            # lifted as iter args either. If this ever fires, Helion's IR
+            # shape changed and the recursive emitter below needs to thread
+            # ``iter_arg_nodes`` through every level, not just the innermost.
             raise NodeLoweringError(
                 node,
                 reason=(
