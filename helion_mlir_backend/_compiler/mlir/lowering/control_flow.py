@@ -11,6 +11,62 @@ if TYPE_CHECKING:
     from ..build_context import BuildContext
 
 
+def _block_id_to_out_dim_from_terminal_store(
+    ctx: BuildContext, out_tensor: torch.Tensor
+) -> dict[int, int] | None:
+    """Find the store that writes the final output and map each of its index
+    positions to the block id it resolves to.
+
+    This is authoritative: a store's index position *is* the output
+    dimension, regardless of the declaration order of the enclosing loops
+    (e.g. ``out[tm, panel, :] = ...`` writes ``panel``'s block id to output
+    dimension 1 even though the ``panel`` loop is declared before ``tm``'s).
+    Returns ``None`` if no matching terminal store is found.
+    """
+    import torch
+    import torch.fx
+
+    out_shape = tuple(int(dim) for dim in out_tensor.shape)
+    sym_to_block_id = ctx.build_sym_to_block_id()
+
+    for graph_info in ctx.host_function.device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if getattr(node.target, "__name__", "") != "store":
+                continue
+            target_node = node.args[0]
+            target_meta = (
+                target_node.meta.get("val")
+                if isinstance(target_node, torch.fx.Node)
+                else None
+            )
+            if not isinstance(target_meta, torch.Tensor):
+                continue
+            if tuple(int(d) for d in target_meta.shape) != out_shape:
+                continue
+            index_nodes = node.args[1]
+            if not isinstance(index_nodes, (list, tuple)):
+                continue
+            if len(index_nodes) != len(out_shape):
+                continue
+
+            mapping: dict[int, int] = {}
+            for dim, index_node in enumerate(index_nodes):
+                if isinstance(index_node, slice):
+                    continue
+                block_id = ctx.infer_block_id_from_index(index_node, sym_to_block_id)
+                if block_id is None and ctx.is_scalar_index_node(index_node):
+                    info = ctx.node_symbol_info(index_node)
+                    if info is not None:
+                        block_id = info[0]
+                if block_id is not None:
+                    mapping[block_id] = dim
+            if mapping:
+                return mapping
+    return None
+
+
 def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
     """Build the outer ``scf.forall`` and its parallel insert terminator.
 
@@ -22,21 +78,27 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
 
     from ..support import torch_dtype_to_mlir
 
-    # Build mapping from block_id to output dimension. ``grid_block_ids`` groups
-    # block ids by the outer ``for`` statement that produced them (e.g. a single
-    # ``for tile_m, tile_n in hl.tile([m, n])`` yields one entry ``[0, 1]``), so
-    # the output dimension must advance per flattened block id, not per group,
-    # or every block id in a multi-dim statement collapses onto one dimension.
-    block_id_to_out_dim: dict[int, int] = {}
-    grid_block_ids_flat: list[int] = []
     out_shape = [int(dim) for dim in out_tensor.shape]
 
-    out_dim = 0
+    # ``grid_block_ids`` groups block ids by the outer ``for`` statement that
+    # produced them (e.g. a single ``for tile_m, tile_n in hl.tile([m, n])``
+    # yields one entry ``[0, 1]``), so the flattened list must advance per
+    # block id, not per group, or every block id in a multi-dim statement
+    # collapses onto one dimension.
+    grid_block_ids_flat: list[int] = []
     for ids in ctx.host_function.device_ir.grid_block_ids:
-        for block_id in ids:
-            block_id_to_out_dim[block_id] = out_dim
-            grid_block_ids_flat.append(block_id)
-            out_dim += 1
+        grid_block_ids_flat.extend(ids)
+
+    # Prefer the authoritative mapping derived from the terminal store's own
+    # index expression: loop declaration order does not necessarily match the
+    # order block ids are indexed in the output (e.g. ``out[tm, panel, :]``
+    # with ``panel``'s loop declared before ``tm``'s). Fall back to loop
+    # declaration order only if no matching terminal store is found.
+    block_id_to_out_dim = _block_id_to_out_dim_from_terminal_store(ctx, out_tensor)
+    if block_id_to_out_dim is None:
+        block_id_to_out_dim = {
+            block_id: out_dim for out_dim, block_id in enumerate(grid_block_ids_flat)
+        }
 
     # Store mapping in context for terminal store lowering.
     ctx.block_id_to_out_dim = block_id_to_out_dim

@@ -374,6 +374,34 @@ class TestExecuteMlir:
             b.view(64, 2, 32).permute(1, 0, 2).contiguous(),
         )
 
+    def test_unpack_grid_tile_reordered_store_execute_mlir(self):
+        """Store index order can differ from loop declaration order.
+
+        ``out[tm, panel, :]`` writes the tile index before the grid index even
+        though the grid loop is declared first; the grid block id must still
+        land on output dimension 1 (not 0).
+        """
+
+        @helion.kernel(static_shapes=True)
+        def unpack_panels(src: torch.Tensor) -> torch.Tensor:
+            n_panels, m, bn = src.shape
+            out = torch.empty((m, n_panels, bn), dtype=src.dtype, device=src.device)
+            for panel in hl.grid(n_panels):
+                for tm in hl.tile(m):
+                    out[tm, panel, :] = src[panel, tm, :]
+            return out
+
+        torch.manual_seed(37)
+        src = torch.randn(3, 8, 8)
+        module = generate_mlir(
+            unpack_panels,
+            [src],
+            config=helion.Config(block_sizes=[1, 4]),
+        )
+        actual = _backend().execute_mlir(module, src, kernel_name="unpack_panels")
+
+        assert _allclose(actual, src.permute(1, 0, 2).contiguous())
+
     @pytest.mark.parametrize("size", [64, 128])
     def test_packed_rhs_matmul_execute_mlir(self, size):
         """A packed RHS remains numerically correct through tiled matmul consumption."""
