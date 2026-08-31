@@ -59,8 +59,40 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
         context = ctx.for_store_ctx_stack[-1]
         current = context.get("current")
         block_id = int(context.get("block_id", -1))
-        inner_dim = int(context.get("inner_dim", -1))
         rank = int(context.get("rank", ndim))
+
+        # Try to use store_plan if available; compute on first use.
+        store_plan = context.get("store_plan")
+        if store_plan is None and current is not None:
+            from .slice_plan import plan_slice
+
+            target_type = ir.RankedTensorType(current.type)
+            try:
+                store_plan = plan_slice(ctx, index_nodes, target_type)
+                context["store_plan"] = store_plan
+            except Exception:
+                # Fallback: plan_slice failed, use legacy inner_dim path
+                store_plan = None
+
+        if store_plan is not None and current is not None:
+            # Descriptor-based per-iteration insert.
+            offsets = store_plan.offsets()
+            static_sizes = store_plan.static_sizes()
+            updated = tensor_d.InsertSliceOp(
+                value,
+                current,
+                offsets,
+                [],
+                [],
+                static_offsets=[ir.ShapedType.get_dynamic_size()] * len(offsets),
+                static_sizes=static_sizes,
+                static_strides=[1] * len(offsets),
+            ).result
+            context["current"] = updated
+            return
+
+        # Fallback to legacy inner_dim path if plan_slice not available.
+        inner_dim = int(context.get("inner_dim", -1))
         if (
             current is not None
             and 0 <= inner_dim < rank
@@ -95,6 +127,23 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
             return
 
     sym_to_block_id = ctx.build_sym_to_block_id()
+
+    # Try descriptor-based terminal store path first.
+    if target_value is not None:
+        try:
+            from .slice_plan import plan_slice
+
+            target_type = ir.RankedTensorType(target_value.type)
+            store_plan = plan_slice(ctx, index_nodes, target_type)
+            offsets = store_plan.offsets()
+            static_sizes = store_plan.static_sizes()
+            ctx.forall_insert_slices.append((value, offsets, static_sizes))
+            return
+        except Exception:
+            # Fall through to positional approach if plan_slice fails.
+            pass
+
+    # Fallback: positional heuristic-based terminal store.
     offsets: list[ir.Value] = []
     static_sizes: list[int] = []
     value_shape = list(ir.RankedTensorType(value.type).shape)

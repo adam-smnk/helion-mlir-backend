@@ -12,23 +12,43 @@ if TYPE_CHECKING:
 
 
 def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
-    """Build the outer ``scf.forall`` and its parallel insert terminator."""
+    """Build the outer ``scf.forall`` and its parallel insert terminator.
+
+    Maps each grid block_id to its actual destination dimension (not just positional).
+    """
     from mlir.dialects import scf as scf_d
     from mlir.dialects import tensor as tensor_d
     import mlir.ir as ir
 
     from ..support import torch_dtype_to_mlir
 
-    grid_block_ids: list[int] = []
-    for ids in ctx.host_function.device_ir.grid_block_ids:
-        grid_block_ids.extend(ids)
-
+    # Build mapping from block_id to output dimension. ``grid_block_ids`` groups
+    # block ids by the outer ``for`` statement that produced them (e.g. a single
+    # ``for tile_m, tile_n in hl.tile([m, n])`` yields one entry ``[0, 1]``), so
+    # the output dimension must advance per flattened block id, not per group,
+    # or every block id in a multi-dim statement collapses onto one dimension.
+    block_id_to_out_dim: dict[int, int] = {}
+    grid_block_ids_flat: list[int] = []
     out_shape = [int(dim) for dim in out_tensor.shape]
-    lbs = [0] * len(grid_block_ids)
-    ubs = [out_shape[index] for index in range(len(grid_block_ids))]
-    steps = [ctx.block_id_to_size[block_id] for block_id in grid_block_ids]
 
-    for block_id, upper_bound in zip(grid_block_ids, ubs, strict=False):
+    out_dim = 0
+    for ids in ctx.host_function.device_ir.grid_block_ids:
+        for block_id in ids:
+            block_id_to_out_dim[block_id] = out_dim
+            grid_block_ids_flat.append(block_id)
+            out_dim += 1
+
+    # Store mapping in context for terminal store lowering.
+    ctx.block_id_to_out_dim = block_id_to_out_dim
+
+    lbs = [0] * len(grid_block_ids_flat)
+    ubs = [
+        out_shape[block_id_to_out_dim.get(bid, idx)]
+        for idx, bid in enumerate(grid_block_ids_flat)
+    ]
+    steps = [ctx.block_id_to_size[block_id] for block_id in grid_block_ids_flat]
+
+    for block_id, upper_bound in zip(grid_block_ids_flat, ubs, strict=False):
         previous = ctx.block_id_to_upper_bound.get(block_id)
         if previous is None:
             ctx.block_id_to_upper_bound[block_id] = int(upper_bound)
@@ -42,7 +62,7 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
     forall = scf_d.ForallOp(lbs, ubs, steps, shared_outs=[output_empty])
 
     for block_id, induction_variable in zip(
-        grid_block_ids,
+        grid_block_ids_flat,
         forall.induction_variables,
         strict=True,
     ):
@@ -142,22 +162,6 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         )
         if len(body_block_ids) == 1:
             block_id = next(iter(body_block_ids))
-        elif not body_block_ids:
-            candidates = [
-                bid
-                for bid, size in ctx.block_id_to_size.items()
-                if bid not in ctx.block_id_to_iv
-                and size > 0
-                and ub_static is not None
-                and ub_static % size == 0
-            ]
-            if candidates:
-                largest = max(ctx.block_id_to_size[bid] for bid in candidates)
-                tied = [
-                    bid for bid in candidates if ctx.block_id_to_size[bid] == largest
-                ]
-                if len(tied) == 1:
-                    block_id = tied[0]
     body_scalar_kinds = {
         info[1]
         for body_node in body_graph.nodes

@@ -97,6 +97,27 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_shared_mlir_context: ir.Context | None = None
+
+
+def _get_shared_mlir_context() -> ir.Context:
+    """Return a process-wide ``mlir.ir.Context``, created lazily on first use.
+
+    Constructing a fresh ``ir.Context()`` per compile is unsafe: the native
+    bindings spawn a background thread pool and load every dialect on each
+    construction, and repeated create/destroy cycles across kernel compiles
+    (e.g. one process compiling many configs) have been observed to segfault
+    when a still-shutting-down context's threads race with a newly
+    constructed one. MLIR contexts are designed to host many independent
+    modules, so reusing a single one for the process avoids the race.
+    """
+    global _shared_mlir_context
+    if _shared_mlir_context is None:
+        import mlir.ir as ir
+
+        _shared_mlir_context = ir.Context()
+    return _shared_mlir_context
+
 
 class MLIRModuleBuilder:
     """Builds an ``mlir.ir.Module`` from a compiled :class:`HostFunction`.
@@ -129,7 +150,7 @@ class MLIRModuleBuilder:
         import mlir.ir as ir
 
         try:
-            ctx = ir.Context()
+            ctx = _get_shared_mlir_context()
             from mlir.dialects import arith as arith_d  # noqa: F401
             from mlir.dialects import func as func_d  # noqa: F401
             from mlir.dialects import linalg as linalg_d  # noqa: F401
