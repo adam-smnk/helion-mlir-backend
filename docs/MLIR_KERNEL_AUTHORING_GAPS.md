@@ -580,9 +580,16 @@ eager `permute().contiguous()` (~2.3 ms at 4K, 4 threads).
 - `for_store_ctx_stack` is optional (descriptor path doesn't require it)
 - Synthetic store accumulator carry is separate from slice geometry
 
-**Test Coverage**: 53 backend tests pass; execution tests fail due to pre-existing lighthouse pipeline issues (sfc.py missing), not refactoring.
+**Test Coverage**: 126/126 tests pass (`uv run pytest`, `HELION_MLIR_PIPELINE` unset — that env var switches to the AMX vectorizing `pipeline.yaml`, which is for the bf16 matmul benchmark scripts only, not general kernels).
 
-**Future Work**:
-- Add multi-D nested grid support (currently only outer forall is multi-D; inner nests are 1-D per Phase 2 design)
-- Unpack operations (3 forms: grid→grid→tile, grid→tile, tile chains) blocked on Lighthouse fixes
-- Ragged K-dimension handling (K not exact multiple of TK) remains open as separate issue
+**Post-refactor bug fixes** (found via crash/correctness triage, not part of the original 6 phases):
+- `codegen.py` reused a fresh `mlir.ir.Context()` per compile; rapid create/destroy across kernel configs raced the native context's background thread pool and corrupted the heap. Fixed by sharing one process-wide `Context` (standard MLIR usage: one context, many modules).
+- `slice_plan.py`'s `plan_slice()` used the absolute block/tile induction variable as the offset even when the base tensor's dimension had already been reduced to one local tile (e.g. a synthetic per-iteration accumulator), writing out of bounds. Fixed: offset is forced to 0 whenever the base extent equals exactly one tile's size.
+- `control_flow.py`'s `block_id_to_out_dim` mapping assumed grid-block ids map to output dimensions in loop-declaration order. Two bugs from that assumption: (1) a single `hl.tile([m, n])` statement produces one `grid_block_ids` group containing both block ids, which all collapsed onto one output dimension; (2) the store's index order can differ from loop declaration order (e.g. `out[tm, panel, :]` with the `panel` loop declared first). Fixed by deriving the mapping from the actual terminal store's index expression (authoritative), falling back to flattened loop order only if no matching store is found.
+
+**Future Work / remaining gaps**:
+- **Unpack operations** — of the 3 originally-planned forms:
+  - `grid(np) → tile(m)`, including reordered store indices (`out[tm, panel, :]`) — **now works**, covered by `test_unpack_grid_tile_reordered_store_execute_mlir`.
+  - `grid(mb) → grid(np) → tile(bm)` (3 levels deep) — still fails (`ValueNotFoundError: invalid block key`) resolving the innermost tile's block symbol; a real gap in how nested `_for_loop` bodies inherit block-id context 3 levels deep, not a Lighthouse issue.
+  - `grid(mb) → tile([bm, np])` (grid + a single combined 2D tile) — still fails: `lower_nested_for_loop`'s `assert len(block_ids) == 1` rejects a single loop node carrying 2 block ids. Generalizing this to emit nested `scf.for` per block id was attempted once and reverted as too complex/risky; still open.
+- Ragged K-dimension handling (K not exact multiple of TK) remains open as a separate issue.
