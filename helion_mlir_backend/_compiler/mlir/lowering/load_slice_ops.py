@@ -50,19 +50,55 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
 
     plan = plan_slice(ctx, index_nodes, tensor_type)
 
-    # Compute the result shape (scalar-indexed dimensions are dropped).
-    result_shape = plan.value_shape()
-    if not result_shape:
-        result_shape = [1]
-
-    result_type = ir.RankedTensorType.get(result_shape, tensor_type.element_type)
-    return tensor_d.ExtractSliceOp(
-        result_type,
+    # Extract at full rank (no rank reduction at the op level): letting MLIR
+    # infer which size-1 dims to drop from static_sizes alone is ambiguous
+    # whenever a *kept* (non-reduced) dim also happens to have extent 1 (a
+    # tile whose block size is 1), which can trigger a native assertion.
+    # Instead, always keep every dim here, then explicitly collapse only the
+    # scalar-indexed (``reduces``) dims via a reassociation map, which is
+    # unambiguous because it names dims by position, not by size.
+    full_shape = plan.static_sizes()
+    full_type = ir.RankedTensorType.get(full_shape, tensor_type.element_type)
+    extracted = tensor_d.ExtractSliceOp(
+        full_type,
         tensor_value,
         plan.offsets(),
         [],
         [],
         static_offsets=[ir.ShapedType.get_dynamic_size()] * len(plan.dims),
-        static_sizes=plan.static_sizes(),
+        static_sizes=full_shape,
         static_strides=[1] * len(plan.dims),
     ).result
+
+    reduced_dims = set(plan.reduced_dims())
+    if not reduced_dims:
+        return extracted
+
+    result_shape = plan.value_shape()
+    if not result_shape:
+        result_shape = [1]
+    result_type = ir.RankedTensorType.get(result_shape, tensor_type.element_type)
+    reassociation = _collapse_reassociation(len(full_shape), reduced_dims)
+    return tensor_d.CollapseShapeOp(result_type, extracted, reassociation).result
+
+
+def _collapse_reassociation(rank: int, reduced_dims: set[int]) -> list[list[int]]:
+    """Build a ``tensor.collapse_shape`` reassociation dropping ``reduced_dims``.
+
+    Each reduced (guaranteed extent-1) dim is merged into the nearest kept
+    dim's group, preferring the next kept dim to its right, falling back to
+    the previous one. Unambiguous by construction (explicit index grouping,
+    not size-based inference).
+    """
+    kept = [d for d in range(rank) if d not in reduced_dims]
+    if not kept:
+        return [list(range(rank))]
+    groups: dict[int, list[int]] = {k: [k] for k in kept}
+    for d in range(rank):
+        if d not in reduced_dims:
+            continue
+        target = next((k for k in kept if k > d), None)
+        if target is None:
+            target = max(k for k in kept if k < d)
+        groups[target].append(d)
+    return [sorted(groups[k]) for k in sorted(groups)]

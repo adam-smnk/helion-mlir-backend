@@ -155,8 +155,220 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
     return forall.results[0]
 
 
+def _find_reused_block_id(
+    ctx: BuildContext, graph: torch.fx.Graph, max_depth: int = 8
+) -> int | None:
+    """Resolve the single new block id introduced by a loop whose ``_for_loop``
+    node reused an already-mapped (outer) block id.
+
+    Helion can nest several loop levels between the reused id's introduction
+    and the level whose real identity we need (e.g. ``grid -> grid -> tile``
+    3+ levels deep), so the body at this exact level may be a pure wrapper —
+    nothing but one further ``_for_loop`` call. Unwrap those wrapper levels
+    one at a time until a body with actual scalar symbol references is found.
+    Returns ``None`` if no single unambiguous candidate is found.
+    """
+    device_ir = ctx.host_function.device_ir
+    current_graph = graph
+    for _ in range(max_depth):
+        candidates = {
+            info[0]
+            for body_node in current_graph.nodes
+            if (info := ctx.node_symbol_info(body_node)) is not None
+            and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
+            and info[0] not in ctx.block_id_to_iv
+        }
+        if candidates:
+            return next(iter(candidates)) if len(candidates) == 1 else None
+        call_nodes = [n for n in current_graph.nodes if n.op == "call_function"]
+        if (
+            len(call_nodes) == 1
+            and getattr(call_nodes[0].target, "__name__", "") == "_for_loop"
+        ):
+            current_graph = device_ir.graphs[call_nodes[0].args[0]].graph
+            continue
+        break
+    return None
+
+
+def _find_descendant_store(
+    ctx: BuildContext, graph: torch.fx.Graph, max_depth: int = 16
+) -> torch.fx.Node | None:
+    """DFS through nested ``_for_loop`` bodies for the first ``store`` call.
+
+    Scoped to true descendants of ``graph`` only (unlike a global scan over
+    every graph), so it is safe to use for detecting whether an intermediate
+    loop level with no store of its own (a pure pass-through, e.g. the
+    middle loop of ``grid -> grid -> tile``) must thread an accumulator down
+    to a deeper level that does have one. Works to arbitrary nesting depth.
+    """
+    device_ir = ctx.host_function.device_ir
+    stack: list[tuple[torch.fx.Graph, int]] = [(graph, 0)]
+    while stack:
+        current_graph, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        for graph_node in current_graph.nodes:
+            if (
+                graph_node.op == "call_function"
+                and getattr(graph_node.target, "__name__", "") == "store"
+            ):
+                return graph_node
+        for graph_node in current_graph.nodes:
+            if (
+                graph_node.op == "call_function"
+                and getattr(graph_node.target, "__name__", "") == "_for_loop"
+            ):
+                stack.append((device_ir.graphs[graph_node.args[0]].graph, depth + 1))
+    return None
+
+
+def _resolve_multi_block_ids(
+    ctx: BuildContext,
+    body_graph: torch.fx.Graph,
+    block_ids: list[int],
+    upper_bounds: list,
+) -> list[int]:
+    """Disambiguate reused block ids on a combined multi-dim ``_for_loop`` node.
+
+    A single ``for tm, tp in hl.tile([bm, np])`` statement produces one
+    ``_for_loop`` node whose ``block_ids`` can all be the same reused
+    placeholder id, with the real per-dimension identities living in the
+    body's own tile symbols. Since several new dimensions are introduced at
+    once here, disambiguate by matching each dimension's declared upper
+    bound against each candidate block's real size hint.
+    """
+    from ..support import block_id_from_key
+
+    candidates = {
+        info[0]
+        for body_node in body_graph.nodes
+        if (info := ctx.node_symbol_info(body_node)) is not None
+        and info[0] not in ctx.block_id_to_iv
+    }
+    candidates.update(
+        cand_id
+        for body_node in body_graph.nodes
+        if getattr(body_node.target, "__name__", "") == "_get_symnode"
+        and body_node.args
+        and (cand_id := block_id_from_key(body_node.args[0])) is not None
+        and cand_id not in ctx.block_id_to_iv
+    )
+    remaining = set(candidates)
+    resolved: list[int] = []
+    for bid, ub in zip(block_ids, upper_bounds, strict=True):
+        if bid in remaining:
+            resolved.append(bid)
+            remaining.discard(bid)
+            continue
+        ub_static = ub if isinstance(ub, int) else None
+        match: int | None = None
+        if ub_static is not None:
+            for cand in remaining:
+                block_info = next(
+                    (b for b in ctx.env.block_sizes if b.block_id == cand), None
+                )
+                if block_info is None:
+                    continue
+                try:
+                    if int(block_info.size_hint()) == ub_static:
+                        match = cand
+                        break
+                except Exception:
+                    continue
+        if match is None and remaining:
+            match = next(iter(remaining))
+        resolved.append(match if match is not None else bid)
+        if match is not None:
+            remaining.discard(match)
+    return resolved
+
+
 def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
-    """Lower a single-dimension nested scf.for loop with optional synthetic store."""
+    """Lower a (possibly multi-dimensional) nested scf.for loop with optional
+    synthetic store, recursing one ``scf.for`` per block id to arbitrary depth.
+    """
+    from ..support import NodeLoweringError
+    from ..support import block_id_from_key
+
+    body_graph_id = node.args[0]
+    block_ids = list(node.args[1])
+    upper_bounds = list(node.args[2])
+    iter_arg_nodes = list(node.args[3])
+    assert len(block_ids) == len(upper_bounds)
+    body_graph_info = ctx.host_function.device_ir.graphs[body_graph_id]
+    body_graph = body_graph_info.graph
+
+    if len(block_ids) == 1:
+        block_id = block_ids[0]
+        # Helion can reuse the enclosing grid block id on a nested loop node.
+        # The body still contains the inner scalar symbol, whose origin is
+        # authoritative.
+        if block_id in ctx.block_id_to_iv:
+            body_block_ids = {
+                info[0]
+                for body_node in body_graph.nodes
+                if (info := ctx.node_symbol_info(body_node)) is not None
+                and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
+                and info[0] not in ctx.block_id_to_iv
+            }
+            body_block_ids.update(
+                body_block_id
+                for body_node in body_graph.nodes
+                if getattr(body_node.target, "__name__", "") == "_get_symnode"
+                and body_node.args
+                and (body_block_id := block_id_from_key(body_node.args[0])) is not None
+                and body_block_id not in ctx.block_id_to_iv
+            )
+            if len(body_block_ids) == 1:
+                block_id = next(iter(body_block_ids))
+            elif not body_block_ids:
+                # Direct body is a pure wrapper with no symbols at this level
+                # (loop nested 3+ levels deep); unwrap further nested
+                # ``_for_loop`` wrappers to find the block id introduced here.
+                resolved = _find_reused_block_id(ctx, body_graph)
+                if resolved is not None:
+                    block_id = resolved
+        block_ids = [block_id]
+    else:
+        if iter_arg_nodes:
+            raise NodeLoweringError(
+                node,
+                reason=(
+                    "Combined multi-dimensional tile loops with an external "
+                    "loop-carried accumulator are not supported"
+                ),
+                recovery_hint=(
+                    "Split the combined hl.tile([...]) into separate nested "
+                    "hl.tile() loops, or move the accumulator to an inner loop"
+                ),
+            )
+        block_ids = _resolve_multi_block_ids(ctx, body_graph, block_ids, upper_bounds)
+
+    return _emit_for_loop_level(
+        ctx, node, body_graph, block_ids, upper_bounds, iter_arg_nodes, 0
+    )
+
+
+def _emit_for_loop_level(
+    ctx: BuildContext,
+    node: torch.fx.Node,
+    body_graph: torch.fx.Graph,
+    block_ids: list[int],
+    upper_bounds: list,
+    iter_arg_nodes: list,
+    level: int,
+) -> ir.Value:
+    """Emit one ``scf.for`` for ``block_ids[level]``.
+
+    Only the innermost level (``level == len(block_ids) - 1``) actually
+    lowers ``body_graph``'s content; outer levels recurse into the next
+    level and thread that level's synthetic accumulator (if any) through via
+    ``ctx.push_store_ctx``, exactly like naturally-nested ``_for_loop`` FX
+    nodes already do (see ``_find_descendant_store``). This lets a single
+    multi-dimensional ``_for_loop`` node (e.g. combined ``hl.tile([m, n])``)
+    lower to nested ``scf.for`` loops, one per dimension.
+    """
     from mlir.dialects import arith as arith_d
     from mlir.dialects import linalg as linalg_d
     from mlir.dialects import scf as scf_d
@@ -166,16 +378,11 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     import torch.fx
 
     from ..support import NodeLoweringError
-    from ..support import block_id_from_key
     from ..support import torch_dtype_to_mlir
 
-    body_graph_id = node.args[0]
-    block_ids = list(node.args[1])
-    upper_bounds = list(node.args[2])
-    iter_arg_nodes = list(node.args[3])
-    assert len(block_ids) == 1 and len(upper_bounds) == 1
-    block_id = block_ids[0]
-    ub_src = upper_bounds[0]
+    block_id = block_ids[level]
+    ub_src = upper_bounds[level]
+    is_innermost = level == len(block_ids) - 1
     ub_static: int | None = None
     ub_val: ir.Value | None = None
     if isinstance(ub_src, int):
@@ -201,58 +408,49 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         )
     if ub_val is not None:
         ub_val = ctx.cast_to_index(ub_val)
-    body_graph_info = ctx.host_function.device_ir.graphs[body_graph_id]
-    body_graph = body_graph_info.graph
 
-    # Helion can reuse the enclosing grid block id on a nested loop node. The
-    # body still contains the inner scalar symbol, whose origin is authoritative.
-    if block_id in ctx.block_id_to_iv:
-        body_block_ids = {
-            info[0]
-            for body_node in body_graph.nodes
-            if (info := ctx.node_symbol_info(body_node)) is not None
-            and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
-            and info[0] not in ctx.block_id_to_iv
-        }
-        body_block_ids.update(
-            body_block_id
-            for body_node in body_graph.nodes
-            if getattr(body_node.target, "__name__", "") == "_get_symnode"
-            and body_node.args
-            and (body_block_id := block_id_from_key(body_node.args[0])) is not None
-            and body_block_id not in ctx.block_id_to_iv
-        )
-        if len(body_block_ids) == 1:
-            block_id = next(iter(body_block_ids))
     body_scalar_kinds = {
         info[1]
         for body_node in body_graph.nodes
         if (info := ctx.node_symbol_info(body_node)) is not None
     }
-    is_grid_loop = "grid" in body_scalar_kinds
+    # A pure-wrapper body (loop nested 3+ levels deep) has no direct symbol
+    # references to inspect, so also fall back to the block's own step size:
+    # grid loops always have unit step by construction.
+    is_grid_loop = (
+        "grid" in body_scalar_kinds or ctx.block_id_to_size.get(block_id) == 1
+    )
     step = ctx.block_id_to_size.get(block_id, ub_static if ub_static is not None else 1)
-    output_node = next(n for n in body_graph.nodes if n.op == "output")
-    out_args = output_node.args[0]
-    if not isinstance(out_args, (list, tuple)):
-        out_args = [out_args]
-    iter_pairs = [(a, ctx.get_value(a)) for a in iter_arg_nodes]
-    iter_pairs = [(a, v) for a, v in iter_pairs if v is not None]
-    carried_count = len(iter_pairs)
-    if 0 < len(out_args) <= len(iter_pairs):
-        carried_count = len(out_args)
-    invariant_pairs = iter_pairs[: len(iter_pairs) - carried_count]
-    carried_pairs = iter_pairs[len(iter_pairs) - carried_count :]
-    iter_init_vals = [v for _, v in carried_pairs]
+
+    if is_innermost:
+        output_node = next(n for n in body_graph.nodes if n.op == "output")
+        out_args = output_node.args[0]
+        if not isinstance(out_args, (list, tuple)):
+            out_args = [out_args]
+        iter_pairs = [(a, ctx.get_value(a)) for a in iter_arg_nodes]
+        iter_pairs = [(a, v) for a, v in iter_pairs if v is not None]
+        carried_count = len(iter_pairs)
+        if 0 < len(out_args) <= len(iter_pairs):
+            carried_count = len(out_args)
+        invariant_pairs = iter_pairs[: len(iter_pairs) - carried_count]
+        carried_pairs = iter_pairs[len(iter_pairs) - carried_count :]
+        iter_init_vals = [v for _, v in carried_pairs]
+    else:
+        out_args = []
+        invariant_pairs = []
+        carried_pairs = []
+        iter_init_vals = []
+
     active_outer_block_ids = set(ctx.block_id_to_iv.keys())
     synthetic_store_ctx: dict[str, object] | None = None
     synthetic_iter_index: int | None = None
-    store_nodes = [
-        n
-        for n in body_graph.nodes
-        if n.op == "call_function" and getattr(n.target, "__name__", "") == "store"
-    ]
-    if len(store_nodes) == 1:
-        store_node = store_nodes[0]
+    # ``body_graph`` is shared by every level of a combined multi-dim
+    # ``_for_loop`` node, and an intermediate level of a naturally-nested
+    # chain (e.g. the middle loop of ``grid -> grid -> tile``) has no store
+    # of its own; either way, searching descendants finds the store that
+    # this level's accumulator (if any) must eventually flush into.
+    store_node = _find_descendant_store(ctx, body_graph)
+    if store_node is not None:
         target_node = store_node.args[0]
         index_nodes = store_node.args[1]
         value_node = store_node.args[2]
@@ -355,8 +553,12 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                     ):
                         tile_shape.append(ctx.block_id_to_size[dim_bid])
                         flush_offsets.append(ctx.block_id_to_iv[dim_bid])
-                    elif not is_grid_loop and (
-                        fallback_outer_bid is not None
+                    elif (
+                        dim_bid is None
+                        and idx_node is not None
+                        and not isinstance(idx_node, slice)
+                        and not is_grid_loop
+                        and fallback_outer_bid is not None
                         and fallback_outer_bid in ctx.block_id_to_size
                     ):
                         tile_shape.append(ctx.block_id_to_size[fallback_outer_bid])
@@ -393,32 +595,61 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         ir.InsertionPoint(body_block),
         ctx.enter_for_loop(block_id, body_block.arguments[0]),
     ):
-        placeholders = [n for n in body_graph.nodes if n.op == "placeholder"]
-        if len(placeholders) > len(iter_pairs):
-            placeholders = placeholders[-len(iter_pairs) :]
-        invariant_placeholders = placeholders[: len(invariant_pairs)]
-        for ph_node, (_, inv_val) in zip(
-            invariant_placeholders, invariant_pairs, strict=False
-        ):
-            ctx.set_value(ph_node, inv_val)
-        carried_placeholders = placeholders[len(invariant_pairs) :]
-        for ph_node, body_arg in zip(
-            carried_placeholders, body_block.arguments[1:], strict=False
-        ):
-            ctx.set_value(ph_node, body_arg)
-        if synthetic_store_ctx is not None and synthetic_iter_index is not None:
-            synthetic_store_ctx["current"] = body_block.arguments[
-                1 + synthetic_iter_index
-            ]
-            with ctx.push_store_ctx(synthetic_store_ctx):
+        if is_innermost:
+            placeholders = [n for n in body_graph.nodes if n.op == "placeholder"]
+            if len(placeholders) > len(iter_pairs):
+                placeholders = placeholders[-len(iter_pairs) :]
+            invariant_placeholders = placeholders[: len(invariant_pairs)]
+            for ph_node, (_, inv_val) in zip(
+                invariant_placeholders, invariant_pairs, strict=False
+            ):
+                ctx.set_value(ph_node, inv_val)
+            carried_placeholders = placeholders[len(invariant_pairs) :]
+            for ph_node, body_arg in zip(
+                carried_placeholders,
+                body_block.arguments[1 : 1 + len(carried_pairs)],
+                strict=False,
+            ):
+                ctx.set_value(ph_node, body_arg)
+            if synthetic_store_ctx is not None and synthetic_iter_index is not None:
+                synthetic_store_ctx["current"] = body_block.arguments[
+                    1 + synthetic_iter_index
+                ]
+                with ctx.push_store_ctx(synthetic_store_ctx):
+                    ctx.lower_graph(body_graph)
+            else:
                 ctx.lower_graph(body_graph)
+            yield_vals = []
+            for a in out_args:
+                v = ctx.get_value(a) if isinstance(a, torch.fx.Node) else None
+                if v is not None:
+                    yield_vals.append(v)
         else:
-            ctx.lower_graph(body_graph)
-        yield_vals = []
-        for a in out_args:
-            v = ctx.get_value(a) if isinstance(a, torch.fx.Node) else None
-            if v is not None:
-                yield_vals.append(v)
+            if synthetic_store_ctx is not None and synthetic_iter_index is not None:
+                synthetic_store_ctx["current"] = body_block.arguments[
+                    1 + synthetic_iter_index
+                ]
+                with ctx.push_store_ctx(synthetic_store_ctx):
+                    _emit_for_loop_level(
+                        ctx,
+                        node,
+                        body_graph,
+                        block_ids,
+                        upper_bounds,
+                        iter_arg_nodes,
+                        level + 1,
+                    )
+            else:
+                _emit_for_loop_level(
+                    ctx,
+                    node,
+                    body_graph,
+                    block_ids,
+                    upper_bounds,
+                    iter_arg_nodes,
+                    level + 1,
+                )
+            yield_vals = []
         if synthetic_store_ctx is not None:
             current = synthetic_store_ctx.get("current")
             if current is not None:
@@ -457,6 +688,16 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                         ctx.index_const(0)
                         for _ in range(parent_type.rank - len(offsets))
                     )
+                # An ancestor's own induction variable is only a valid offset
+                # here if the parent accumulator's dimension actually spans
+                # its full range; if that dimension has already been reduced
+                # to a single local slot (size 1, e.g. a grid ancestor two or
+                # more levels up), the offset must be 0 or the insert goes
+                # out of bounds.
+                offsets = [
+                    ctx.index_const(0) if int(parent_type.shape[d]) == 1 else off
+                    for d, off in enumerate(offsets)
+                ]
                 updated = tensor_d.InsertSliceOp(
                     final_tile,
                     parent_current,

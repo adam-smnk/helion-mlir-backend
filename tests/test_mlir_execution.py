@@ -402,6 +402,63 @@ class TestExecuteMlir:
 
         assert _allclose(actual, src.permute(1, 0, 2).contiguous())
 
+    def test_unpack_triple_nested_grid_execute_mlir(self):
+        """``grid -> grid -> tile`` (3 levels deep) chains accumulators correctly.
+
+        Each level's synthetic accumulator must flush into its parent's at the
+        right offset, with ancestor dimensions already reduced to a single
+        local slot forced to offset 0 rather than an out-of-scope/absolute iv.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def unpack_triple_nested(src: torch.Tensor) -> torch.Tensor:
+            mb, np_, bm, bn = src.shape
+            out = torch.empty((mb, bm, np_, bn), dtype=src.dtype, device=src.device)
+            for m_block in hl.grid(mb):
+                for panel in hl.grid(np_):
+                    for tile_m in hl.tile(bm):
+                        out[m_block, tile_m, panel, :] = src[m_block, panel, tile_m, :]
+            return out
+
+        torch.manual_seed(53)
+        src = torch.randn(2, 3, 4, 8)
+        module = generate_mlir(
+            unpack_triple_nested,
+            [src],
+            config=helion.Config(block_sizes=[1, 1, 4]),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="unpack_triple_nested"
+        )
+
+        assert _allclose(actual, src.permute(0, 2, 1, 3).contiguous())
+
+    def test_grid_combined_2d_tile_execute_mlir(self):
+        """``grid -> tile([a, b])`` (one loop node, two block ids) lowers to
+        nested ``scf.for`` loops, one per combined tile dimension."""
+
+        @helion.kernel(static_shapes=True)
+        def copy_grid_combined_tile(src: torch.Tensor) -> torch.Tensor:
+            mb, np_, bm, bn = src.shape
+            out = torch.empty((mb, np_, bm, bn), dtype=src.dtype, device=src.device)
+            for m_block in hl.grid(mb):
+                for tp, tm in hl.tile([np_, bm]):
+                    out[m_block, tp, tm, :] = src[m_block, tp, tm, :]
+            return out
+
+        torch.manual_seed(59)
+        src = torch.randn(2, 3, 4, 8)
+        module = generate_mlir(
+            copy_grid_combined_tile,
+            [src],
+            config=helion.Config(block_sizes=[1, 4, 1]),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="copy_grid_combined_tile"
+        )
+
+        assert _allclose(actual, src)
+
     @pytest.mark.parametrize("size", [64, 128])
     def test_packed_rhs_matmul_execute_mlir(self, size):
         """A packed RHS remains numerically correct through tiled matmul consumption."""
