@@ -260,8 +260,11 @@ class TestScalarBlockIndices:
         ir_str = str(module)
 
         assert "scf.forall" in ir_str
-        # The scalar grid dimension is dropped from the loaded tile.
-        assert "tensor<4x32x32xf32> to tensor<32x32xf32>" in ir_str
+        # The scalar grid dimension is dropped from the loaded tile via an
+        # unambiguous rank-preserving extract followed by an explicit collapse
+        # (avoids MLIR's ambiguous same-size rank-reduction inference).
+        assert "tensor<4x32x32xf32> to tensor<1x32x32xf32>" in ir_str
+        assert "tensor<1x32x32xf32> into tensor<32x32xf32>" in ir_str
         assert "linalg.matmul" in ir_str
         # The store expands back to the full rank.
         assert "tensor<32x32xf32> into tensor<4x32x32xf32>" in ir_str
