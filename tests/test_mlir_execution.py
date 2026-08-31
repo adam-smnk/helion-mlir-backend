@@ -550,6 +550,204 @@ class TestExecuteMlir:
 
         assert _allclose(actual, torch.bmm(a, b))
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_unpack_grid_tile_reordered_store_dtypes(self, dtype):
+        """Reordered-store unpack (Form 2) stays correct across dtypes."""
+
+        @helion.kernel(static_shapes=True)
+        def unpack_panels_dtype(src: torch.Tensor) -> torch.Tensor:
+            n_panels, m, bn = src.shape
+            out = torch.empty((m, n_panels, bn), dtype=src.dtype, device=src.device)
+            for panel in hl.grid(n_panels):
+                for tm in hl.tile(m):
+                    out[tm, panel, :] = src[panel, tm, :]
+            return out
+
+        torch.manual_seed(73)
+        src = torch.randn(3, 8, 8).to(dtype)
+        module = generate_mlir(
+            unpack_panels_dtype,
+            [src],
+            config=helion.Config(block_sizes=[1, 4]),
+        )
+        actual = _backend().execute_mlir(module, src, kernel_name="unpack_panels_dtype")
+
+        assert _allclose(actual, src.permute(1, 0, 2).contiguous())
+
+    @pytest.mark.parametrize("shape", [(2, 3, 4, 8), (3, 2, 5, 6), (2, 4, 3, 7)])
+    def test_unpack_triple_nested_grid_shapes(self, shape):
+        """Triple-nested-grid unpack (Form 1) across non-uniform shapes."""
+
+        @helion.kernel(static_shapes=True)
+        def unpack_triple_nested_shape(src: torch.Tensor) -> torch.Tensor:
+            mb, np_, bm, bn = src.shape
+            out = torch.empty((mb, bm, np_, bn), dtype=src.dtype, device=src.device)
+            for m_block in hl.grid(mb):
+                for panel in hl.grid(np_):
+                    for tile_m in hl.tile(bm):
+                        out[m_block, tile_m, panel, :] = src[m_block, panel, tile_m, :]
+            return out
+
+        torch.manual_seed(sum(shape) + 100)
+        src = torch.randn(*shape)
+        module = generate_mlir(
+            unpack_triple_nested_shape,
+            [src],
+            config=helion.Config(block_sizes=[1, 1, 2]),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="unpack_triple_nested_shape"
+        )
+
+        assert _allclose(actual, src.permute(0, 2, 1, 3).contiguous())
+
+    @pytest.mark.parametrize(
+        "block_sizes",
+        [
+            [1, 4, 1],  # tm covers full extent in one shot, tp one-per-iteration
+            [1, 1, 3],  # tm one-per-iteration, tp covers full extent in one shot
+            [1, 2, 2],  # both dims iterate multiple times
+            [1, 8, 8],  # both dims larger than their extent (clamped)
+        ],
+    )
+    def test_grid_combined_2d_tile_block_sizes(self, block_sizes):
+        """Combined 2D tile (Form 3) stays correct across block-size configs
+        stressing the multi-block disambiguation and offset-clamping logic."""
+
+        @helion.kernel(static_shapes=True)
+        def copy_grid_combined_tile_bs(src: torch.Tensor) -> torch.Tensor:
+            mb, np_, bm, bn = src.shape
+            out = torch.empty((mb, np_, bm, bn), dtype=src.dtype, device=src.device)
+            for m_block in hl.grid(mb):
+                for tp, tm in hl.tile([np_, bm]):
+                    out[m_block, tp, tm, :] = src[m_block, tp, tm, :]
+            return out
+
+        torch.manual_seed(79)
+        src = torch.randn(2, 3, 4, 8)
+        module = generate_mlir(
+            copy_grid_combined_tile_bs,
+            [src],
+            config=helion.Config(block_sizes=block_sizes),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="copy_grid_combined_tile_bs"
+        )
+
+        assert _allclose(actual, src)
+
+    def test_grid_grid_combined_2d_tile_execute_mlir(self):
+        """``grid -> grid -> tile([a, b])``: arbitrary-depth recursion and
+        multi-block disambiguation stressed together in one kernel."""
+
+        @helion.kernel(static_shapes=True)
+        def copy_grid_grid_combined_tile(src: torch.Tensor) -> torch.Tensor:
+            mb, nb, bm, bn = src.shape
+            out = torch.empty((mb, nb, bm, bn), dtype=src.dtype, device=src.device)
+            for i in hl.grid(mb):
+                for j in hl.grid(nb):
+                    for tm, tn in hl.tile([bm, bn]):
+                        out[i, j, tm, tn] = src[i, j, tm, tn] + 1.0
+            return out
+
+        torch.manual_seed(83)
+        src = torch.randn(2, 3, 4, 5)
+        module = generate_mlir(
+            copy_grid_grid_combined_tile,
+            [src],
+            config=helion.Config(block_sizes=[1, 1, 2, 3]),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="copy_grid_grid_combined_tile"
+        )
+
+        assert _allclose(actual, src + 1.0)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_grid_combined_2d_tile_explicit_transpose_dtypes(self, dtype):
+        """Explicit-permute combined-tile unpack stays correct across dtypes."""
+
+        @helion.kernel(static_shapes=True)
+        def unpack_combined_tile_transpose_dtype(src: torch.Tensor) -> torch.Tensor:
+            mb, np_, bm, bn = src.shape
+            out = torch.empty((mb, bm, np_, bn), dtype=src.dtype, device=src.device)
+            for m_block in hl.grid(mb):
+                for tm, tp in hl.tile([bm, np_]):
+                    loaded = src[m_block, tp, tm, :]
+                    out[m_block, tm, tp, :] = loaded.permute(1, 0, 2)
+            return out
+
+        torch.manual_seed(89)
+        src = torch.randn(2, 3, 4, 8).to(dtype)
+        module = generate_mlir(
+            unpack_combined_tile_transpose_dtype,
+            [src],
+            config=helion.Config(block_sizes=[1, 4, 1]),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="unpack_combined_tile_transpose_dtype"
+        )
+
+        assert _allclose(actual, src.permute(0, 2, 1, 3).contiguous())
+
+    @pytest.mark.parametrize("shape", [(4, 6), (5, 3), (8, 8)])
+    def test_scalar_grid_index_transpose_shapes(self, shape):
+        """Grid-index-scoped transpose across non-square/square 2D tiles."""
+
+        @helion.kernel(static_shapes=True)
+        def grid_load_transpose_shape(src: torch.Tensor) -> torch.Tensor:
+            nb, m, n = src.shape
+            out = torch.empty((nb, n, m), dtype=src.dtype, device=src.device)
+            for i in hl.grid(nb):
+                out[i, :, :] = src[i, :, :].t()
+            return out
+
+        torch.manual_seed(sum(shape) + 200)
+        src = torch.randn(3, *shape)
+        module = generate_mlir(
+            grid_load_transpose_shape,
+            [src],
+            config=helion.Config(block_sizes=[1]),
+        )
+        actual = _backend().execute_mlir(
+            module, src, kernel_name="grid_load_transpose_shape"
+        )
+
+        assert _allclose(actual, src.transpose(1, 2))
+
+    @pytest.mark.parametrize(
+        "block_sizes",
+        [[1, 4, 4, 4], [1, 2, 2, 2], [1, 8, 8, 8]],
+    )
+    def test_grid_combined_tile_separate_reduction_block_sizes(self, block_sizes):
+        """Batched matmul via combined tile + separate reduction loop across
+        block-size configs (exact tiling, sub-tiling, and single-shot)."""
+
+        @helion.kernel(static_shapes=True)
+        def batched_matmul_bs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            nb, m, k = a.shape
+            _, k2, n = b.shape
+            out = torch.zeros((nb, m, n), dtype=torch.float32, device=a.device)
+            for i in hl.grid(nb):
+                for tm, tn in hl.tile([m, n]):
+                    acc = hl.zeros([tm, tn], dtype=torch.float32)
+                    for tk in hl.tile(k):
+                        acc = torch.addmm(acc, a[i, tm, tk], b[i, tk, tn])
+                    out[i, tm, tn] = acc
+            return out
+
+        torch.manual_seed(97)
+        a = torch.randn(2, 8, 8)
+        b = torch.randn(2, 8, 8)
+        module = generate_mlir(
+            batched_matmul_bs,
+            [a, b],
+            config=helion.Config(block_sizes=block_sizes),
+        )
+        actual = _backend().execute_mlir(module, a, b, kernel_name="batched_matmul_bs")
+
+        assert _allclose(actual, torch.bmm(a, b))
+
     @pytest.mark.parametrize("size", [64, 128])
     def test_packed_rhs_matmul_execute_mlir(self, size):
         """A packed RHS remains numerically correct through tiled matmul consumption."""
@@ -845,6 +1043,59 @@ class TestDirectCall:
         c = matmul_full_rhs_slice(a, b)
         assert torch.isfinite(c).all()
         assert _allclose(c, ref)
+
+    def test_unpack_combined_tile_transpose_direct(self):
+        """Direct call (full runtime pipeline, not generate_mlir+execute_mlir)
+        for a combined 2D tile with an explicit transpose reconciling the
+        store, matching the reordered-unpack pattern used in production."""
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[1, 4, 1]),
+        )
+        def unpack_combined_tile_transpose_direct(src: torch.Tensor) -> torch.Tensor:
+            mb, np_, bm, bn = src.shape
+            out = torch.empty((mb, bm, np_, bn), dtype=src.dtype, device=src.device)
+            for m_block in hl.grid(mb):
+                for tm, tp in hl.tile([bm, np_]):
+                    loaded = src[m_block, tp, tm, :]
+                    out[m_block, tm, tp, :] = loaded.permute(1, 0, 2)
+            return out
+
+        torch.manual_seed(103)
+        src = torch.randn(2, 3, 4, 8)
+        actual = unpack_combined_tile_transpose_direct(src)
+
+        assert _allclose(actual, src.permute(0, 2, 1, 3).contiguous())
+
+    def test_batched_matmul_combined_tile_direct(self):
+        """Direct call for grid + combined tile + separate reduction loop
+        (batched matmul), the realistic combined-tile-plus-accumulator case."""
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[1, 4, 4, 4]),
+        )
+        def batched_matmul_direct(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            nb, m, k = a.shape
+            _, k2, n = b.shape
+            out = torch.zeros((nb, m, n), dtype=torch.float32, device=a.device)
+            for i in hl.grid(nb):
+                for tm, tn in hl.tile([m, n]):
+                    acc = hl.zeros([tm, tn], dtype=torch.float32)
+                    for tk in hl.tile(k):
+                        acc = torch.addmm(acc, a[i, tm, tk], b[i, tk, tn])
+                    out[i, tm, tn] = acc
+            return out
+
+        torch.manual_seed(107)
+        a = torch.randn(2, 8, 8)
+        b = torch.randn(2, 8, 8)
+        actual = batched_matmul_direct(a, b)
+
+        assert _allclose(actual, torch.bmm(a, b))
 
 
 # ---------------------------------------------------------------------------
