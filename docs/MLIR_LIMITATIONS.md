@@ -10,7 +10,7 @@ This document lists current limitations for the MLIR backend in this repository.
   `tests/test_mlir_execution.py`, `tests/test_mlir_integration.py`,
   `tests/test_index_descriptor.py`, `tests/test_reduce_ops.py`, and
   `tests/test_property_kernels.py` (property-based fuzz coverage).
-- The current suite contains 162 passing tests.
+- The current suite contains 174 passing tests.
 - Both explicit generate-and-execute flow and direct backend="mlir" flow are exercised.
 - All example scripts under `examples/` are kept runnable and are re-verified
   after backend changes (`uv run python examples/<name>.py`).
@@ -146,10 +146,36 @@ Consequence:
   of several outputs (rather than first resolving to a plain SSA value that
   is then stored into multiple outputs, the common/supported pattern) raises
   `UnsupportedOperationError` ("multi-output store routing").
-- Multi-phase kernels (kernels using `hl.barrier()`) are not yet supported —
-  tracked as follow-up work.
 
-## 11) Backend Architecture Boundary
+## 11) Multi-Phase Kernels (`hl.barrier()`) and Host-Tensor Interop
+
+Current behavior:
+- Kernels using `hl.barrier()` between top-level `hl.tile()`/`hl.grid()` loops,
+  and kernels that read a host-computed tensor beyond their own declared
+  parameters (e.g. `scale = x.mean() * 100.0` then `hl.load(scale, [])`), are
+  supported -- but **only** through the direct `@helion.kernel(backend="mlir")`
+  call path, not through `generate_mlir()`/`execute_mlir()`.
+
+Why:
+- Each `hl.barrier()`-separated phase compiles to its own MLIR module/JIT'd
+  function. A real host-side "driver" (built from the kernel's own AST, with
+  device loops and barriers neutralized) runs between phase calls, threading
+  real tensors by host variable name -- this driver only exists on the direct
+  call path.
+
+Consequence:
+- `generate_mlir()`/`execute_mlir()` raise a clear `UnsupportedOperationError`
+  ("multi-phase or host-tensor-interop kernel") for such kernels, naming the
+  direct call path as the alternative.
+- A phase's output tensor must resolve to a plain host variable name (a
+  computed/expression origin is not yet supported).
+- The kernel's own final `return` must be a plain name or a tuple/list of
+  names (not an arbitrary expression).
+- Each phase is compiled as its own fully separate MLIR module (simpler and
+  safer than one shared multi-entry-point module); this is a compile-time-only
+  cost, cached per kernel/config like any other compile.
+
+## 12) Backend Architecture Boundary
 
 The MLIR backend is intentionally decoupled from `TritonBackend`. It inherits
 from Helion's backend-neutral `Backend` and bypasses Helion's Python AST codegen

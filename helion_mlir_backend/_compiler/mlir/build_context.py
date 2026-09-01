@@ -290,13 +290,34 @@ class BuildContext:
                 last_value = value
         return last_value
 
-    def lower_root_graphs(self, shared_out: ir.Value) -> ir.Value:
-        """Lower all root device graphs for the active forall body."""
+    def lower_root_graphs(
+        self, shared_out: ir.Value, root_ids: list[int] | None = None
+    ) -> ir.Value:
+        """Lower device root graphs (all of them, or an explicit subset --
+        e.g. one ``hl.barrier()``-separated phase's own roots) for the
+        active forall body. ``root_ids`` are real graph ids, not positions."""
         result = shared_out
-        for root_id in self.host_function.device_ir.root_ids:
+        ids = (
+            root_ids if root_ids is not None else self.host_function.device_ir.root_ids
+        )
+        for root_id in ids:
             graph = self.host_function.device_ir.graphs[root_id].graph
             result = self.lower_graph(graph) or result
         return result
+
+    def reset_for_new_function(self) -> None:
+        """Clear per-function state before building another ``func.func``.
+
+        Needed only when compiling more than one function against the same
+        ``BuildContext`` (one per phase): a previous function's parameter
+        bindings, induction variables, and pending inserts are SSA values
+        scoped to that function and must not leak into the next one.
+        """
+        self.param_to_value.clear()
+        self.block_id_to_iv.clear()
+        self.forall_insert_slices.clear()
+        self.for_store_ctx_stack.clear()
+        self.for_block_id_stack.clear()
 
     @contextmanager
     def enter_for_loop(

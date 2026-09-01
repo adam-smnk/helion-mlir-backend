@@ -7,14 +7,19 @@ This guide describes the current usage of the MLIR backend in this repository.
 - The backend is experimental, but it is not IR-only.
 - End-to-end CPU execution is supported through the lighthouse execution path.
 - Two user-facing flows are validated in tests:
-  - Explicit flow: generate MLIR then execute via backend API.
-  - Direct flow: call a kernel decorated with backend="mlir".
+  - Explicit flow: generate MLIR then execute via backend API (single-phase
+    kernels whose device loops reference only declared parameters).
+  - Direct flow: call a kernel decorated with backend="mlir" (also supports
+    `hl.barrier()` multi-phase kernels and host-tensor interop -- see
+    `docs/MLIR_LIMITATIONS.md` item 11).
 
 Reference tests are in `tests/test_mlir_backend.py`, `tests/test_mlir_execution.py`,
 `tests/test_mlir_integration.py`, `tests/test_index_descriptor.py`,
-`tests/test_reduce_ops.py`, and `tests/test_property_kernels.py` (currently 162
-tests across the MLIR test suite). Runnable usage examples also live under
-`examples/` at the repository root.
+`tests/test_reduce_ops.py`, `tests/test_property_kernels.py`,
+`tests/test_host_prefix.py`, `tests/test_phase_plan.py`, and
+`tests/test_multi_phase_execution.py` (currently 174 tests across the MLIR test
+suite). Runnable usage examples also live under `examples/` at the repository
+root.
 
 ## Recommended Environment
 

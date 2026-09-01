@@ -33,6 +33,47 @@ class OutputTensorResolver:
             )
         return outputs[0]
 
+    def resolve_all_in_graphs(
+        self,
+        graphs: list[torch.fx.Graph],
+        exclude_tensor_ids: set[int] | None = None,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Every distinct tensor written by a ``store`` within *graphs*.
+
+        Simplified relative to :meth:`resolve_all`: intended for a scoped
+        subset of the kernel's graphs (e.g. one ``hl.barrier()``-separated
+        phase's own root + nested loop-body graphs), where the whole-kernel
+        "device-IR output node" / "unique non-input parameter" precedence
+        steps don't apply. Excludes the kernel's own declared-parameter
+        tensors (or, if given, *exclude_tensor_ids* instead).
+        """
+        hf = self.host_function
+        if exclude_tensor_ids is None:
+            exclude_tensor_ids = {
+                id(value)
+                for value in hf.params.arguments.values()
+                if isinstance(value, torch.Tensor)
+            }
+        seen_ids: set[int] = set()
+        store_targets: list[torch.Tensor] = []
+        for graph in graphs:
+            for node in graph.nodes:
+                if (
+                    node.op == "call_function"
+                    and getattr(node.target, "__name__", "") == "store"
+                    and len(node.args) >= 1
+                    and isinstance(node.args[0], torch.fx.Node)
+                ):
+                    destination = node.args[0].meta.get("val")
+                    if (
+                        isinstance(destination, torch.Tensor)
+                        and id(destination) not in exclude_tensor_ids
+                        and id(destination) not in seen_ids
+                    ):
+                        seen_ids.add(id(destination))
+                        store_targets.append(destination)
+        return [("__store_target__", t) for t in store_targets]
+
     def resolve_all(
         self, tensor_params: list[tuple[str, torch.Tensor]]
     ) -> list[tuple[str, torch.Tensor]]:

@@ -71,6 +71,8 @@ Prerequisites before Phase 2 can land:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from dataclasses import field
 import logging
 from typing import TYPE_CHECKING
 
@@ -130,6 +132,22 @@ def _get_shared_mlir_context() -> ir.Context:
             )
         _shared_mlir_context = ir.Context()
     return _shared_mlir_context
+
+
+@dataclass
+class PhaseModuleResult:
+    """One compiled phase, ready for the direct-call driver to JIT and run.
+
+    ``input_names``/``output_names`` are host variable names, in the exact
+    order the phase's ``func.func`` expects its arguments/produces its
+    results -- the driver looks up real tensors by these names and binds
+    results back under ``output_names`` for later phases to consume.
+    """
+
+    name: str
+    module: ir.Module
+    input_names: list[str] = field(default_factory=list)
+    output_names: list[str] = field(default_factory=list)
 
 
 class MLIRModuleBuilder:
@@ -195,16 +213,187 @@ class MLIRModuleBuilder:
                 recovery_hint="Check that kernel has static_shapes=True and all ops are in hl.tile() loops",
             ) from exc
 
-    def _build_function(self) -> None:
+    def build_phase_modules(self) -> list[PhaseModuleResult]:
+        """Build one MLIR module per ``hl.barrier()``-separated phase.
+
+        Used only by the direct ``backend="mlir"`` driver path
+        (``bound_kernel.py::mlir_compile_config``) -- never by the public
+        ``generate_mlir()``/``execute_mlir()`` two-call flow, which keeps
+        using :meth:`build`'s single-module, single-phase-only contract.
+        """
         from mlir.dialects import func as func_d
         import mlir.ir as ir
+
+        from .lowering import build_kernel_body
+        from .phase_plan import build_phase_plans
+        from .phase_plan import find_extra_host_tensor_names
+        from .phase_plan import find_host_tensor_fake_value
+        from .phase_plan import iter_phase_graphs
+        from .phase_plan import resolve_host_variable_name
 
         tensor_params = [
             (name, value)
             for name, value in self.hf.params.arguments.items()
             if isinstance(value, torch.Tensor)
         ]
-        out_params = self._find_output_tensors(tensor_params)
+        declared_param_names = {name for name, _ in tensor_params}
+        extra_names = find_extra_host_tensor_names(self.hf, declared_param_names)
+        plans = build_phase_plans(self.hf, declared_param_names, extra_names)
+
+        name_to_fake: dict[str, torch.Tensor] = dict(tensor_params)
+        for name in extra_names:
+            fake = find_host_tensor_fake_value(self.hf, name)
+            if fake is not None:
+                name_to_fake[name] = fake
+
+        results: list[PhaseModuleResult] = []
+        try:
+            mlir_ctx = _get_shared_mlir_context()
+            from mlir.dialects import arith as arith_d  # noqa: F401
+            from mlir.dialects import linalg as linalg_d  # noqa: F401
+            from mlir.dialects import scf as scf_d  # noqa: F401
+            from mlir.dialects import tensor as tensor_d  # noqa: F401
+
+            with ir.Location.unknown(mlir_ctx), self.hf:
+                self._resolve_block_sizes()
+                self._resolve_block_upper_bounds()
+
+                for plan in plans:
+                    module = ir.Module.create()
+                    self.context.mlir_module = module
+                    self.context.mlir_context = mlir_ctx
+                    self._helper_table = AtenHelperTable(module)
+                    phase_name = f"{self.hf.name}__phase{plan.phase_index}"
+                    phase_graphs = iter_phase_graphs(self.hf, plan.root_ids)
+
+                    with ir.InsertionPoint(module.body):
+                        self._prebuild_aten_helpers(module, graphs=phase_graphs)
+
+                        input_types = [
+                            torch_tensor_to_mlir_type(name_to_fake[name])
+                            for name in plan.input_names
+                        ]
+                        output_types = [
+                            torch_tensor_to_mlir_type(tensor)
+                            for _, tensor in plan.outputs
+                        ]
+                        fn = func_d.FuncOp(
+                            phase_name, ir.FunctionType.get(input_types, output_types)
+                        )
+                        fn.attributes["sym_visibility"] = ir.StringAttr.get("public")
+                        entry = fn.add_entry_block()
+                        with ir.InsertionPoint(entry):
+                            self.context.reset_for_new_function()
+                            for name, arg in zip(
+                                plan.input_names, entry.arguments, strict=True
+                            ):
+                                self.context.param_to_value[name] = arg
+
+                            real_root_ids = [
+                                self.hf.device_ir.root_ids[pos] for pos in plan.root_ids
+                            ]
+                            scoped_groups = [
+                                self.hf.device_ir.grid_block_ids[pos]
+                                for pos in plan.root_ids
+                            ]
+                            result_vals = build_kernel_body(
+                                self.context,
+                                [tensor for _, tensor in plan.outputs],
+                                root_ids=real_root_ids,
+                                grid_block_id_groups=scoped_groups,
+                            )
+                            func_d.ReturnOp(result_vals)
+
+                    output_names: list[str] = []
+                    for _, tensor in plan.outputs:
+                        resolved = resolve_host_variable_name(self.hf, tensor)
+                        if resolved is None:
+                            raise UnsupportedOperationError(
+                                "unresolvable phase output name",
+                                reason=(
+                                    "a phase's output tensor must be bound to a "
+                                    "plain host-level variable name to be threaded "
+                                    "to a later phase or the kernel's return "
+                                    "statement"
+                                ),
+                            )
+                        name_to_fake[resolved] = tensor
+                        output_names.append(resolved)
+
+                    results.append(
+                        PhaseModuleResult(
+                            name=phase_name,
+                            module=module,
+                            input_names=list(plan.input_names),
+                            output_names=output_names,
+                        )
+                    )
+            return results
+        except (
+            ModuleBuilderError,
+            NodeLoweringError,
+            ValueNotFoundError,
+            UnsupportedOperationError,
+        ):
+            raise
+        except Exception as exc:
+            raise ModuleBuilderError(
+                "phase_module_creation",
+                reason=str(exc),
+                recovery_hint="Check that kernel has static_shapes=True and all ops are in hl.tile() loops",
+            ) from exc
+
+    def _build_function(self) -> None:
+        from .phase_plan import requires_multi_phase_driver
+        from .support import UnsupportedOperationError
+
+        tensor_params = [
+            (name, value)
+            for name, value in self.hf.params.arguments.items()
+            if isinstance(value, torch.Tensor)
+        ]
+        needs_driver, extra_names = requires_multi_phase_driver(self.hf, tensor_params)
+        multi_phase = len(self.hf.device_ir.phases) > 1
+
+        if not needs_driver:
+            out_params = self._find_output_tensors(tensor_params)
+            self._build_single_phase_function(tensor_params, out_params)
+            return
+
+        # Multi-phase (hl.barrier()) and/or host-tensor-interop kernels are
+        # only supported through the direct backend="mlir" call path (see
+        # bound_kernel.py::mlir_compile_config -> build_phase_modules()),
+        # which drives a real host-side wrapper between phases. This
+        # single-module entry point (generate_mlir()/execute_mlir()) has no
+        # such driver, so it can't supply extra host tensors or thread real
+        # values between phases.
+        if multi_phase:
+            reason = "this kernel uses hl.barrier() (multiple phases)"
+        else:
+            reason = (
+                f"this kernel depends on host tensor(s) {extra_names!r} not "
+                "in its declared parameters"
+            )
+        raise UnsupportedOperationError(
+            "multi-phase or host-tensor-interop kernel",
+            reason=(
+                f"{reason}; generate_mlir()/execute_mlir() only support "
+                "single-phase kernels whose device loops reference only "
+                "declared parameters"
+            ),
+            alternatives=[
+                "call the kernel directly via @helion.kernel(backend='mlir')"
+            ],
+        )
+
+    def _build_single_phase_function(
+        self,
+        tensor_params: list[tuple[str, torch.Tensor]],
+        out_params: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        from mlir.dialects import func as func_d
+        import mlir.ir as ir
+
         output_types = [torch_tensor_to_mlir_type(t) for _, t in out_params]
         out_names = {name for name, _ in out_params}
         out_tensor_ids = {id(t) for _, t in out_params}
@@ -645,11 +834,15 @@ class MLIRModuleBuilder:
     # ATen pre-pass: lower all ATen nodes before codegen starts
     # ------------------------------------------------------------------
 
-    def _prebuild_aten_helpers(self, module: ir.Module) -> None:
+    def _prebuild_aten_helpers(
+        self, module: ir.Module, graphs: list[torch.fx.Graph] | None = None
+    ) -> None:
         """Scan device IR for ATen nodes, lower them all via one torch-mlir pass.
 
         Results are stored in the context's ATen helper map and the helper
         ``func.func`` operations are inserted at the module's top level.
+        Scoped to *graphs* when given (e.g. one phase's own graphs, for
+        ``build_phase_modules``), otherwise scans the whole kernel's.
         """
         from .aten_bridge import aten_target_matches
         from .aten_lowering import is_aten_op
@@ -665,9 +858,14 @@ class MLIRModuleBuilder:
         restore_symbolic_shapes_in_bodies(self.hf, self.context)
         self._refresh_aten_tensor_meta()
 
+        search_graphs = (
+            graphs
+            if graphs is not None
+            else [gi.graph for gi in self.hf.device_ir.graphs]
+        )
         aten_nodes: list[torch.fx.Node] = []
-        for graph_info in self.hf.device_ir.graphs:
-            for node in graph_info.graph.nodes:
+        for graph in search_graphs:
+            for node in graph.nodes:
                 if is_aten_op(node):
                     if aten_target_matches(
                         node,
