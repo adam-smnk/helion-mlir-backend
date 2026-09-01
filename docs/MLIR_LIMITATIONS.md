@@ -10,7 +10,7 @@ This document lists current limitations for the MLIR backend in this repository.
   `tests/test_mlir_execution.py`, `tests/test_mlir_integration.py`,
   `tests/test_index_descriptor.py`, `tests/test_reduce_ops.py`, and
   `tests/test_property_kernels.py` (property-based fuzz coverage).
-- The current suite contains 160 passing tests.
+- The current suite contains 162 passing tests.
 - Both explicit generate-and-execute flow and direct backend="mlir" flow are exercised.
 - All example scripts under `examples/` are kept runnable and are re-verified
   after backend changes (`uv run python examples/<name>.py`).
@@ -122,21 +122,39 @@ Consequence:
 - Workaround: choose a block size that evenly divides the dimension, or
   restructure the loop so that dimension needs only one iteration.
 
-## 10) Multi-Output Kernels Are Not Supported
+## 10) Multi-Output Kernels: Supported Within a Single Phase/Iteration Space
 
 Current requirement:
-- A kernel must return a single tensor.
+- A kernel may `return out1, out2, ...` as long as every output tensor is
+  written by loop(s) sharing one implicit "phase" (no `hl.barrier()` between
+  their writers) AND all of that phase's top-level loops use the same
+  `scf.forall` iteration space (identical tiled dimensions/extents).
+
+Why:
+- Each output tensor gets its own `tensor.empty` + `shared_outs` entry in the
+  phase's single `scf.forall`; each store is routed to the matching entry by
+  destination-tensor identity. All outputs of one phase therefore share one
+  iteration space by construction.
 
 Consequence:
-- `return out1, out2` raises a clear `UnsupportedOperationError`
-  ("multi-output kernel") at compile time.
-- Workaround: split the kernel into separate single-output kernels.
+- `execute_mlir` returns a `list` of tensors (not a single tensor) whenever
+  there is more than one output.
+- Two independent top-level loops with **different** shapes (even without a
+  barrier) raise a clear `UnsupportedOperationError` ("independent top-level
+  loops with incompatible geometry") rather than miscompiling.
+- A synthetic nested-reduction accumulator that must itself be routed to one
+  of several outputs (rather than first resolving to a plain SSA value that
+  is then stored into multiple outputs, the common/supported pattern) raises
+  `UnsupportedOperationError` ("multi-output store routing").
+- Multi-phase kernels (kernels using `hl.barrier()`) are not yet supported —
+  tracked as follow-up work.
 
 ## 11) Backend Architecture Boundary
 
 The MLIR backend is intentionally decoupled from `TritonBackend`. It inherits
 from Helion's backend-neutral `Backend` and bypasses Helion's Python AST codegen
 and Triton cache-management path. The implementation is split into:
+
 
 - `lowering/` for operation and control-flow emission.
 - `aten_bridge/` for custom ATen handling and torch-mlir helper management.

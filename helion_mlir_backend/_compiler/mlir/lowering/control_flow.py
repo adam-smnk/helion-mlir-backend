@@ -57,8 +57,16 @@ def _block_id_to_out_dim_from_terminal_store(
     return None
 
 
-def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
+def build_kernel_body(
+    ctx: BuildContext, out_tensors: list[torch.Tensor]
+) -> list[ir.Value]:
     """Build the outer ``scf.forall`` and its parallel insert terminator.
+
+    ``out_tensors`` is every tensor the active phase writes (usually one; more
+    than one when a single phase stores into several distinct output
+    tensors). All of them share this forall's single iteration space, so
+    their tiled dimensions must agree -- see the shape-compatibility check
+    below.
 
     Maps each grid block_id to its actual destination dimension (not just positional).
     """
@@ -68,7 +76,8 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
 
     from ..support import torch_dtype_to_mlir
 
-    out_shape = [int(dim) for dim in out_tensor.shape]
+    primary_tensor = out_tensors[0]
+    out_shape = [int(dim) for dim in primary_tensor.shape]
 
     # ``grid_block_ids`` groups block ids by the outer ``for`` statement that
     # produced them (e.g. a single ``for tile_m, tile_n in hl.tile([m, n])``
@@ -93,11 +102,36 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
         }
 
     lbs = [0] * len(grid_block_ids_flat)
+    for idx, bid in enumerate(grid_block_ids_flat):
+        if block_id_to_out_dim.get(bid, idx) >= len(out_shape):
+            from ..support import UnsupportedOperationError
+
+            raise UnsupportedOperationError(
+                "independent top-level loops with incompatible geometry",
+                reason=(
+                    f"block_id {bid} needs output dimension "
+                    f"{block_id_to_out_dim.get(bid, idx)}, but the resolved "
+                    f"output tensor only has {len(out_shape)} dimension(s); "
+                    "this usually means two or more independent top-level "
+                    "hl.tile()/hl.grid() loops (not separated by hl.barrier()) "
+                    "iterate over incompatible shapes"
+                ),
+                alternatives=[
+                    "separate independent loops with hl.barrier()",
+                    (
+                        "ensure all top-level loops in one phase share the same "
+                        "iteration space"
+                    ),
+                ],
+            )
     ubs = [
         out_shape[block_id_to_out_dim.get(bid, idx)]
         for idx, bid in enumerate(grid_block_ids_flat)
     ]
     steps = [ctx.block_id_to_size[block_id] for block_id in grid_block_ids_flat]
+
+    if len(out_tensors) > 1:
+        _validate_multi_output_shapes(out_tensors, out_shape, block_id_to_out_dim)
 
     # The outer scf.forall emits one statically-sized extract/insert per
     # iteration (no per-iteration dynamic clamp for a ragged last tile), so a
@@ -139,11 +173,14 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
         else:
             ctx.block_id_to_upper_bound[block_id] = min(previous, int(upper_bound))
 
-    output_empty = tensor_d.EmptyOp(
-        out_shape,
-        torch_dtype_to_mlir(out_tensor.dtype),
-    ).result
-    forall = scf_d.ForallOp(lbs, ubs, steps, shared_outs=[output_empty])
+    output_emptys = [
+        tensor_d.EmptyOp(
+            [int(d) for d in tensor.shape],
+            torch_dtype_to_mlir(tensor.dtype),
+        ).result
+        for tensor in out_tensors
+    ]
+    forall = scf_d.ForallOp(lbs, ubs, steps, shared_outs=output_emptys)
 
     for block_id, induction_variable in zip(
         grid_block_ids_flat,
@@ -156,19 +193,46 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
         ctx.block_id_to_iv[block_id] = induction_variable
 
     with ir.InsertionPoint(forall.body):
-        shared_out = next(iter(forall.inner_iter_args))
-        ctx.lower_root_graphs(shared_out)
+        shared_outs = list(forall.inner_iter_args)
+        ctx.lower_root_graphs(shared_outs[0])
         in_parallel = scf_d.InParallelOp()
         with ir.InsertionPoint(in_parallel.block):
+            tensor_id_to_index = {id(tensor): i for i, tensor in enumerate(out_tensors)}
             for value, offsets, *rest in ctx.forall_insert_slices:
+                static_sizes_field = rest[0] if rest else None
+                target_tensor_id = rest[1] if len(rest) > 1 else None
                 source_type = ir.RankedTensorType(value.type)
                 static_sizes = (
-                    list(rest[0]) if rest and rest[0] else list(source_type.shape)
+                    list(static_sizes_field)
+                    if static_sizes_field
+                    else list(source_type.shape)
                 )
                 rank = len(static_sizes)
+                destination = shared_outs[0]
+                if len(shared_outs) > 1:
+                    index = tensor_id_to_index.get(target_tensor_id)
+                    if index is None:
+                        from ..support import UnsupportedOperationError
+
+                        raise UnsupportedOperationError(
+                            "multi-output store routing",
+                            reason=(
+                                "could not determine which of the kernel's output "
+                                "tensors this store targets (e.g. a nested-reduction "
+                                "accumulator flushed into a multi-output phase is "
+                                "not yet supported)"
+                            ),
+                            alternatives=[
+                                (
+                                    "avoid nested hl.tile() reductions in a phase "
+                                    "that returns multiple tensors"
+                                )
+                            ],
+                        )
+                    destination = shared_outs[index]
                 tensor_d.ParallelInsertSliceOp(
                     value,
-                    shared_out,
+                    destination,
                     offsets,
                     [],
                     [],
@@ -177,7 +241,43 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
                     static_strides=[1] * rank,
                 )
 
-    return forall.results[0]
+    return list(forall.results)
+
+
+def _validate_multi_output_shapes(
+    out_tensors: list[torch.Tensor],
+    primary_shape: list[int],
+    block_id_to_out_dim: dict[int, int],
+) -> None:
+    """Reject a phase whose N output tensors disagree on a tiled dimension.
+
+    All outputs of one phase share a single ``scf.forall`` iteration space,
+    so every tiled dimension's extent must match across them; a mismatch
+    means the outputs need separate loops (separate phases), which V1 does
+    not yet derive automatically.
+    """
+    from ..support import UnsupportedOperationError
+
+    for extra in out_tensors[1:]:
+        extra_shape = [int(dim) for dim in extra.shape]
+        for dim in block_id_to_out_dim.values():
+            if dim < len(extra_shape) and dim < len(primary_shape):
+                if extra_shape[dim] != primary_shape[dim]:
+                    raise UnsupportedOperationError(
+                        "differently-shaped multi-output kernel",
+                        reason=(
+                            "all tensors written within a single hl.tile()/"
+                            "hl.grid() loop must share the same tiled shape; got "
+                            f"{primary_shape} and {extra_shape}"
+                        ),
+                        alternatives=[
+                            (
+                                "split differently-shaped outputs into separate "
+                                "hl.tile()/hl.grid() loops (separated by "
+                                "hl.barrier() if one depends on the other)"
+                            )
+                        ],
+                    )
 
 
 def _find_reused_block_id(
@@ -620,7 +720,13 @@ def _prepare_synthetic_accumulator(
 
     from .for_store_context import ForStoreContext
 
-    return ForStoreContext(flush_offsets=flush_offsets), synthetic_iter_index
+    target_tensor_id = (
+        id(target_meta) if isinstance(target_meta, torch.Tensor) else None
+    )
+    return (
+        ForStoreContext(flush_offsets=flush_offsets, target_tensor_id=target_tensor_id),
+        synthetic_iter_index,
+    )
 
 
 def _lower_innermost_loop_body(
@@ -861,7 +967,12 @@ def _flush_synthetic_accumulator_to_parent(
     final_tile = for_op.results[synthetic_iter_index]
     if not ctx.for_store_ctx_stack:
         ctx.forall_insert_slices.append(
-            (final_tile, synthetic_store_ctx.flush_offsets, None)
+            (
+                final_tile,
+                synthetic_store_ctx.flush_offsets,
+                None,
+                synthetic_store_ctx.target_tensor_id,
+            )
         )
         return
 
