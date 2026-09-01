@@ -37,6 +37,8 @@ def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     try:
         source_type = ir.RankedTensorType(source_value.type)
     except Exception:
+        # Native MLIR binding raises for a non-ranked-tensor type; this
+        # probes "is it a tensor" rather than catching a specific error.
         return None
     element_type = source_type.element_type
 

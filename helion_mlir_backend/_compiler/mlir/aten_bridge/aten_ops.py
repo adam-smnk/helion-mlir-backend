@@ -326,6 +326,8 @@ def lower_scalar_binary(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | No
         try:
             return ir.RankedTensorType(value.type)
         except Exception:
+            # Native MLIR binding raises for any non-ranked-tensor type; this
+            # probes "is it a tensor" rather than catching a specific error.
             return None
 
     tensor_index = next(

@@ -98,6 +98,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _shared_mlir_context: ir.Context | None = None
+_context_construction_count = 0
 
 
 def _get_shared_mlir_context() -> ir.Context:
@@ -111,10 +112,22 @@ def _get_shared_mlir_context() -> ir.Context:
     constructed one. MLIR contexts are designed to host many independent
     modules, so reusing a single one for the process avoids the race.
     """
-    global _shared_mlir_context
+    global _shared_mlir_context, _context_construction_count
     if _shared_mlir_context is None:
         import mlir.ir as ir
 
+        _context_construction_count += 1
+        if _context_construction_count > 1:
+            # A second construction means _shared_mlir_context was reset to
+            # None by something other than this function -- exactly the
+            # crash pattern this cache exists to prevent (see docstring).
+            raise RuntimeError(
+                "The process-wide shared mlir.ir.Context was reconstructed. "
+                "This previously caused segfaults from racing background "
+                "thread pools across kernel compiles. Route all MLIR context "
+                "access through _get_shared_mlir_context() and never "
+                "construct ir.Context() directly."
+            )
         _shared_mlir_context = ir.Context()
     return _shared_mlir_context
 
@@ -232,7 +245,7 @@ class MLIRModuleBuilder:
             if isinstance(size, torch.SymInt):
                 try:
                     size = int(size)
-                except Exception:
+                except (TypeError, ValueError):
                     log.warning("block_id %d has dynamic size %s", bs.block_id, size)
                     size = -1
             else:
@@ -240,7 +253,22 @@ class MLIRModuleBuilder:
             self.context.block_id_to_size[bs.block_id] = size
 
     def _resolve_block_upper_bounds(self) -> None:
-        """Infer static upper bounds per block_id from ``_for_loop`` nodes."""
+        """Infer static upper bounds per block_id from ``_for_loop`` nodes.
+
+        A nested ``_for_loop`` can declare a reused *placeholder* block id
+        equal to an enclosing grid/combined-tile block id (Helion's own
+        convention; the loop's real identity is only resolved later, during
+        lowering, by scanning its body -- see ``_find_reused_block_id``).
+        Trusting such a declaration here would silently clobber the outer
+        block's real upper bound with the inner loop's unrelated extent
+        (observed to corrupt a combined-tile dimension's clamp and produce a
+        wrong-shaped ``linalg.matmul`` operand). Skip any block id that is
+        also a known outer grid/tile block id; ``build_kernel_body`` sets
+        those bounds correctly and separately from the output shape.
+        """
+        grid_block_ids = {
+            bid for ids in self.hf.device_ir.grid_block_ids for bid in ids
+        }
         for graph_info in self.hf.device_ir.graphs:
             for node in graph_info.graph.nodes:
                 if node.op != "call_function":
@@ -259,9 +287,11 @@ class MLIRModuleBuilder:
                     try:
                         block_id = int(bid)
                         ub_int = int(ub)
-                    except Exception:
+                    except (TypeError, ValueError):
                         continue
                     if ub_int <= 0:
+                        continue
+                    if block_id in grid_block_ids:
                         continue
                     prev = self.context.block_id_to_upper_bound.get(block_id)
                     if prev is None:
@@ -578,7 +608,7 @@ class MLIRModuleBuilder:
             # Try to resolve SymInt
             try:
                 concrete = int(val)
-            except Exception:
+            except (TypeError, ValueError):
                 log.warning("Could not resolve SymInt in sym_size: %s", val)
                 concrete = 0
         else:

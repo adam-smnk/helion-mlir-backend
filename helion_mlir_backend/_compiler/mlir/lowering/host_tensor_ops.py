@@ -59,6 +59,8 @@ def materialize_host_tensor_alias_shape(
         base_shape = [int(dim) for dim in base_type.shape]
         element_type = base_type.element_type
     except Exception:
+        # Native MLIR binding raises for a non-ranked-tensor type; treat as
+        # "not aliasable" rather than a specific error.
         return None
 
     alias_shape = ctx.shape_from_node_meta(alias_node)

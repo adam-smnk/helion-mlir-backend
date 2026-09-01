@@ -62,6 +62,9 @@ def batch_import_and_lower(
             importer.import_stateless_graph(graph, func_name=function_name)
             name_map[id(node)] = function_name
         except Exception as exc:
+            # FxImporter/torch-mlir can fail in many ways for an unsupported
+            # op; skip this node's helper and let codegen raise a clear
+            # UnsupportedOperationError when it finds no pre-built entry.
             arg_info = [
                 (
                     f"{arg.name}:{arg.op}:{arg.target}:"

@@ -99,6 +99,39 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
     ]
     steps = [ctx.block_id_to_size[block_id] for block_id in grid_block_ids_flat]
 
+    # The outer scf.forall emits one statically-sized extract/insert per
+    # iteration (no per-iteration dynamic clamp for a ragged last tile), so a
+    # dimension that's part of a COMBINED multi-dim tile (e.g. hl.tile([m, n]))
+    # and needs more than one iteration must divide evenly by its block size;
+    # a ragged last iteration would read/write past the tensor's real bound.
+    # A single-dimension hl.tile() is unaffected: its own tile.end/mask-based
+    # dynamic clamping (see tile_index_ops.scalar_tile_value) already handles
+    # raggedness correctly. A single iteration (step >= extent) is also
+    # unaffected since slice_plan already clamps that case statically.
+    combined_block_ids = {
+        bid
+        for ids in ctx.host_function.device_ir.grid_block_ids
+        if len(ids) > 1
+        for bid in ids
+    }
+    for block_id, step, ub in zip(grid_block_ids_flat, steps, ubs, strict=True):
+        if block_id in combined_block_ids and step < ub and ub % step != 0:
+            from ..support import UnsupportedOperationError
+
+            raise UnsupportedOperationError(
+                "ragged combined-tile block size",
+                reason=(
+                    f"block_id {block_id}: dimension of size {ub} is not evenly "
+                    f"divisible by block size {step}, and needs more than one "
+                    "iteration; this backend does not yet support a "
+                    "dynamically-sized boundary tile in this position"
+                ),
+                alternatives=[
+                    "choose a block size that evenly divides this dimension",
+                    "restructure the kernel so this dimension needs only one iteration",
+                ],
+            )
+
     for block_id, upper_bound in zip(grid_block_ids_flat, ubs, strict=False):
         previous = ctx.block_id_to_upper_bound.get(block_id)
         if previous is None:
@@ -117,6 +150,9 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
         forall.induction_variables,
         strict=True,
     ):
+        # Bound for the whole compile (no enclosing scope to restore to),
+        # unlike nested scf.for levels which use ctx.enter_for_loop's
+        # save/restore.
         ctx.block_id_to_iv[block_id] = induction_variable
 
     with ir.InsertionPoint(forall.body):
@@ -263,7 +299,7 @@ def _resolve_multi_block_ids(
                     if int(block_info.size_hint()) == ub_static:
                         match = cand
                         break
-                except Exception:
+                except (TypeError, ValueError):
                     continue
         if match is None and remaining:
             match = next(iter(remaining))
@@ -442,7 +478,7 @@ def _resolve_loop_upper_bound(
             if isinstance(meta_val, torch.Tensor) and meta_val.numel() == 1:
                 try:
                     ub_static = int(meta_val.item())
-                except Exception:
+                except (TypeError, ValueError):
                     ub_static = None
             elif isinstance(meta_val, (int, float)):
                 ub_static = int(meta_val)
