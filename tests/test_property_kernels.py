@@ -122,3 +122,54 @@ def test_reordered_store_random_shapes(n_panels: int, m: int, bn: int) -> None:
     module = generate_mlir(unpack_panels, [src], config=config)
     actual = MLIRBackend().execute_mlir(module, src, kernel_name="unpack_panels")
     torch.testing.assert_close(actual, src.permute(1, 0, 2).contiguous())
+
+
+@given(
+    m=st.sampled_from([8, 16, 32]),
+    n=st.sampled_from([8, 16, 32]),
+    block_size=st.sampled_from(_BLOCK_SIZES),
+)
+@_SETTINGS
+def test_multi_phase_multi_output_with_host_interop_random_shapes(
+    m: int, n: int, block_size: int
+) -> None:
+    """Fuzz the direct-call phase driver across all V1 feature boundaries.
+
+    The host-computed scalar is consumed in phase 0; phase 1 reads phase 0's
+    output and returns two tensors. Each phase has two tile dimensions, so
+    the config deliberately supplies four block-size slots.
+    """
+
+    @helion.kernel(
+        static_shapes=True,
+        backend="mlir",
+        config=helion.Config(block_sizes=[block_size] * 4),
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    def multi_phase_multi_output(
+        x: torch.Tensor, y: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, columns = x.shape
+        scale = x.mean() * 2.0
+        mid = torch.zeros((rows, columns), dtype=torch.float32, device=x.device)
+        out = torch.zeros((rows, columns), dtype=torch.float32, device=x.device)
+        residual = torch.zeros((rows, columns), dtype=torch.float32, device=x.device)
+        for tm, tn in hl.tile([rows, columns]):
+            s = hl.load(scale, [])
+            mid[tm, tn] = (x[tm, tn] + y[tm, tn]) * s
+        hl.barrier()
+        for tm, tn in hl.tile([rows, columns]):
+            out[tm, tn] = mid[tm, tn] * 2.0
+            residual[tm, tn] = mid[tm, tn] - x[tm, tn]
+        return out, residual
+
+    torch.manual_seed(11)
+    x = torch.randn(m, n)
+    y = torch.randn(m, n)
+    actual = multi_phase_multi_output(x, y)
+    scale = x.mean() * 2.0
+    mid = (x + y) * scale
+
+    assert isinstance(actual, list) and len(actual) == 2
+    torch.testing.assert_close(actual[0], mid * 2.0)
+    torch.testing.assert_close(actual[1], mid - x)
