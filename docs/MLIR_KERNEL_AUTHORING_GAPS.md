@@ -568,11 +568,17 @@ eager `permute().contiguous()` (~2.3 ms at 4K, 4 threads).
 
 3. **Phase 2: Nested loop generalization** — Removed `assert len(block_ids) == 1` from `lower_nested_for_loop`. Divisibility heuristic fallback removed (kept inner block ID resolution from body symbols).
 
-4. **Phase 3: Synthetic store on descriptor** — `memory_ops.py` per-iteration insert now tries `plan_slice()` on synthetic store context; falls back to legacy `inner_dim` path if plan fails.
+4. **Phase 3: Synthetic store on descriptor** — `memory_ops.py` per-iteration insert uses `plan_slice()` on the synthetic store context directly (the legacy `inner_dim` fallback path was removed after empirical verification — see "Legacy cleanup" below).
 
-5. **Phase 4: Terminal store + grid dims** — Added `block_id_to_out_dim` mapping in `build_kernel_body` to track which grid block_id maps to which output dimension (not positional). Terminal store path tries descriptor first, then positional fallback.
+5. **Phase 4: Terminal store + grid dims** — `build_kernel_body` derives which grid block_id maps to which output dimension (not positional) from the terminal store's own index expression. Terminal store path tries the descriptor first, then a positional fallback (this fallback is the common case in practice, since the real output tensor usually has no SSA value bound yet at terminal-store time).
 
-6. **Phase 5: Cleanup + hardening** — Kept `infer_block_id_from_value_shape()` as deprecated fallback (for safety); no callers removed. Marked terminal store as descriptor-preferring.
+6. **Phase 5: Cleanup + hardening** — `infer_block_id_from_value_shape()` (kept as a deprecated fallback in the original pass) was later confirmed dead via empirical instrumentation and removed — see "Legacy cleanup" below.
+
+**Legacy cleanup** (verified via empirical instrumentation: temporarily added stderr markers to every suspected-dead fallback branch, ran the full test suite with `-s`, counted hits, removed anything with zero hits):
+- Removed `build_context.py::infer_block_id_from_value_shape` and its 2 call sites — symbolic block-id resolution always suffices; this shape-based guess never fired.
+- Removed the legacy `inner_dim`-based fallback in `memory_ops.py::lower_store`'s synthetic-store branch, along with the `try/except` that swallowed `plan_slice` failures to reach it — `plan_slice` never fails there across all tested nesting depths, combined tiles, transposes, and reductions; a real failure now surfaces as a real error.
+- Removed the now-write-only `"block_id"`/`"inner_dim"`/`"rank"` keys from `control_flow.py`'s `synthetic_store_ctx` dict, and the dead `BuildContext.block_id_to_out_dim` field (set but never read back).
+- Confirmed **still active** (kept): the positional heuristic-based terminal store (the most common path in practice), `_find_reused_block_id`'s recursive wrapper-unwrapping, the `fallback_outer_bid` heuristic, and the loop-declaration-order fallback in `build_kernel_body`.
 
 **Invariants Maintained**:
 - Index position == tensor dimension (scalars reduce rank via `reduces=True`)

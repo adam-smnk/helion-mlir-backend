@@ -100,9 +100,6 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
             block_id: out_dim for out_dim, block_id in enumerate(grid_block_ids_flat)
         }
 
-    # Store mapping in context for terminal store lowering.
-    ctx.block_id_to_out_dim = block_id_to_out_dim
-
     lbs = [0] * len(grid_block_ids_flat)
     ubs = [
         out_shape[block_id_to_out_dim.get(bid, idx)]
@@ -587,9 +584,6 @@ def _emit_for_loop_level(
                 synthetic_iter_index = len(iter_init_vals)
                 iter_init_vals.append(tile_init)
                 synthetic_store_ctx = {
-                    "block_id": block_id,
-                    "inner_dim": inner_dim,
-                    "rank": rank,
                     "flush_offsets": flush_offsets,
                     "current": None,
                 }
