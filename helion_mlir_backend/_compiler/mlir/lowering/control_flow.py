@@ -13,7 +13,9 @@ if TYPE_CHECKING:
 
 
 def _block_id_to_out_dim_from_terminal_store(
-    ctx: BuildContext, grid_block_ids: list[int]
+    ctx: BuildContext,
+    grid_block_ids: list[int],
+    graphs: list[torch.fx.Graph] | None = None,
 ) -> dict[int, int] | None:
     """Find the store that writes the final output and map each of its index
     positions to the block id it resolves to.
@@ -29,14 +31,20 @@ def _block_id_to_out_dim_from_terminal_store(
     resolved indices -- a stronger, less accidental signal than matching on
     tensor shape alone (multiple tensors can share a shape) -- while any
     other resolved block ids are simply ignored. Returns ``None`` if no such
-    store is found.
+    store is found. Scoped to *graphs* when given (e.g. one phase's own
+    graphs), otherwise scans the whole kernel's.
     """
     from ..support.index_meta import resolve_index_descriptor
 
     expected_block_ids = set(grid_block_ids)
+    search_graphs = (
+        graphs
+        if graphs is not None
+        else [gi.graph for gi in ctx.host_function.device_ir.graphs]
+    )
 
-    for graph_info in ctx.host_function.device_ir.graphs:
-        for node in graph_info.graph.nodes:
+    for graph in search_graphs:
+        for node in graph.nodes:
             if node.op != "call_function":
                 continue
             if getattr(node.target, "__name__", "") != "store":
@@ -58,7 +66,10 @@ def _block_id_to_out_dim_from_terminal_store(
 
 
 def build_kernel_body(
-    ctx: BuildContext, out_tensors: list[torch.Tensor]
+    ctx: BuildContext,
+    out_tensors: list[torch.Tensor],
+    root_ids: list[int] | None = None,
+    grid_block_id_groups: list[list[int]] | None = None,
 ) -> list[ir.Value]:
     """Build the outer ``scf.forall`` and its parallel insert terminator.
 
@@ -67,6 +78,10 @@ def build_kernel_body(
     tensors). All of them share this forall's single iteration space, so
     their tiled dimensions must agree -- see the shape-compatibility check
     below.
+
+    ``root_ids``/``grid_block_id_groups`` scope this build to one
+    ``hl.barrier()``-separated phase's own root graphs/block-id groups
+    instead of the whole kernel's (the default, when both are ``None``).
 
     Maps each grid block_id to its actual destination dimension (not just positional).
     """
@@ -84,9 +99,20 @@ def build_kernel_body(
     # yields one entry ``[0, 1]``), so the flattened list must advance per
     # block id, not per group, or every block id in a multi-dim statement
     # collapses onto one dimension.
+    groups = (
+        grid_block_id_groups
+        if grid_block_id_groups is not None
+        else ctx.host_function.device_ir.grid_block_ids
+    )
     grid_block_ids_flat: list[int] = []
-    for ids in ctx.host_function.device_ir.grid_block_ids:
+    for ids in groups:
         grid_block_ids_flat.extend(ids)
+
+    phase_graphs = (
+        [ctx.host_function.device_ir.graphs[rid].graph for rid in root_ids]
+        if root_ids is not None
+        else None
+    )
 
     # Prefer the authoritative mapping derived from the terminal store's own
     # index expression: loop declaration order does not necessarily match the
@@ -94,7 +120,7 @@ def build_kernel_body(
     # with ``panel``'s loop declared before ``tm``'s). Fall back to loop
     # declaration order only if no matching terminal store is found.
     block_id_to_out_dim = _block_id_to_out_dim_from_terminal_store(
-        ctx, grid_block_ids_flat
+        ctx, grid_block_ids_flat, graphs=phase_graphs
     )
     if block_id_to_out_dim is None:
         block_id_to_out_dim = {
@@ -142,12 +168,7 @@ def build_kernel_body(
     # dynamic clamping (see tile_index_ops.scalar_tile_value) already handles
     # raggedness correctly. A single iteration (step >= extent) is also
     # unaffected since slice_plan already clamps that case statically.
-    combined_block_ids = {
-        bid
-        for ids in ctx.host_function.device_ir.grid_block_ids
-        if len(ids) > 1
-        for bid in ids
-    }
+    combined_block_ids = {bid for ids in groups if len(ids) > 1 for bid in ids}
     for block_id, step, ub in zip(grid_block_ids_flat, steps, ubs, strict=True):
         if block_id in combined_block_ids and step < ub and ub % step != 0:
             from ..support import UnsupportedOperationError
@@ -194,7 +215,7 @@ def build_kernel_body(
 
     with ir.InsertionPoint(forall.body):
         shared_outs = list(forall.inner_iter_args)
-        ctx.lower_root_graphs(shared_outs[0])
+        ctx.lower_root_graphs(shared_outs[0], root_ids=root_ids)
         in_parallel = scf_d.InParallelOp()
         with ir.InsertionPoint(in_parallel.block):
             tensor_id_to_index = {id(tensor): i for i, tensor in enumerate(out_tensors)}

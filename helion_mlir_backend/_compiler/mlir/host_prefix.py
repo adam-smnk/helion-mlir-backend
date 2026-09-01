@@ -87,13 +87,26 @@ class _NeutralizeGridLoops(ast.NodeTransformer):
     Recurses through the whole body (not just top-level statements) so a
     GRID loop nested inside a host-level ``if``/``while``/``try`` is still
     found. Every other statement -- including ordinary host ``for``/``while``
-    loops -- is left untouched and re-executed for real.
+    loops -- is left untouched and re-executed for real. ``hl.barrier()``
+    calls are also neutralized: they're a real Python function that only
+    raises when actually called (it's meant to be traced, not executed), and
+    the phase-sequencing this AST feeds into (see ``bound_kernel.py``'s
+    multi-phase driver) already provides the ordering a barrier would.
     """
 
     def visit_For(self, node: ast.For) -> ast.AST:
         from helion._compiler.ast_extension import LoopType
 
         if getattr(node, "_loop_type", None) == LoopType.GRID:
+            placeholder = ast.Pass()
+            return ast.copy_location(placeholder, node)
+        self.generic_visit(node)
+        return node
+
+    def visit_Expr(self, node: ast.Expr) -> ast.AST:
+        from helion._compiler.type_info import BarrierResultType
+
+        if isinstance(getattr(node.value, "_type_info", None), BarrierResultType):
             placeholder = ast.Pass()
             return ast.copy_location(placeholder, node)
         self.generic_visit(node)
