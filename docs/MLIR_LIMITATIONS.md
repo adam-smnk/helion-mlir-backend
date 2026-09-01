@@ -7,9 +7,13 @@ This document lists current limitations for the MLIR backend in this repository.
 - The backend is experimental.
 - CPU execution is supported and validated in tests.
 - The MLIR validation suite spans `tests/test_mlir_backend.py`,
-  `tests/test_mlir_execution.py`, and `tests/test_mlir_integration.py`.
-- The current suite contains 85 passing tests.
+  `tests/test_mlir_execution.py`, `tests/test_mlir_integration.py`,
+  `tests/test_index_descriptor.py`, `tests/test_reduce_ops.py`, and
+  `tests/test_property_kernels.py` (property-based fuzz coverage).
+- The current suite contains 160 passing tests.
 - Both explicit generate-and-execute flow and direct backend="mlir" flow are exercised.
+- All example scripts under `examples/` are kept runnable and are re-verified
+  after backend changes (`uv run python examples/<name>.py`).
 
 This replaces earlier "IR-only" descriptions.
 
@@ -99,7 +103,36 @@ Recommended workflow:
 - Use `HELION_MLIR_DUMP_PRE_LOWERING=1`.
 - Reproduce with targeted tests in `tests/test_mlir_execution.py`.
 
-## 9) Backend Architecture Boundary
+## 9) Ragged Combined-Tile Boundary Is Not Dynamically Clamped
+
+Current requirement:
+- For a combined multi-dimensional tile (e.g. `for tm, tn in hl.tile([m, n])`),
+  every dimension whose block size needs more than one iteration must evenly
+  divide that dimension's extent.
+
+Why:
+- The outer `scf.forall` emits one statically-sized extract/insert per
+  iteration with no per-iteration dynamic clamp for a ragged (partial) last
+  tile. A single-dimension `hl.tile()` does not have this restriction; its own
+  `tile.end`-based dynamic clamp already handles raggedness correctly.
+
+Consequence:
+- Compiling such a kernel raises a clear `UnsupportedOperationError` ("ragged
+  combined-tile block size") instead of miscompiling.
+- Workaround: choose a block size that evenly divides the dimension, or
+  restructure the loop so that dimension needs only one iteration.
+
+## 10) Multi-Output Kernels Are Not Supported
+
+Current requirement:
+- A kernel must return a single tensor.
+
+Consequence:
+- `return out1, out2` raises a clear `UnsupportedOperationError`
+  ("multi-output kernel") at compile time.
+- Workaround: split the kernel into separate single-output kernels.
+
+## 11) Backend Architecture Boundary
 
 The MLIR backend is intentionally decoupled from `TritonBackend`. It inherits
 from Helion's backend-neutral `Backend` and bypasses Helion's Python AST codegen

@@ -35,11 +35,14 @@ In `MLIRModuleBuilder._resolve_block_sizes` (`codegen.py`), with shared state ow
 - `CompileEnvironment.block_sizes` are resolved from config (`from_config`) with `HostFunction` active.
 - Concrete sizes are stored in:
   - `_block_id_to_size: dict[int, int]`
-- Symbolic support maps are also built:
-  - `_block_hint_to_id: dict[int, int]`
-  - `_block_symint_to_id: dict[int, int]` (sympy symbol identity to block id)
 
-These maps allow SymInt dimensions to be concretized consistently even when shape metadata changes representation (symbolic name, hint value, or symbol identity).
+Block-id resolution for any index/subscript node (not just this stage) flows
+through a single authoritative helper, `resolve_index_descriptor` in
+`support/index_meta.py`, which reads Helion's own device-IR metadata
+(`meta['tile_with_offset']`, set for every backend) and
+`HostFunction.expr_to_origin` (via `CompileEnvironment.get_block_id`) instead
+of name- or identity-based heuristic maps. There is no separate
+`block_hint_to_id`/`block_symint_to_id` bookkeeping to keep in sync.
 
 ## Stage 2: Nested Body Placeholder Repair
 
@@ -63,17 +66,34 @@ In `preprocess_aten_nodes` / `_build_aten_subgraph` (`aten_lowering.py`):
 
 This stage is critical because helper function argument/result types become fixed MLIR function signatures.
 
+One normalization step in `_build_aten_subgraph` rewrites stale/mismatched
+operand shapes to a common bounded shape before building the helper. This
+normalization is restricted to operands that already share the same rank: an
+earlier version also rank-expanded lower-rank operands (e.g. a 1-D bias vs a
+2-D accumulator) to match, which produced a helper signature the real
+call-site MLIR value never actually matched (the value was never expanded) --
+breaking every rank-mismatched broadcast add. Genuine rank-broadcast is left
+to torch-mlir's own linalg lowering instead. See
+`tests/test_reduce_ops.py::test_rank_mismatch_broadcast_add`.
+
 ## Stage 4: Concrete Shape Resolution Rules
 
-In `_resolve_dims` (`aten_lowering.py`) and `BuildContext` block-ID inference, dimension resolution order is:
+In `_resolve_dims` (`aten_lowering.py`) and `resolve_index_descriptor`
+(`support/index_meta.py`), dimension resolution order is:
 
-1. Symbolic name lookup (`uN` style symbol -> block id).
-2. Sympy expression symbol lookup.
-3. Symbol identity lookup via `_block_symint_to_id`.
-4. Upper-bound clamping against configured loop bounds.
-5. Final fallback to `int(dim)`.
+1. Literal int index -> scalar (no block id).
+2. `meta['tile_with_offset']` (set by Helion's own device-IR pass) -> block id + offset.
+3. `CompileEnvironment.get_block_id(symint)` via `HostFunction.expr_to_origin`.
+4. `_get_symnode('block_size_N')` key lookup.
+5. A load's own tensor-dimension symbol origin (`sym_size.int(tensor, dim)`).
+6. Upper-bound clamping against configured loop bounds.
+7. Final fallback to `int(dim)`.
 
-This layered strategy makes propagation robust across traced graph rewrites.
+This layered strategy makes propagation robust across traced graph rewrites,
+and replaces an earlier generation of id()-keyed/name-heuristic maps that were
+removed once this single authoritative path covered every historically-buggy
+indexing pattern (combined 2D tile, nested reduction, transpose, reordered
+store -- see `tests/test_index_descriptor.py`).
 
 ## Stage 5: Load/Store Lowering Consistency
 
@@ -112,7 +132,8 @@ Without these rewrites, generic decomposition patterns can still fail verificati
 ## Practical Debugging Checklist
 
 1. Verify config-driven block sizes were resolved as expected.
-2. Inspect symbolic maps (`BuildContext.block_id_to_size`, `block_hint_to_id`, `block_symint_to_id`).
+2. Inspect `BuildContext.block_id_to_size` / `block_id_to_upper_bound` and, for
+   any individual index node, call `resolve_index_descriptor` directly.
 3. Confirm placeholder metadata repair happened for nested `_for_loop` bodies.
 4. Check ATen helper signatures and concrete fake input/output shapes.
 5. Compare `tensor.extract_slice` result shapes against helper input types.
