@@ -27,3 +27,6 @@ class ForStoreContext:
     flush_offsets: list[ir.Value]
     current: ir.Value | None = None
     store_plan: SlicePlan | None = None
+    # id() of the destination FakeTensor this eventually flushes into (when
+    # known) -- routes the flush to the right output when a phase has >1.
+    target_tensor_id: int | None = None

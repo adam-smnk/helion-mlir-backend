@@ -57,7 +57,7 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     # Rare: the destination already has an SSA value bound (its dimensions
     # can be read directly from the value's own type).
     if target_value is not None and _store_via_bound_target(
-        ctx, index_nodes, value, target_value
+        ctx, index_nodes, value, target_value, node
     ):
         return
 
@@ -108,6 +108,7 @@ def _store_via_bound_target(
     index_nodes: list | tuple,
     value: ir.Value,
     target_value: ir.Value,
+    node: torch.fx.Node,
 ) -> bool:
     """Try the descriptor-based terminal store; return False to defer."""
     import mlir.ir as ir
@@ -121,7 +122,10 @@ def _store_via_bound_target(
         store_plan = plan_slice(ctx, index_nodes, target_type)
         offsets = store_plan.offsets()
         static_sizes = store_plan.static_sizes()
-        ctx.forall_insert_slices.append((value, offsets, static_sizes))
+        target_tensor_id = _target_tensor_id(node)
+        ctx.forall_insert_slices.append(
+            (value, offsets, static_sizes, target_tensor_id)
+        )
         return True
     except NodeLoweringError:
         # Expected bail signal: a tile index has no resolvable block id
@@ -197,4 +201,17 @@ def _store_via_deferred_target(
         reduction = target_rank - len(value_shape)
         static_sizes = [1] * reduction + value_shape
 
-    ctx.forall_insert_slices.append((value, offsets, static_sizes))
+    ctx.forall_insert_slices.append(
+        (value, offsets, static_sizes, _target_tensor_id(node))
+    )
+
+
+def _target_tensor_id(node: torch.fx.Node) -> int | None:
+    """``id()`` of the store's destination FakeTensor, when resolvable."""
+    import torch
+
+    target_node = node.args[0]
+    if not isinstance(target_node, torch.fx.Node):
+        return None
+    target_val = target_node.meta.get("val")
+    return id(target_val) if isinstance(target_val, torch.Tensor) else None

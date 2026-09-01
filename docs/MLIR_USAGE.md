@@ -12,7 +12,7 @@ This guide describes the current usage of the MLIR backend in this repository.
 
 Reference tests are in `tests/test_mlir_backend.py`, `tests/test_mlir_execution.py`,
 `tests/test_mlir_integration.py`, `tests/test_index_descriptor.py`,
-`tests/test_reduce_ops.py`, and `tests/test_property_kernels.py` (currently 160
+`tests/test_reduce_ops.py`, and `tests/test_property_kernels.py` (currently 162
 tests across the MLIR test suite). Runnable usage examples also live under
 `examples/` at the repository root.
 

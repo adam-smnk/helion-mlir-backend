@@ -204,18 +204,15 @@ class MLIRModuleBuilder:
             for name, value in self.hf.params.arguments.items()
             if isinstance(value, torch.Tensor)
         ]
-        out_name, out_tensor = self._find_output_tensor(tensor_params)
-        output_types = [torch_tensor_to_mlir_type(out_tensor)]
-        if any(name == out_name for name, _ in tensor_params):
-            input_params = [
-                (name, value) for name, value in tensor_params if name != out_name
-            ]
-        else:
-            input_params = [
-                (name, value)
-                for name, value in tensor_params
-                if value is not out_tensor
-            ]
+        out_params = self._find_output_tensors(tensor_params)
+        output_types = [torch_tensor_to_mlir_type(t) for _, t in out_params]
+        out_names = {name for name, _ in out_params}
+        out_tensor_ids = {id(t) for _, t in out_params}
+        input_params = [
+            (name, value)
+            for name, value in tensor_params
+            if name not in out_names and id(value) not in out_tensor_ids
+        ]
         input_types = [torch_tensor_to_mlir_type(value) for _, value in input_params]
 
         fn = func_d.FuncOp(self.hf.name, ir.FunctionType.get(input_types, output_types))
@@ -227,14 +224,14 @@ class MLIRModuleBuilder:
             if not self.context.block_id_to_size:
                 with self.hf:
                     self._resolve_block_sizes()
-            func_d.ReturnOp([self._build_kernel_body(out_tensor)])
+            func_d.ReturnOp(self._build_kernel_body([t for _, t in out_params]))
 
-    def _find_output_tensor(
+    def _find_output_tensors(
         self, tensor_params: list[tuple[str, torch.Tensor]]
-    ) -> tuple[str, torch.Tensor]:
+    ) -> list[tuple[str, torch.Tensor]]:
         from .output_resolver import OutputTensorResolver
 
-        return OutputTensorResolver(self.hf).resolve(tensor_params)
+        return OutputTensorResolver(self.hf).resolve_all(tensor_params)
 
     def _resolve_block_sizes(self) -> None:
         """Populate ``block_id_to_size`` from the active config."""
@@ -305,10 +302,10 @@ class MLIRModuleBuilder:
     # Kernel body – outer forall structure
     # ------------------------------------------------------------------
 
-    def _build_kernel_body(self, out_tensor: torch.Tensor) -> ir.Value:
+    def _build_kernel_body(self, out_tensors: list[torch.Tensor]) -> list[ir.Value]:
         from .lowering import build_kernel_body
 
-        return build_kernel_body(self.context, out_tensor)
+        return build_kernel_body(self.context, out_tensors)
 
     # ------------------------------------------------------------------
     # Root graph processing
