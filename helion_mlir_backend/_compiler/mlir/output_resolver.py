@@ -12,27 +12,6 @@ class OutputTensorResolver:
     def __init__(self, host_function: object) -> None:
         self.host_function = host_function
 
-    def resolve(
-        self, tensor_params: list[tuple[str, torch.Tensor]]
-    ) -> tuple[str, torch.Tensor]:
-        """Return the single output name and fake tensor (see :meth:`resolve_all`).
-
-        Kept for callers that only ever expect one output; raises the same
-        multi-output diagnostic ``resolve_all`` would otherwise return >1 for.
-        """
-        outputs = self.resolve_all(tensor_params)
-        if len(outputs) > 1:
-            from .support import UnsupportedOperationError
-
-            raise UnsupportedOperationError(
-                "multi-output kernel",
-                reason=(
-                    "This entry point only supports kernels that return a single tensor"
-                ),
-                alternatives=["Split the kernel into separate single-output kernels"],
-            )
-        return outputs[0]
-
     def resolve_all_in_graphs(
         self,
         graphs: list[torch.fx.Graph],

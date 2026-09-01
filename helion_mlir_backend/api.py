@@ -29,15 +29,13 @@ def generate_mlir(
     from helion._compiler.variable_origin import ArgumentOrigin
     from helion.runtime.settings import Settings
 
-    fn = getattr(kernel, "_fn", None) or getattr(kernel, "fn", None)
+    fn = getattr(kernel, "fn", None)
     if fn is None:
         raise ValueError(
             f"Expected a @helion.kernel-decorated function; got {type(kernel).__name__}"
         )
 
-    settings: Settings = getattr(kernel, "_settings", None) or getattr(
-        kernel, "settings", Settings()
-    )
+    settings: Settings = getattr(kernel, "settings", Settings())
     settings.backend = "mlir"
 
     if config is None:
