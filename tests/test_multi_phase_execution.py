@@ -165,6 +165,37 @@ def test_multiphase_grid_packing_then_blocked_matmul():
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=1.0)
 
 
+def test_multiphase_reordered_store_uses_nested_terminal_mapping():
+    """A phase-1 terminal store below `grid -> tile` maps grid to dim 1.
+
+    The phase root itself has no store, so terminal-store lookup must include
+    nested loop bodies to derive `out[tm, panel, :]` correctly rather than
+    falling back to loop declaration order.
+    """
+
+    @helion.kernel(
+        static_shapes=True,
+        backend="mlir",
+        config=helion.Config(block_sizes=[4, 4]),
+    )
+    def unpack_after_barrier(src: torch.Tensor) -> torch.Tensor:
+        panels, rows, width = src.shape
+        mid = torch.empty((panels, rows, width), dtype=src.dtype, device=src.device)
+        out = torch.empty((rows, panels, width), dtype=src.dtype, device=src.device)
+        for panel in hl.grid(panels):
+            for tm in hl.tile(rows):
+                mid[panel, tm, :] = src[panel, tm, :]
+        hl.barrier()
+        for panel in hl.grid(panels):
+            for tm in hl.tile(rows):
+                out[tm, panel, :] = mid[panel, tm, :]
+        return out
+
+    src = torch.randn(3, 8, 5)
+    actual = unpack_after_barrier(src)
+    torch.testing.assert_close(actual, src.permute(1, 0, 2).contiguous())
+
+
 def test_multi_phase_generate_mlir_raises_clear_diagnostic():
     from helion_mlir_backend import generate_mlir
     from helion_mlir_backend._compiler.mlir.support.errors import (
