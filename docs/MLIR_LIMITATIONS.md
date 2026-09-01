@@ -174,6 +174,14 @@ Consequence:
 - Each phase is compiled as its own fully separate MLIR module (simpler and
   safer than one shared multi-entry-point module); this is a compile-time-only
   cost, cached per kernel/config like any other compile.
+- No statement other than `hl.barrier()` itself may appear between two
+  top-level device loops (a Helion frontend rule, not backend-specific), so a
+  host tensor a later phase needs must be computed before the loop that
+  first uses it, not between phases.
+
+Example:
+- `examples/multi_phase_mlir.py` -- a runnable two-phase kernel combining
+  `hl.barrier()` with a host-computed interop tensor.
 
 ## 12) Backend Architecture Boundary
 

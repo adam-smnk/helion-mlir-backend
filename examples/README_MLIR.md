@@ -10,6 +10,7 @@ The MLIR backend enables Helion kernels to be lowered into MLIR code using the L
 - How the backend generates MLIR operations
 - Various kernel patterns: matmul, element-wise, fused operations
 - MLIR IR inspection and debugging
+- Multi-phase execution (`hl.barrier()`) and host-tensor interop via the direct call path
 
 ## Examples
 
@@ -135,6 +136,33 @@ python examples/sum_mlir.py
 
 ---
 
+### 8. multi_phase_mlir.py
+**Multi-Phase Execution (`hl.barrier()` + Host-Tensor Interop)**
+
+Demonstrates two capabilities only available through the direct
+`@helion.kernel(backend="mlir")` call path (not `generate_mlir()` +
+`execute_mlir()`):
+- **Multi-phase kernels:** two top-level `hl.tile()` loops separated by
+  `hl.barrier()`, where the second phase reads the first phase's output.
+  Each phase compiles to its own MLIR function; a real host-side driver
+  runs between phase calls, threading tensors between phases by name.
+- **Host-tensor interop:** a host-computed tensor (`scale = x.mean() * 2.0`)
+  that isn't one of the kernel's own declared parameters, consumed inside a
+  device loop via `hl.load(scale, [])`.
+
+See `docs/MLIR_LIMITATIONS.md` ("Multi-Phase Kernels and Host-Tensor
+Interop") for the full scope and current limitations of this feature.
+
+**Run:**
+```bash
+python examples/multi_phase_mlir.py
+```
+
+**Output:** Executes the kernel directly and validates the result against
+eager PyTorch.
+
+---
+
 ## Running the Examples
 
 ### Prerequisites
@@ -152,6 +180,7 @@ python examples/bmm_mlir.py
 python examples/broadcast_matmul_mlir.py
 python examples/geglu_mlir.py
 python examples/sum_mlir.py
+python examples/multi_phase_mlir.py
 ```
 
 ### Run Specific Example
