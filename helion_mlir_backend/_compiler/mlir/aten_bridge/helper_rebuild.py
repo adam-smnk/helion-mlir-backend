@@ -78,8 +78,7 @@ def rebuild_aten_helper_for_call(
                 [node],
                 ctx.mlir_module,
                 ctx.block_id_to_size,
-                ctx.block_hint_to_id,
-                ctx.block_symint_to_id,
+                ctx.env,
                 ctx.block_id_to_upper_bound,
                 {id(node): overrides},
             )

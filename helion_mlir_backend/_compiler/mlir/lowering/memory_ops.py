@@ -55,17 +55,17 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
 
     if ctx.for_store_ctx_stack:
         context = ctx.for_store_ctx_stack[-1]
-        current = context.get("current")
+        current = context.current
 
         # Compute the descriptor-based per-iteration insert plan once, on
         # first use.
-        store_plan = context.get("store_plan")
+        store_plan = context.store_plan
         if store_plan is None and current is not None:
             from .slice_plan import plan_slice
 
             target_type = ir.RankedTensorType(current.type)
             store_plan = plan_slice(ctx, index_nodes, target_type)
-            context["store_plan"] = store_plan
+            context.store_plan = store_plan
 
         if store_plan is not None and current is not None:
             offsets = store_plan.offsets()
@@ -80,13 +80,13 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
                 static_sizes=static_sizes,
                 static_strides=[1] * len(offsets),
             ).result
-            context["current"] = updated
+            context.current = updated
             return
-
-    sym_to_block_id = ctx.build_sym_to_block_id()
 
     # Try descriptor-based terminal store path first.
     if target_value is not None:
+        from ..support.errors import NodeLoweringError
+
         try:
             from .slice_plan import plan_slice
 
@@ -96,8 +96,11 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
             static_sizes = store_plan.static_sizes()
             ctx.forall_insert_slices.append((value, offsets, static_sizes))
             return
-        except Exception:
-            # Fall through to positional approach if plan_slice fails.
+        except NodeLoweringError:
+            # Expected bail signal: a tile index has no resolvable block id
+            # (e.g. target_value's dimension doesn't match index_nodes yet).
+            # Fall through to the positional approach below. Any other
+            # exception is a real bug and must propagate.
             pass
 
     # Fallback: positional heuristic-based terminal store. Reached whenever
@@ -138,7 +141,7 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
 
         if value_dim >= len(value_shape):
             break
-        block_id = ctx.infer_block_id_from_index(index_node, sym_to_block_id)
+        block_id = ctx.infer_block_id_from_index(index_node)
         if block_id is not None and block_id in ctx.block_id_to_iv:
             offsets.append(ctx.block_id_to_iv[block_id])
         else:

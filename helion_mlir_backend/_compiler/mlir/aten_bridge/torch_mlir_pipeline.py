@@ -13,6 +13,8 @@ import torch.fx
 if TYPE_CHECKING:
     from collections.abc import Callable as CallableType
 
+    from helion._compiler.compile_environment import CompileEnvironment
+
     AtenSubgraphBuilder = CallableType[..., tuple[torch.fx.Graph, list[int]]]
 
 log = logging.getLogger(__name__)
@@ -22,18 +24,25 @@ def batch_import_and_lower(
     aten_nodes: list[torch.fx.Node],
     block_id_to_size: dict[int, int],
     build_subgraph: Callable[..., tuple[torch.fx.Graph, list[int]]],
-    block_hint_to_id: dict[int, int] | None = None,
-    block_symint_to_id: dict[int, int] | None = None,
+    env: CompileEnvironment | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
     arg_position_overrides: dict[int, dict[int, torch.Tensor]] | None = None,
 ) -> tuple[str, dict[int, str]]:
     """Build and lower all ATen subgraphs in one torch-MLIR pipeline pass."""
-    from torch_mlir.compiler_utils import OutputType
-    from torch_mlir.compiler_utils import lower_mlir_module
-    from torch_mlir.compiler_utils import run_pipeline_with_repro_report
-    from torch_mlir.dialects import torch as torch_d
-    from torch_mlir.extras.fx_importer import FxImporter
-    import torch_mlir.ir as tm_ir
+    try:
+        from torch_mlir.compiler_utils import OutputType
+        from torch_mlir.compiler_utils import lower_mlir_module
+        from torch_mlir.compiler_utils import run_pipeline_with_repro_report
+        from torch_mlir.dialects import torch as torch_d
+        from torch_mlir.extras.fx_importer import FxImporter
+        import torch_mlir.ir as tm_ir
+    except ImportError as exc:
+        raise ImportError(
+            "torch-mlir is required to lower ATen ops for the MLIR backend "
+            "(every ATen op not covered by a hand-written manual lowering is "
+            "compiled through it). Install it with the project's pinned "
+            "dependency set (e.g. `uv sync`)."
+        ) from exc
 
     context = tm_ir.Context()
     torch_d.register_dialect(context)
@@ -46,8 +55,7 @@ def batch_import_and_lower(
             graph, _ = build_subgraph(
                 node,
                 block_id_to_size,
-                block_hint_to_id or {},
-                block_symint_to_id or {},
+                env,
                 block_id_to_upper_bound or {},
                 (arg_position_overrides or {}).get(id(node)),
             )

@@ -44,23 +44,34 @@ def lower_flat_gather(
             if isinstance(base_meta, torch.Tensor) and base_meta.ndim >= 2:
                 trailing_extent = int(base_meta.shape[-1])
 
-        if (
-            trailing_extent is None
-            and source_target == "_host_tensor"
-            and tensor_node.args
-        ):
-            alias_name = tensor_node.args[0]
-            if isinstance(alias_name, str) and alias_name.endswith("_flat"):
-                base_name = alias_name[: -len("_flat")]
-                alias_value = ctx.host_function.params.arguments.get(alias_name)
-                base_value = ctx.host_function.params.arguments.get(base_name)
-                if (
-                    isinstance(alias_value, torch.Tensor)
-                    and isinstance(base_value, torch.Tensor)
-                    and base_value.ndim >= 2
-                    and alias_value.numel() == base_value.numel()
-                ):
-                    trailing_extent = int(base_value.shape[-1])
+        if trailing_extent is None and source_target == "_host_tensor":
+            alias_value = tensor_node.meta.get("val")
+            if isinstance(alias_value, torch.Tensor):
+                # A host-side flattened view (e.g. ``x_flat = x_data.view(-1)``
+                # written outside the tiled loop) shares storage with its
+                # source tensor; find that source among the kernel's own
+                # parameters by storage identity rather than guessing from
+                # the captured variable's name.
+                try:
+                    alias_storage = alias_value.untyped_storage()
+                except Exception:
+                    alias_storage = None
+                if alias_storage is not None:
+                    for candidate in ctx.host_function.params.arguments.values():
+                        if (
+                            isinstance(candidate, torch.Tensor)
+                            and candidate.ndim >= 2
+                            and candidate is not alias_value
+                        ):
+                            try:
+                                same_storage = (
+                                    candidate.untyped_storage() is alias_storage
+                                )
+                            except Exception:
+                                same_storage = False
+                            if same_storage:
+                                trailing_extent = int(candidate.shape[-1])
+                                break
 
         if trailing_extent is not None and trailing_extent > 0:
             gather_shape[-1] = min(gather_shape[-1], trailing_extent)

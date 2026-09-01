@@ -143,15 +143,6 @@ class TestExtractedHelpers:
         assert block_id_from_key(value) == expected
 
     @pytest.mark.parametrize(
-        ("value", "expected"),
-        (("u0", 0), ("u17", 17), ("block_size_2", None), ("u", None)),
-    )
-    def test_block_id_from_symbol(self, value, expected):
-        from helion_mlir_backend._compiler.mlir.support import block_id_from_symbol
-
-        assert block_id_from_symbol(value) == expected
-
-    @pytest.mark.parametrize(
         ("value", "block_id", "upper_bounds", "expected"),
         ((64, 0, {0: 32}, 32), (64, 0, {0: 0}, 64), (64, 0, None, 64)),
     )

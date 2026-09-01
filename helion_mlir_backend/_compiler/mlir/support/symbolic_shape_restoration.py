@@ -61,7 +61,6 @@ def _restore_placeholder_metadata(
         _propagate_new_var(body_graph, placeholder, outer_value)
         return
 
-    _register_symbolic_shape_ids(shape_arg, outer_value, context, placeholder)
     concrete_shape = context.shape_from_nodes(list(shape_arg), "iter_arg")
     if isinstance(upper_bounds, (list, tuple)):
         for index, bound in enumerate(upper_bounds):
@@ -73,33 +72,9 @@ def _restore_placeholder_metadata(
                 continue
     concrete_value = torch.zeros(concrete_shape, dtype=outer_value.dtype)
     placeholder.meta["val"] = concrete_value
-    _propagate_body_metadata(body_graph, placeholder, concrete_value, context)
-
-
-def _register_symbolic_shape_ids(
-    shape_arg: list | tuple,
-    outer_value: torch.Tensor,
-    context: BuildContext,
-    placeholder: torch.fx.Node,
-) -> None:
-    import sympy
-
-    for index, shape_node in enumerate(shape_arg):
-        if not isinstance(shape_node, torch.fx.Node) or index >= len(outer_value.shape):
-            continue
-        if getattr(shape_node.target, "__name__", "") != "_get_symnode":
-            continue
-        key = shape_node.args[0] if shape_node.args else None
-        block_id = block_id_from_key(key)
-        if block_id is None:
-            continue
-        # Placeholder metadata is concretized below, so remember which block each
-        # dimension came from while the symbols are still available.
-        context.placeholder_dim_to_block_id[(id(placeholder), index)] = block_id
-        dimension = outer_value.shape[index]
-        expression = getattr(getattr(dimension, "node", None), "expr", None)
-        if isinstance(dimension, torch.SymInt) and isinstance(expression, sympy.Symbol):
-            context.block_symint_to_id[id(expression)] = block_id
+    _propagate_body_metadata(
+        body_graph, placeholder, concrete_value, list(shape_arg), context
+    )
 
 
 def _propagate_new_var(
@@ -121,6 +96,7 @@ def _propagate_body_metadata(
     body_graph: torch.fx.Graph,
     placeholder: torch.fx.Node,
     concrete_value: torch.Tensor,
+    shape_arg: list,
     context: BuildContext,
 ) -> None:
     concrete_shape = list(concrete_value.shape)
@@ -136,7 +112,7 @@ def _propagate_body_metadata(
             body_node.meta["val"] = concrete_value
             continue
         if target_name in ("sym_size.int", "sym_size_int"):
-            _propagate_sym_size(body_node, placeholder, concrete_shape)
+            _propagate_sym_size(body_node, placeholder, concrete_shape, shape_arg)
             continue
         if target_name == "load":
             _propagate_load_shape(body_node, context)
@@ -146,11 +122,28 @@ def _propagate_sym_size(
     node: torch.fx.Node,
     placeholder: torch.fx.Node,
     concrete_shape: list[int],
+    shape_arg: list,
 ) -> None:
     dimension = node.args[1] if len(node.args) > 1 else None
-    if node.args and node.args[0] is placeholder and isinstance(dimension, int):
-        if dimension < len(concrete_shape):
-            node.meta["val"] = concrete_shape[dimension]
+    if not (node.args and node.args[0] is placeholder and isinstance(dimension, int)):
+        return
+    if dimension >= len(concrete_shape):
+        return
+    # Concretizing to a plain int below discards the dimension's symbol
+    # identity, so tag the block id it came from using the same
+    # ``tile_with_offset`` convention Helion's own device-IR pass uses (read
+    # by ``resolve_index_descriptor``), instead of a side id()-keyed map.
+    if dimension < len(shape_arg):
+        shape_node = shape_arg[dimension]
+        if (
+            isinstance(shape_node, torch.fx.Node)
+            and getattr(shape_node.target, "__name__", "") == "_get_symnode"
+            and shape_node.args
+        ):
+            block_id = block_id_from_key(shape_node.args[0])
+            if block_id is not None:
+                node.meta["tile_with_offset"] = {"block_id": block_id, "offset": 0}
+    node.meta["val"] = concrete_shape[dimension]
 
 
 def _propagate_load_shape(node: torch.fx.Node, context: BuildContext) -> None:

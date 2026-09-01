@@ -44,30 +44,3 @@ class AtenHelperTable:
                 for expected, actual in zip(function_type.inputs, values, strict=True)
             )
         return False
-
-    def is_identity(self, func_name: str) -> bool:
-        """Return whether a helper returns its sole argument unchanged."""
-        if self.module is None:
-            return False
-        for operation in self.module.body.operations:
-            name_attr = operation.attributes.get("sym_name")
-            if name_attr is None:
-                continue
-            name = name_attr.value if hasattr(name_attr, "value") else str(name_attr)
-            if name != func_name:
-                continue
-            try:
-                block = operation.regions[0].blocks[0]
-                operations = list(block.operations)
-                if len(operations) != 1:
-                    return False
-                return_op = operations[0]
-                return (
-                    return_op.operation.name == "func.return"
-                    and len(return_op.operands) == 1
-                    and len(block.arguments) == 1
-                    and return_op.operands[0] == block.arguments[0]
-                )
-            except Exception:
-                return False
-        return False

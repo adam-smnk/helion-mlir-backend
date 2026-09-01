@@ -25,8 +25,7 @@ def lower_tile_index(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
         return None
 
     tile_argument = node.args[0]
-    symbols = ctx.build_sym_to_block_id()
-    block_id = ctx.infer_block_id_from_index(tile_argument, symbols)
+    block_id = ctx.infer_block_id_from_index(tile_argument)
     if block_id is None and ctx.for_block_id_stack:
         block_id = ctx.for_block_id_stack[-1]
 
@@ -138,9 +137,7 @@ def lower_tile_scalar_op(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | N
         if isinstance(tile_argument, torch.fx.Node) and tile_argument.args:
             block_id = block_id_from_key(tile_argument.args[0])
         if block_id is None:
-            block_id = ctx.infer_block_id_from_index(
-                tile_argument, ctx.build_sym_to_block_id()
-            )
+            block_id = ctx.infer_block_id_from_index(tile_argument)
     if block_id is None and ctx.for_block_id_stack:
         block_id = ctx.for_block_id_stack[-1]
     if block_id is None:

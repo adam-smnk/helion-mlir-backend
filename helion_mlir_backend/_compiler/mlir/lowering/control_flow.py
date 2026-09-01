@@ -9,10 +9,11 @@ if TYPE_CHECKING:
     import torch
 
     from ..build_context import BuildContext
+    from .for_store_context import ForStoreContext
 
 
 def _block_id_to_out_dim_from_terminal_store(
-    ctx: BuildContext, out_tensor: torch.Tensor
+    ctx: BuildContext, grid_block_ids: list[int]
 ) -> dict[int, int] | None:
     """Find the store that writes the final output and map each of its index
     positions to the block id it resolves to.
@@ -21,13 +22,18 @@ def _block_id_to_out_dim_from_terminal_store(
     dimension, regardless of the declaration order of the enclosing loops
     (e.g. ``out[tm, panel, :] = ...`` writes ``panel``'s block id to output
     dimension 1 even though the ``panel`` loop is declared before ``tm``'s).
-    Returns ``None`` if no matching terminal store is found.
-    """
-    import torch
-    import torch.fx
 
-    out_shape = tuple(int(dim) for dim in out_tensor.shape)
-    sym_to_block_id = ctx.build_sym_to_block_id()
+    A store's index list may also resolve block ids for loops that are *not*
+    part of the outer parallel grid (e.g. a nested ``hl.tile()`` loop), so a
+    store is accepted once every outer grid block id is found among its
+    resolved indices -- a stronger, less accidental signal than matching on
+    tensor shape alone (multiple tensors can share a shape) -- while any
+    other resolved block ids are simply ignored. Returns ``None`` if no such
+    store is found.
+    """
+    from ..support.index_meta import resolve_index_descriptor
+
+    expected_block_ids = set(grid_block_ids)
 
     for graph_info in ctx.host_function.device_ir.graphs:
         for node in graph_info.graph.nodes:
@@ -35,35 +41,19 @@ def _block_id_to_out_dim_from_terminal_store(
                 continue
             if getattr(node.target, "__name__", "") != "store":
                 continue
-            target_node = node.args[0]
-            target_meta = (
-                target_node.meta.get("val")
-                if isinstance(target_node, torch.fx.Node)
-                else None
-            )
-            if not isinstance(target_meta, torch.Tensor):
-                continue
-            if tuple(int(d) for d in target_meta.shape) != out_shape:
-                continue
             index_nodes = node.args[1]
             if not isinstance(index_nodes, (list, tuple)):
-                continue
-            if len(index_nodes) != len(out_shape):
                 continue
 
             mapping: dict[int, int] = {}
             for dim, index_node in enumerate(index_nodes):
                 if isinstance(index_node, slice):
                     continue
-                block_id = ctx.infer_block_id_from_index(index_node, sym_to_block_id)
-                if block_id is None and ctx.is_scalar_index_node(index_node):
-                    info = ctx.node_symbol_info(index_node)
-                    if info is not None:
-                        block_id = info[0]
-                if block_id is not None:
-                    mapping[block_id] = dim
-            if mapping:
-                return mapping
+                descriptor = resolve_index_descriptor(ctx, index_node)
+                if descriptor.block_id is not None:
+                    mapping[descriptor.block_id] = dim
+            if expected_block_ids and expected_block_ids.issubset(mapping):
+                return {bid: mapping[bid] for bid in expected_block_ids}
     return None
 
 
@@ -94,7 +84,9 @@ def build_kernel_body(ctx: BuildContext, out_tensor: torch.Tensor) -> ir.Value:
     # order block ids are indexed in the output (e.g. ``out[tm, panel, :]``
     # with ``panel``'s loop declared before ``tm``'s). Fall back to loop
     # declaration order only if no matching terminal store is found.
-    block_id_to_out_dim = _block_id_to_out_dim_from_terminal_store(ctx, out_tensor)
+    block_id_to_out_dim = _block_id_to_out_dim_from_terminal_store(
+        ctx, grid_block_ids_flat
+    )
     if block_id_to_out_dim is None:
         block_id_to_out_dim = {
             block_id: out_dim for out_dim, block_id in enumerate(grid_block_ids_flat)
@@ -358,6 +350,115 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     )
 
 
+def _compute_synthetic_tile_geometry(
+    ctx: BuildContext,
+    *,
+    full_shape: list[int],
+    index_nodes: list | tuple,
+    dim_block_ids: list[int | None],
+    inner_dim: int,
+    block_id: int,
+    active_outer_block_ids: set[int],
+    is_grid_loop: bool,
+    ub_static: int | None,
+    step: int,
+) -> tuple[list[int], list[ir.Value]]:
+    """Compute a synthetic per-iteration accumulator's shape and the offsets
+    it flushes at, one entry per destination-store dimension.
+
+    For the loop's own dimension (``inner_dim``), the tile spans the whole
+    loop range. For a scalar-indexed dimension, the tile has size 1 at that
+    scalar's current value. For a dimension owned by an active outer loop,
+    the tile spans that outer loop's block size at its current offset. Any
+    remaining dimension without a resolvable block id falls back to the
+    nearest other active outer loop's block id (grid loops only), or is left
+    unreduced at its full declared size with a zero offset.
+    """
+    tile_shape: list[int] = []
+    flush_offsets: list[ir.Value] = []
+    outer_bids = [bid for bid in active_outer_block_ids if bid != block_id]
+    fallback_outer_bid = outer_bids[0] if outer_bids else None
+    for dim, dim_size in enumerate(full_shape):
+        idx_node = index_nodes[dim] if dim < len(index_nodes) else None
+        dim_bid = dim_block_ids[dim]
+        if dim == inner_dim or dim_bid == block_id:
+            tile_shape.append(ub_static if ub_static is not None else step)
+            flush_offsets.append(ctx.index_const(0))
+            continue
+        if idx_node is not None and ctx.is_scalar_index_node(idx_node):
+            tile_shape.append(1)
+            scalar_value = (
+                ctx.block_id_to_iv.get(dim_bid) if isinstance(dim_bid, int) else None
+            )
+            if scalar_value is None:
+                scalar_value = ctx.get_value(idx_node)
+            flush_offsets.append(
+                scalar_value if scalar_value is not None else ctx.index_const(0)
+            )
+            continue
+        if (
+            isinstance(dim_bid, int)
+            and dim_bid in active_outer_block_ids
+            and dim_bid in ctx.block_id_to_size
+        ):
+            tile_shape.append(ctx.block_id_to_size[dim_bid])
+            flush_offsets.append(ctx.block_id_to_iv[dim_bid])
+        elif (
+            dim_bid is None
+            and idx_node is not None
+            and not isinstance(idx_node, slice)
+            and not is_grid_loop
+            and fallback_outer_bid is not None
+            and fallback_outer_bid in ctx.block_id_to_size
+        ):
+            tile_shape.append(ctx.block_id_to_size[fallback_outer_bid])
+            flush_offsets.append(ctx.block_id_to_iv[fallback_outer_bid])
+        else:
+            tile_shape.append(int(dim_size))
+            flush_offsets.append(ctx.index_const(0))
+    return tile_shape, flush_offsets
+
+
+def _resolve_loop_upper_bound(
+    ctx: BuildContext,
+    node: torch.fx.Node,
+    ub_src: object,
+) -> tuple[int | None, ir.Value | None]:
+    """Resolve a ``_for_loop`` upper bound to a static int and/or an ir.Value."""
+    import mlir.ir as ir
+    import torch
+    import torch.fx
+
+    from ..support import NodeLoweringError
+
+    ub_static: int | None = None
+    ub_val: ir.Value | None = None
+    if isinstance(ub_src, int):
+        ub_static = int(ub_src)
+    elif isinstance(ub_src, torch.fx.Node):
+        ub_val = ctx.get_value(ub_src)
+        if ub_val is None:
+            meta_val = ub_src.meta.get("val")
+            if isinstance(meta_val, torch.Tensor) and meta_val.numel() == 1:
+                try:
+                    ub_static = int(meta_val.item())
+                except Exception:
+                    ub_static = None
+            elif isinstance(meta_val, (int, float)):
+                ub_static = int(meta_val)
+    elif isinstance(ub_src, ir.Value):
+        ub_val = ub_src
+    if ub_static is None and ub_val is None:
+        raise NodeLoweringError(
+            node,
+            reason=f"Unsupported loop upper bound type: {type(ub_src).__name__}",
+            recovery_hint="Ensure loop bounds are integer constants or scalar tensor values",
+        )
+    if ub_val is not None:
+        ub_val = ctx.cast_to_index(ub_val)
+    return ub_static, ub_val
+
+
 def _emit_for_loop_level(
     ctx: BuildContext,
     node: torch.fx.Node,
@@ -391,31 +492,7 @@ def _emit_for_loop_level(
     block_id = block_ids[level]
     ub_src = upper_bounds[level]
     is_innermost = level == len(block_ids) - 1
-    ub_static: int | None = None
-    ub_val: ir.Value | None = None
-    if isinstance(ub_src, int):
-        ub_static = int(ub_src)
-    elif isinstance(ub_src, torch.fx.Node):
-        ub_val = ctx.get_value(ub_src)
-        if ub_val is None:
-            meta_val = ub_src.meta.get("val")
-            if isinstance(meta_val, torch.Tensor) and meta_val.numel() == 1:
-                try:
-                    ub_static = int(meta_val.item())
-                except Exception:
-                    ub_static = None
-            elif isinstance(meta_val, (int, float)):
-                ub_static = int(meta_val)
-    elif isinstance(ub_src, ir.Value):
-        ub_val = ub_src
-    if ub_static is None and ub_val is None:
-        raise NodeLoweringError(
-            node,
-            reason=f"Unsupported loop upper bound type: {type(ub_src).__name__}",
-            recovery_hint="Ensure loop bounds are integer constants or scalar tensor values",
-        )
-    if ub_val is not None:
-        ub_val = ctx.cast_to_index(ub_val)
+    ub_static, ub_val = _resolve_loop_upper_bound(ctx, node, ub_src)
 
     body_scalar_kinds = {
         info[1]
@@ -450,7 +527,7 @@ def _emit_for_loop_level(
         iter_init_vals = []
 
     active_outer_block_ids = set(ctx.block_id_to_iv.keys())
-    synthetic_store_ctx: dict[str, object] | None = None
+    synthetic_store_ctx: ForStoreContext | None = None
     synthetic_iter_index: int | None = None
     # ``body_graph`` is shared by every level of a combined multi-dim
     # ``_for_loop`` node, and an intermediate level of a naturally-nested
@@ -509,13 +586,12 @@ def _emit_for_loop_level(
                     else:
                         full_shape[dim] = 1
             rank = len(full_shape)
-            sym_to_block_id = ctx.build_sym_to_block_id()
             dim_block_ids: list[int | None] = []
             inner_dim: int | None = None
             for dim, idx_node in enumerate(index_nodes):
                 if dim >= rank:
                     break
-                dim_bid = ctx.infer_block_id_from_index(idx_node, sym_to_block_id)
+                dim_bid = ctx.infer_block_id_from_index(idx_node)
                 if dim_bid is None and ctx.is_scalar_index_node(idx_node):
                     info = ctx.node_symbol_info(idx_node)
                     if info is not None:
@@ -528,52 +604,18 @@ def _emit_for_loop_level(
             if inner_dim is None:
                 inner_dim = min(rank - 1, max(0, len(index_nodes) - 1))
             if inner_dim is not None:
-                tile_shape: list[int] = []
-                flush_offsets: list[ir.Value] = []
-                outer_bids = [bid for bid in active_outer_block_ids if bid != block_id]
-                fallback_outer_bid = outer_bids[0] if outer_bids else None
-                for dim, dim_size in enumerate(full_shape):
-                    idx_node = index_nodes[dim] if dim < len(index_nodes) else None
-                    dim_bid = dim_block_ids[dim]
-                    if dim == inner_dim or dim_bid == block_id:
-                        tile_shape.append(ub_static if ub_static is not None else step)
-                        flush_offsets.append(ctx.index_const(0))
-                        continue
-                    if idx_node is not None and ctx.is_scalar_index_node(idx_node):
-                        tile_shape.append(1)
-                        scalar_value = (
-                            ctx.block_id_to_iv.get(dim_bid)
-                            if isinstance(dim_bid, int)
-                            else None
-                        )
-                        if scalar_value is None:
-                            scalar_value = ctx.get_value(idx_node)
-                        flush_offsets.append(
-                            scalar_value
-                            if scalar_value is not None
-                            else ctx.index_const(0)
-                        )
-                        continue
-                    if (
-                        isinstance(dim_bid, int)
-                        and dim_bid in active_outer_block_ids
-                        and dim_bid in ctx.block_id_to_size
-                    ):
-                        tile_shape.append(ctx.block_id_to_size[dim_bid])
-                        flush_offsets.append(ctx.block_id_to_iv[dim_bid])
-                    elif (
-                        dim_bid is None
-                        and idx_node is not None
-                        and not isinstance(idx_node, slice)
-                        and not is_grid_loop
-                        and fallback_outer_bid is not None
-                        and fallback_outer_bid in ctx.block_id_to_size
-                    ):
-                        tile_shape.append(ctx.block_id_to_size[fallback_outer_bid])
-                        flush_offsets.append(ctx.block_id_to_iv[fallback_outer_bid])
-                    else:
-                        tile_shape.append(int(dim_size))
-                        flush_offsets.append(ctx.index_const(0))
+                tile_shape, flush_offsets = _compute_synthetic_tile_geometry(
+                    ctx,
+                    full_shape=full_shape,
+                    index_nodes=index_nodes,
+                    dim_block_ids=dim_block_ids,
+                    inner_dim=inner_dim,
+                    block_id=block_id,
+                    active_outer_block_ids=active_outer_block_ids,
+                    is_grid_loop=is_grid_loop,
+                    ub_static=ub_static,
+                    step=step,
+                )
                 tile_empty = tensor_d.EmptyOp(tile_shape, elem_ty).result
                 if isinstance(elem_ty, ir.FloatType):
                     zero_attr = ir.FloatAttr.get(elem_ty, 0.0)
@@ -583,10 +625,10 @@ def _emit_for_loop_level(
                 tile_init = linalg_d.fill(zero, outs=[tile_empty])
                 synthetic_iter_index = len(iter_init_vals)
                 iter_init_vals.append(tile_init)
-                synthetic_store_ctx = {
-                    "flush_offsets": flush_offsets,
-                    "current": None,
-                }
+
+                from .for_store_context import ForStoreContext
+
+                synthetic_store_ctx = ForStoreContext(flush_offsets=flush_offsets)
     lb_val = ctx.index_const(0)
     ub_val = (
         ub_val
@@ -617,7 +659,7 @@ def _emit_for_loop_level(
             ):
                 ctx.set_value(ph_node, body_arg)
             if synthetic_store_ctx is not None and synthetic_iter_index is not None:
-                synthetic_store_ctx["current"] = body_block.arguments[
+                synthetic_store_ctx.current = body_block.arguments[
                     1 + synthetic_iter_index
                 ]
                 with ctx.push_store_ctx(synthetic_store_ctx):
@@ -631,7 +673,7 @@ def _emit_for_loop_level(
                     yield_vals.append(v)
         else:
             if synthetic_store_ctx is not None and synthetic_iter_index is not None:
-                synthetic_store_ctx["current"] = body_block.arguments[
+                synthetic_store_ctx.current = body_block.arguments[
                     1 + synthetic_iter_index
                 ]
                 with ctx.push_store_ctx(synthetic_store_ctx):
@@ -656,7 +698,7 @@ def _emit_for_loop_level(
                 )
             yield_vals = []
         if synthetic_store_ctx is not None:
-            current = synthetic_store_ctx.get("current")
+            current = synthetic_store_ctx.current
             if current is not None:
                 insert_at = (
                     synthetic_iter_index
@@ -682,11 +724,11 @@ def _emit_for_loop_level(
         final_tile = for_op.results[synthetic_iter_index]
         if ctx.for_store_ctx_stack:
             parent_ctx = ctx.for_store_ctx_stack[-1]
-            parent_current = parent_ctx.get("current")
+            parent_current = parent_ctx.current
             if parent_current is not None:
                 parent_type = ir.RankedTensorType(parent_current.type)
                 tile_type = ir.RankedTensorType(final_tile.type)
-                offsets = list(synthetic_store_ctx["flush_offsets"])
+                offsets = list(synthetic_store_ctx.flush_offsets)
                 if len(offsets) != parent_type.rank:
                     offsets = offsets[: parent_type.rank]
                     offsets.extend(
@@ -714,9 +756,9 @@ def _emit_for_loop_level(
                     static_sizes=[int(dim) for dim in tile_type.shape],
                     static_strides=[1] * parent_type.rank,
                 ).result
-                parent_ctx["current"] = updated
+                parent_ctx.current = updated
         else:
             ctx.forall_insert_slices.append(
-                (final_tile, synthetic_store_ctx["flush_offsets"], None)
+                (final_tile, synthetic_store_ctx.flush_offsets, None)
             )
     return for_op
