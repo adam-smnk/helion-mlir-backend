@@ -54,9 +54,9 @@ class OutputTensorResolver:
                             "The MLIR backend only supports kernels that return a "
                             "single tensor"
                         ),
-                        recovery_hint=(
+                        alternatives=[
                             "Split the kernel into separate single-output kernels"
-                        ),
+                        ],
                     )
                 if output_arg:
                     output_arg = output_arg[0]
@@ -93,6 +93,26 @@ class OutputTensorResolver:
 
         if len(store_targets) == 1:
             return "__store_target__", store_targets[0]
+        if len(store_targets) > 1:
+            # Multiple distinct non-input tensors are each written by their
+            # own `store`, i.e. a genuine multi-output kernel (`return a, b`).
+            # This device-IR shape is different from a plain single-output
+            # kernel's: the per-loop-body FX graph's own `output` node stays
+            # trivial (`None`) since outputs are mutated host tensors, not
+            # graph results, so the list/tuple check above never observes
+            # more than one tensor-like value there and never fires for this
+            # case. Detect it here instead, where it reliably shows up as 2+
+            # distinct non-input store targets, rather than silently falling
+            # through to an arbitrary (and wrong) single-output guess.
+            from .support import UnsupportedOperationError
+
+            raise UnsupportedOperationError(
+                "multi-output kernel",
+                reason=(
+                    "The MLIR backend only supports kernels that return a single tensor"
+                ),
+                alternatives=["Split the kernel into separate single-output kernels"],
+            )
 
         non_input_tensors = [
             (name, tensor) for name, tensor in tensor_params if name not in input_names
