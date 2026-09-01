@@ -30,6 +30,8 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             try:
                 gather_index_type = ir.RankedTensorType(gather_index_value.type)
             except Exception:
+                # Native MLIR binding raises for a non-ranked-tensor type; this
+                # probes "is it a tensor" rather than catching a specific error.
                 gather_index_type = None
             if gather_index_type is not None and gather_index_type.rank >= 1:
                 from .load_ops import lower_flat_gather

@@ -37,9 +37,16 @@ class BuildContext:
     block_id_to_size: dict[int, int] = field(default_factory=dict)
     block_id_to_upper_bound: dict[int, int] = field(default_factory=dict)
 
+    # Written directly once per outer grid block id (build_kernel_body) then
+    # save/restored per nested scf.for level via enter_for_loop(); read
+    # everywhere a block id's current induction variable is needed.
     block_id_to_iv: dict[int, ir.Value] = field(default_factory=dict)
     forall_insert_slices: list[tuple] = field(default_factory=list)
+    # Mutate only via push_store_ctx(); read the top via for_store_ctx_stack[-1].
     for_store_ctx_stack: list[ForStoreContext] = field(default_factory=list)
+    # Mutate only via enter_for_loop(); read as a last-resort fallback (top of
+    # stack = innermost active loop's block id) when a scalar tile op has no
+    # other way to resolve which block id it belongs to.
     for_block_id_stack: list[int] = field(default_factory=list)
 
     mlir_module: ir.Module | None = None
@@ -147,7 +154,7 @@ class BuildContext:
         if isinstance(value, torch.Tensor):
             try:
                 return [int(dim) for dim in value.shape]
-            except Exception:
+            except (TypeError, ValueError):
                 return None
         tensor_meta = node.meta.get("tensor_meta")
         shape = getattr(tensor_meta, "shape", None)
@@ -155,7 +162,7 @@ class BuildContext:
             return None
         try:
             return [int(dim) for dim in shape]
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
     def shape_from_nodes(
@@ -171,7 +178,11 @@ class BuildContext:
                 if target_name == "_get_symnode" and shape_node.args:
                     block_id = block_id_from_key(shape_node.args[0])
                     if block_id is not None and block_id in self.block_id_to_size:
-                        shape.append(self.block_id_to_size[block_id])
+                        size = self.block_id_to_size[block_id]
+                        upper_bound = self.block_id_to_upper_bound.get(block_id)
+                        if upper_bound is not None:
+                            size = min(size, upper_bound)
+                        shape.append(size)
                         continue
                 if (
                     target_name in ("sym_size.int", "sym_size_int")
@@ -207,7 +218,7 @@ class BuildContext:
                     try:
                         shape.append(int(value))
                         continue
-                    except Exception:
+                    except (TypeError, ValueError):
                         pass
             elif isinstance(shape_node, int):
                 shape.append(shape_node)

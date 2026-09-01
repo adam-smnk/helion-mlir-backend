@@ -85,6 +85,9 @@ def rebuild_aten_helper_for_call(
         except Exception as exc:
             import logging
 
+            # preprocess_aten_nodes runs the full torch-mlir pipeline, which
+            # can fail in many ways; the caller raises a clear error if this
+            # returns None and the signature still doesn't match.
             logging.getLogger(__name__).warning(
                 "On-demand helper rebuild failed for node %s (%s): %s",
                 node.name,

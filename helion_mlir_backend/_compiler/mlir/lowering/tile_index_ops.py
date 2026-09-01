@@ -58,6 +58,7 @@ def lower_tile_index(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
             if isinstance(metadata_type, (ir.IntegerType, ir.IndexType)):
                 element_type = metadata_type
         except Exception:
+            # Best-effort element-type refinement; fall back to index type.
             pass
 
     index_type = ir.IndexType.get()

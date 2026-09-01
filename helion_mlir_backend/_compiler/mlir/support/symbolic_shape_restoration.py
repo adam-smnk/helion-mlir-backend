@@ -158,4 +158,6 @@ def _propagate_load_shape(node: torch.fx.Node, context: BuildContext) -> None:
         ):
             node.meta["val"] = torch.zeros(load_shape, dtype=old_value.dtype)
     except Exception:
+        # Best-effort shape refresh; on failure the node keeps its prior
+        # (possibly stale but still usable) metadata.
         return

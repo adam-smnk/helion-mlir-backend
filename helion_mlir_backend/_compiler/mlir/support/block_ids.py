@@ -32,6 +32,8 @@ def _symbol_expr(value: object) -> object | None:
     try:
         return value._sympy_()
     except Exception:
+        # torch.SymInt._sympy_() has no documented narrow failure mode; best
+        # effort only.
         return None
 
 

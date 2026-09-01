@@ -26,6 +26,7 @@ dev = [
   "pytest>=8.0.0",
   "pytest-timeout",
   "psutil",
+  "hypothesis",
 ]
 
 # Based on Helion rules

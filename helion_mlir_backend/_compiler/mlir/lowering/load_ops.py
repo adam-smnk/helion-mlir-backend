@@ -55,6 +55,8 @@ def lower_flat_gather(
                 try:
                     alias_storage = alias_value.untyped_storage()
                 except Exception:
+                    # torch.Tensor.untyped_storage() can raise for unusual
+                    # tensor backends; treat as "no storage identity available".
                     alias_storage = None
                 if alias_storage is not None:
                     for candidate in ctx.host_function.params.arguments.values():
@@ -68,6 +70,8 @@ def lower_flat_gather(
                                     candidate.untyped_storage() is alias_storage
                                 )
                             except Exception:
+                                # Same rationale as above: unusual tensor
+                                # backends can raise here.
                                 same_storage = False
                             if same_storage:
                                 trailing_extent = int(candidate.shape[-1])

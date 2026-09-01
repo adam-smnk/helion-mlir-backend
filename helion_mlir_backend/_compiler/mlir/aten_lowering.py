@@ -390,6 +390,8 @@ def _try_evaluate_aten_result(
         with torch.no_grad():
             out = node.target(*eval_args, **eval_kwargs)
     except Exception:
+        # node.target is an arbitrary user-selected ATen op; it can raise any
+        # exception type depending on operand shapes/dtypes.
         return None
 
     if isinstance(out, torch.Tensor):
@@ -680,6 +682,7 @@ def _evaluate_fake_aten_node(
         with torch.no_grad():
             result = node.target(*eval_args, **eval_kwargs)
     except Exception:
+        # Same rationale as _try_evaluate_aten_result: arbitrary ATen op.
         return None
 
     if isinstance(result, torch.Tensor):
@@ -796,7 +799,7 @@ def _resolve_symint_dim(
 ) -> int | None:
     try:
         hint_value = int(dimension)
-    except Exception:
+    except (TypeError, ValueError):
         hint_value = None
 
     block_id = env.get_block_id(dimension) if env is not None else None
