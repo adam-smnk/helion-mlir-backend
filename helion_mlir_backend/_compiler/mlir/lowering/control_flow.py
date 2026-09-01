@@ -447,34 +447,36 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
 
     if len(block_ids) == 1:
         block_id = block_ids[0]
-        # Helion can reuse the enclosing grid block id on a nested loop node.
-        # The body still contains the inner scalar symbol, whose origin is
-        # authoritative.
-        if block_id in ctx.block_id_to_iv:
-            body_block_ids = {
-                info[0]
-                for body_node in body_graph.nodes
-                if (info := ctx.node_symbol_info(body_node)) is not None
-                and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
-                and info[0] not in ctx.block_id_to_iv
-            }
-            body_block_ids.update(
-                body_block_id
-                for body_node in body_graph.nodes
-                if getattr(body_node.target, "__name__", "") == "_get_symnode"
-                and body_node.args
-                and (body_block_id := block_id_from_key(body_node.args[0])) is not None
-                and body_block_id not in ctx.block_id_to_iv
-            )
-            if len(body_block_ids) == 1:
-                block_id = next(iter(body_block_ids))
-            elif not body_block_ids:
-                # Direct body is a pure wrapper with no symbols at this level
-                # (loop nested 3+ levels deep); unwrap further nested
-                # ``_for_loop`` wrappers to find the block id introduced here.
-                resolved = _find_reused_block_id(ctx, body_graph)
-                if resolved is not None:
-                    block_id = resolved
+        # Helion can reuse a surrounding grid block id on a nested loop node.
+        # This may be a grid id from an earlier hl.barrier()-separated phase,
+        # so it need not be active in ctx.block_id_to_iv. The body still
+        # contains the inner scalar symbol, whose origin is authoritative.
+        body_block_ids = {
+            info[0]
+            for body_node in body_graph.nodes
+            if (info := ctx.node_symbol_info(body_node)) is not None
+            and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
+            and info[0] not in ctx.block_id_to_iv
+        }
+        body_block_ids.update(
+            body_block_id
+            for body_node in body_graph.nodes
+            if getattr(body_node.target, "__name__", "") == "_get_symnode"
+            and body_node.args
+            and (body_block_id := block_id_from_key(body_node.args[0])) is not None
+            and body_block_id not in ctx.block_id_to_iv
+        )
+        if len(body_block_ids) == 1:
+            candidate = next(iter(body_block_ids))
+            if candidate != block_id:
+                block_id = candidate
+        elif not body_block_ids and block_id in ctx.block_id_to_iv:
+            # Direct body is a pure wrapper with no symbols at this level
+            # (loop nested 3+ levels deep); unwrap further nested
+            # ``_for_loop`` wrappers to find the block id introduced here.
+            resolved = _find_reused_block_id(ctx, body_graph)
+            if resolved is not None:
+                block_id = resolved
         block_ids = [block_id]
     else:
         if iter_arg_nodes:

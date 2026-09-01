@@ -106,6 +106,65 @@ def test_host_tensor_computed_before_phases_and_used_in_later_phase():
     torch.testing.assert_close(result, (x + y) * (x.mean() * 3.0))
 
 
+def test_multiphase_grid_packing_then_blocked_matmul():
+    """Phase-local block IDs must supersede a stale ID reused from phase 0.
+
+    The nested `tm` loop in phase 1 can be declared with phase 0's raw grid
+    block ID even though its body identifies a new tile block ID. The
+    recovery must use that unique body-derived ID, or synthetic accumulator
+    geometry expands the final 8-wide panel dimension to 16 and emits an
+    invalid tensor.cast.
+    """
+
+    n, block_m, block_n, tile_m, tile_k = 32, 16, 8, 8, 8
+    m_blocks, n_panels = n // block_m, n // block_n
+
+    @helion.kernel(
+        static_shapes=True,
+        backend="mlir",
+        config=helion.Config(block_sizes=[tile_k, tile_m, tile_k]),
+    )
+    def packed_blocked_matmul(a3: torch.Tensor, b3: torch.Tensor) -> torch.Tensor:
+        m_blocks_, block_m_, k = a3.shape
+        k2, n_panels_, block_n_ = b3.shape
+        packed_b = torch.empty(
+            (n_panels_, k, block_n_), dtype=b3.dtype, device=b3.device
+        )
+        blocked_out = torch.empty(
+            (m_blocks_, n_panels_, block_m_, block_n_),
+            dtype=torch.float32,
+            device=a3.device,
+        )
+        for panel in hl.grid(n_panels_):
+            for tile_k_ in hl.tile(k):
+                packed_b[panel, tile_k_, :] = b3[tile_k_, panel, :]
+        hl.barrier()
+        for m_block, panel in hl.grid([m_blocks_, n_panels_]):
+            for tile_m_ in hl.tile(block_m_):
+                acc = hl.zeros([tile_m_, block_n_], dtype=torch.float32)
+                for tile_k_ in hl.tile(k):
+                    acc = torch.addmm(
+                        acc,
+                        a3[m_block, tile_m_, tile_k_],
+                        packed_b[panel, tile_k_, :],
+                    )
+                blocked_out[m_block, panel, tile_m_, :] = acc
+        return blocked_out
+
+    a = torch.randn(n, n, dtype=torch.bfloat16)
+    b = torch.randn(n, n, dtype=torch.bfloat16)
+    a3 = a.view(m_blocks, block_m, n)
+    b3 = b.view(n, n_panels, block_n).contiguous()
+
+    actual = packed_blocked_matmul(a3, b3)
+    expected = (
+        (a.float() @ b.float())
+        .view(m_blocks, block_m, n_panels, block_n)
+        .permute(0, 2, 1, 3)
+    )
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=1.0)
+
+
 def test_multi_phase_generate_mlir_raises_clear_diagnostic():
     from helion_mlir_backend import generate_mlir
     from helion_mlir_backend._compiler.mlir.support.errors import (
