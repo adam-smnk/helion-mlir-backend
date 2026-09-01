@@ -108,11 +108,7 @@ def build_kernel_body(
     for ids in groups:
         grid_block_ids_flat.extend(ids)
 
-    phase_graphs = (
-        [ctx.host_function.device_ir.graphs[rid].graph for rid in root_ids]
-        if root_ids is not None
-        else None
-    )
+    phase_graphs = _phase_graph_closure(ctx, root_ids) if root_ids is not None else None
 
     # Prefer the authoritative mapping derived from the terminal store's own
     # index expression: loop declaration order does not necessarily match the
@@ -263,6 +259,35 @@ def build_kernel_body(
                 )
 
     return list(forall.results)
+
+
+def _phase_graph_closure(
+    ctx: BuildContext, root_ids: list[int]
+) -> list[torch.fx.Graph]:
+    """Every graph belonging to phase-root graph IDs, including nested loops.
+
+    Terminal stores usually reside in a nested `_for_loop` body rather than
+    directly in a root graph, so a root-only scan would miss the authoritative
+    index order and incorrectly use declaration order as a fallback.
+    """
+    device_ir = ctx.host_function.device_ir
+    graphs: list[torch.fx.Graph] = []
+    seen_ids: set[int] = set()
+    pending = list(root_ids)
+    while pending:
+        graph_id = pending.pop()
+        if graph_id in seen_ids:
+            continue
+        seen_ids.add(graph_id)
+        graph = device_ir.graphs[graph_id].graph
+        graphs.append(graph)
+        pending.extend(
+            node.args[0]
+            for node in graph.nodes
+            if node.op == "call_function"
+            and getattr(node.target, "__name__", "") == "_for_loop"
+        )
+    return graphs
 
 
 def _validate_multi_output_shapes(
