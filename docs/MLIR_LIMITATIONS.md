@@ -10,7 +10,7 @@ This document lists current limitations for the MLIR backend in this repository.
   `tests/test_mlir_execution.py`, `tests/test_mlir_integration.py`,
   `tests/test_index_descriptor.py`, `tests/test_reduce_ops.py`, and
   `tests/test_property_kernels.py` (property-based fuzz coverage).
-- The current suite contains 174 passing tests.
+- The current suite contains 181 passing tests.
 - Both explicit generate-and-execute flow and direct backend="mlir" flow are exercised.
 - All example scripts under `examples/` are kept runnable and are re-verified
   after backend changes (`uv run python examples/<name>.py`).
