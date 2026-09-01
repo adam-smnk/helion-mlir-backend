@@ -37,7 +37,6 @@ class BuildContext:
     block_hint_to_id: dict[int, int] = field(default_factory=dict)
     block_symint_to_id: dict[int, int] = field(default_factory=dict)
     block_id_to_upper_bound: dict[int, int] = field(default_factory=dict)
-    block_id_to_out_dim: dict[int, int] = field(default_factory=dict)
 
     block_id_to_iv: dict[int, ir.Value] = field(default_factory=dict)
     placeholder_dim_to_block_id: dict[tuple[int, int], int] = field(
@@ -324,41 +323,7 @@ class BuildContext:
             return left_block, left_bias + right_bias
         if right_block is not None and left_block is None:
             return right_block, right_bias + left_bias
-        if left_block is not None or right_block is not None:
-            return None, 0
-
-        left_shape_block = self.infer_block_id_from_value_shape(left_index)
-        right_shape_block = self.infer_block_id_from_value_shape(right_index)
-        if left_shape_block is not None and right_shape_block is None:
-            return left_shape_block, left_bias + right_bias
-        if right_shape_block is not None and left_shape_block is None:
-            return right_shape_block, right_bias + left_bias
         return None, 0
-
-    def infer_block_id_from_value_shape(self, index_node: object) -> int | None:
-        """Infer a block id from a one-dimensional index value extent."""
-        import mlir.ir as ir
-        import torch.fx
-
-        if not isinstance(index_node, torch.fx.Node):
-            return None
-        value = self.get_value(index_node)
-        if value is None:
-            return None
-        try:
-            value_type = ir.RankedTensorType(value.type)
-        except Exception:
-            return None
-        if value_type.rank != 1:
-            return None
-        extent = int(value_type.shape[0])
-        candidates = [
-            block_id
-            for block_id in self.block_id_to_iv
-            if self.block_id_to_upper_bound.get(block_id) == extent
-            or self.block_id_to_size.get(block_id) == extent
-        ]
-        return candidates[0] if len(candidates) == 1 else None
 
     def infer_block_id_from_index_symbolic(
         self, index_node: object, sym_to_block_id: dict[str, int]

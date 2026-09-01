@@ -53,29 +53,21 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     if target_value is not None:
         value = _cast_store_value(ctx, value, target_value)
 
-    ndim = len(ir.RankedTensorType(value.type).shape)
-
     if ctx.for_store_ctx_stack:
         context = ctx.for_store_ctx_stack[-1]
         current = context.get("current")
-        block_id = int(context.get("block_id", -1))
-        rank = int(context.get("rank", ndim))
 
-        # Try to use store_plan if available; compute on first use.
+        # Compute the descriptor-based per-iteration insert plan once, on
+        # first use.
         store_plan = context.get("store_plan")
         if store_plan is None and current is not None:
             from .slice_plan import plan_slice
 
             target_type = ir.RankedTensorType(current.type)
-            try:
-                store_plan = plan_slice(ctx, index_nodes, target_type)
-                context["store_plan"] = store_plan
-            except Exception:
-                # Fallback: plan_slice failed, use legacy inner_dim path
-                store_plan = None
+            store_plan = plan_slice(ctx, index_nodes, target_type)
+            context["store_plan"] = store_plan
 
         if store_plan is not None and current is not None:
-            # Descriptor-based per-iteration insert.
             offsets = store_plan.offsets()
             static_sizes = store_plan.static_sizes()
             updated = tensor_d.InsertSliceOp(
@@ -87,41 +79,6 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
                 static_offsets=[ir.ShapedType.get_dynamic_size()] * len(offsets),
                 static_sizes=static_sizes,
                 static_strides=[1] * len(offsets),
-            ).result
-            context["current"] = updated
-            return
-
-        # Fallback to legacy inner_dim path if plan_slice not available.
-        inner_dim = int(context.get("inner_dim", -1))
-        if (
-            current is not None
-            and 0 <= inner_dim < rank
-            and block_id in ctx.block_id_to_iv
-        ):
-            source_type = ir.RankedTensorType(value.type)
-            source_rank = len(source_type.shape)
-            scalar_offsets = [
-                ctx.block_id_to_iv[block_id]
-                if dimension == inner_dim
-                else ctx.index_const(0)
-                for dimension in range(rank)
-            ]
-            static_sizes = list(source_type.shape)
-            if source_rank < rank:
-                static_sizes = [1] * (rank - source_rank) + static_sizes
-            if len(static_sizes) < rank:
-                static_sizes = static_sizes + [1] * (rank - len(static_sizes))
-            elif len(static_sizes) > rank:
-                static_sizes = static_sizes[:rank]
-            updated = tensor_d.InsertSliceOp(
-                value,
-                current,
-                scalar_offsets,
-                [],
-                [],
-                static_offsets=[ir.ShapedType.get_dynamic_size()] * rank,
-                static_sizes=static_sizes,
-                static_strides=[1] * rank,
             ).result
             context["current"] = updated
             return
@@ -143,7 +100,9 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
             # Fall through to positional approach if plan_slice fails.
             pass
 
-    # Fallback: positional heuristic-based terminal store.
+    # Fallback: positional heuristic-based terminal store. Reached whenever
+    # ``target_value`` isn't bound yet (the common case: the output tensor is
+    # created later in ``build_kernel_body``, not as an SSA value here).
     offsets: list[ir.Value] = []
     static_sizes: list[int] = []
     value_shape = list(ir.RankedTensorType(value.type).shape)
