@@ -118,6 +118,42 @@ Equivalent accumulation style is also supported:
 acc = acc + torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
 ```
 
+### Multi-phase kernels (`hl.barrier()`) and host-tensor interop
+
+Only supported through the **direct call path** above (`backend="mlir"`),
+not through `generate_mlir()` + `execute_mlir()`:
+
+```python
+@helion.kernel(static_shapes=True, backend="mlir")
+def two_phase(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    scale = x.mean() * 2.0  # host tensor, not a declared parameter
+    mid = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+    out = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+
+    for tile_m, tile_n in hl.tile([m, n]):
+        s = hl.load(scale, [])
+        mid[tile_m, tile_n] = (x[tile_m, tile_n] + y[tile_m, tile_n]) * s
+
+    hl.barrier()  # phase 1 below reads `mid`, written above
+
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = mid[tile_m, tile_n] * 2.0
+    return out
+```
+
+Each `hl.barrier()`-separated phase compiles to its own MLIR function; a
+real host-side driver runs between phase calls, threading real tensors
+between phases and any host-computed tensors by their Python variable name.
+`hl.barrier()` is required (not optional, not CPU-specific) whenever a later
+phase reads a tensor written by an earlier one -- Helion's frontend rejects
+the kernel otherwise (`LoopDependencyError`), and no statement other than
+`hl.barrier()` itself may appear between two top-level device loops, so a
+host tensor a later phase needs must be computed before the loop that first
+uses it. See `examples/multi_phase_mlir.py` for a complete, runnable example,
+and `docs/MLIR_LIMITATIONS.md` ("Multi-Phase Kernels and Host-Tensor
+Interop") for full scope and current limitations.
+
 ## Configurable Block Sizes
 
 Block sizes from `helion.Config(block_sizes=[...])` are propagated into generated loops.
