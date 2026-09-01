@@ -57,7 +57,8 @@ def elementwise_mul(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
     for tile_m, tile_n in hl.tile([m, n]):
         # Broadcast scalar multiplication
-        out[tile_m, tile_n] = x[tile_m, tile_n] * scale
+        scale_val = hl.load(scale, [])
+        out[tile_m, tile_n] = x[tile_m, tile_n] * scale_val
 
     return out
 

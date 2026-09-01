@@ -247,11 +247,21 @@ def _build_aten_subgraph(
 
     # Some traced elementwise ATen nodes can carry stale tensor metadata on one
     # operand while another operand is already tile-bounded. Normalize all
-    # tensor placeholders for this node to a common bounded shape.
-    if len(concrete_tensor_args) >= 2 and _is_broadcasting_aten_target(node.target):
-        target_shape = broadcast_target_shape(
-            [t for t in concrete_tensor_args.values() if isinstance(t, torch.Tensor)]
-        )
+    # tensor placeholders for this node to a common bounded shape. Restricted
+    # to same-rank operands: rank-expanding a lower-rank operand (e.g. a 1D
+    # bias broadcast against a 2D accumulator) would make the helper's
+    # signature require an already-expanded shape that the real call site
+    # never materializes (the MLIR value stays at its original rank), so
+    # genuine rank-broadcast is instead left to torch-mlir's own lowering.
+    _tensor_values = [
+        t for t in concrete_tensor_args.values() if isinstance(t, torch.Tensor)
+    ]
+    if (
+        len(concrete_tensor_args) >= 2
+        and _is_broadcasting_aten_target(node.target)
+        and len({t.dim() for t in _tensor_values}) == 1
+    ):
+        target_shape = broadcast_target_shape(_tensor_values)
         if target_shape is not None:
             for fx_node, t in list(concrete_tensor_args.items()):
                 if tuple(int(s) for s in t.shape) != tuple(target_shape):
