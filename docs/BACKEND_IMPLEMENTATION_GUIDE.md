@@ -6,7 +6,7 @@
 helion/_compiler/mybackend/
 ├── __init__.py                    # Empty or re-exports
 ├── backend.py                     # Backend class (required)
-├── _codegen_modules.py            # Module registry (required)
+├── _codegen_modules.py            # Module registry (only for per-op codegen hooks)
 ├── aten_lowering.py               # ATen op mappings (optional)
 ├── memory_ops.py                  # Store/load codegen
 ├── reduce_ops.py                  # Reduction codegen

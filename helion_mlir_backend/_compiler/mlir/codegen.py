@@ -21,52 +21,21 @@ Pointwise aten ops        → ``linalg.generic`` or ``arith.*``
 ``_phi``                  → the result of the enclosing ``scf.for``
 ``_new_var``              → pass-through (same MLIR value)
 
-Why this module manually lowers ATen ops instead of using torch-mlir
----------------------------------------------------------------------
-The `torch-mlir` project (present in this workspace as source) provides
-``FxImporter`` + a ``torch-backend-to-linalg-on-tensors-backend-pipeline``
-that would in principle replace the hand-written ``_lower_*`` methods below.
-There are three reasons it is not used today:
+ATen lowering architecture
+--------------------------
+This builder uses a hybrid design. Helion-specific device-IR nodes
+(``_for_loop``, ``_host_tensor``, ``_phi``, ``_new_var``, ``load``, and
+``store``) determine the tile/control-flow structure and lower directly to
+``scf``/``tensor``/``linalg`` operations. Generic ATen nodes are extracted
+into pure FX subgraphs by ``aten_lowering.py``, imported through
+``torch_mlir.extras.fx_importer.FxImporter``, lowered through torch-mlir's
+Torch-to-Linalg pipeline, and cloned back into this module as private helper
+``func.func`` operations. A small set of manual ATen lowerings remains for
+Helion-specific operand conventions and recognized accumulation patterns.
 
-1. **Not built**: ``torch_mlir`` is only present as source; using it requires
-   a full LLVM + MLIR + torch-mlir CMake build.  Until a pre-built wheel is
-   available (e.g. from the EUDSL index already in ``pyproject.toml``), the
-   Python package cannot be imported.
-
-2. **Dialect mismatch**: ``FxImporter`` imports an FX graph into the *torch*
-   MLIR dialect (``torch.aten.mm``, ``torch.aten.add.Tensor``, …), not into
-   linalg directly.  Reaching linalg-on-tensors requires running the C++
-   pipeline pass ``torch-backend-to-linalg-on-tensors-backend-pipeline``
-   afterwards.  We currently write linalg ops directly, bypassing the
-   ``torch`` dialect entirely.
-
-3. **Helion-specific ops are unknown to FxImporter**: Helion's device IR
-   graph contains non-ATen call_function nodes (``_host_tensor``,
-   ``_for_loop``, ``_phi``, ``_new_var``, ``store``, ``load``).
-   ``FxImporter.import_nodes()`` only accepts ``TorchOpOverload`` or
-   ``HigherOrderOperator`` targets; the helion ops would raise
-   ``NotImplementedError``.  The tiling structure they encode must be emitted
-   as ``scf.forall`` / ``scf.for``, which torch-mlir's pipeline never
-   generates.
-
-Desired future architecture (two-phase)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Phase 1 – keep as-is: emit the ``scf.forall`` / ``scf.for`` tile structure
-from helion-specific nodes (``_for_loop``, ``_host_tensor``, etc.).
-
-Phase 2 – replace ``_lower_*`` ATen methods: extract the pure-ATen subgraph
-from each tile body, import it with ``FxImporter.import_stateless_graph()``,
-run the linalg lowering pipeline, then inline the resulting ``func.func``
-into the tile body.  This would give automatic coverage for all ops that
-torch-mlir supports (hundreds vs the current ~15) with no manual
-reimplementation.
-
-Prerequisites before Phase 2 can land:
-  * A pre-built ``torch_mlir`` wheel on the EUDSL index (or a local build).
-  * A bridge layer that strips helion-specific nodes before handing the
-    subgraph to ``FxImporter``, then re-emits the surrounding structure.
-  * Update ``pyproject.toml`` to add ``torch-mlir`` as a dependency
-    (analogous to ``mlir-python-bindings``).
+This split is necessary because ``FxImporter`` cannot import Helion's
+non-ATen FX targets, while torch-mlir provides broad, reusable coverage for
+the ordinary ATen portions of each tile body.
 """
 
 from __future__ import annotations
