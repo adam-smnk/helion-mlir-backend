@@ -6,10 +6,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
-from typing import Any
 
 from .support import block_id_from_key
-from .support import block_id_from_symbol
+from .support.index_meta import resolve_index_descriptor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -20,6 +19,8 @@ if TYPE_CHECKING:
     from helion.runtime.config import Config
     import mlir.ir as ir
     import torch.fx
+
+    from .lowering.for_store_context import ForStoreContext
 
 
 @dataclass
@@ -34,16 +35,11 @@ class BuildContext:
     param_to_value: dict[str, ir.Value] = field(default_factory=dict)
 
     block_id_to_size: dict[int, int] = field(default_factory=dict)
-    block_hint_to_id: dict[int, int] = field(default_factory=dict)
-    block_symint_to_id: dict[int, int] = field(default_factory=dict)
     block_id_to_upper_bound: dict[int, int] = field(default_factory=dict)
 
     block_id_to_iv: dict[int, ir.Value] = field(default_factory=dict)
-    placeholder_dim_to_block_id: dict[tuple[int, int], int] = field(
-        default_factory=dict
-    )
     forall_insert_slices: list[tuple] = field(default_factory=list)
-    for_store_ctx_stack: list[dict[str, Any]] = field(default_factory=list)
+    for_store_ctx_stack: list[ForStoreContext] = field(default_factory=list)
     for_block_id_stack: list[int] = field(default_factory=list)
 
     mlir_module: ir.Module | None = None
@@ -166,7 +162,6 @@ class BuildContext:
         self, shape_nodes: list, operation_name: str = "op"
     ) -> list[int]:
         """Resolve FX shape nodes using configured block sizes and metadata."""
-        import sympy
         import torch.fx
 
         shape: list[int] = []
@@ -196,8 +191,7 @@ class BuildContext:
                         resolved = _resolve_dims(
                             value.shape,
                             self.block_id_to_size,
-                            self.block_hint_to_id,
-                            self.block_symint_to_id,
+                            self.env,
                             self.block_id_to_upper_bound,
                         )
                         if 0 <= dim < len(resolved):
@@ -205,11 +199,7 @@ class BuildContext:
                             continue
                 value = shape_node.meta.get("val")
                 if isinstance(value, torch.SymInt):
-                    block_id = block_id_from_symbol(str(value))
-                    if block_id is None:
-                        expression = getattr(getattr(value, "node", None), "expr", None)
-                        if isinstance(expression, sympy.Symbol):
-                            block_id = block_id_from_symbol(str(expression))
+                    block_id = self.env.get_block_id(value)
                     if block_id is not None and block_id in self.block_id_to_size:
                         shape.append(self.block_id_to_size[block_id])
                         continue
@@ -224,10 +214,6 @@ class BuildContext:
                 continue
             shape.append(1)
         return shape
-
-    def build_sym_to_block_id(self) -> dict[str, int]:
-        """Build symbolic ``uN`` names from the active Helion block sizes."""
-        return {f"u{block.block_id}": block.block_id for block in self.env.block_sizes}
 
     def symbol_info(self, value: object) -> tuple[int, str] | None:
         """Resolve a SymInt to ``(block_id, kind)`` using Helion symbol origins."""
@@ -272,118 +258,14 @@ class BuildContext:
             for argument in arguments
         )
 
-    def infer_block_id_from_index(
-        self, index_node: object, sym_to_block_id: dict[str, int]
-    ) -> int | None:
+    def infer_block_id_from_index(self, index_node: object) -> int | None:
         """Infer the block id represented by an index expression."""
-        block_id, _ = self.infer_index_block_and_bias(index_node, sym_to_block_id)
-        return block_id
+        return resolve_index_descriptor(self, index_node).block_id
 
-    def infer_index_block_and_bias(
-        self, index_node: object, sym_to_block_id: dict[str, int]
-    ) -> tuple[int | None, int]:
+    def infer_index_block_and_bias(self, index_node: object) -> tuple[int | None, int]:
         """Infer a block id and additive bias from a tile-index expression."""
-        import torch.fx
-
-        block_id = self.infer_block_id_from_index_symbolic(index_node, sym_to_block_id)
-        if block_id is not None:
-            return block_id, 0
-        if isinstance(index_node, int):
-            return None, index_node
-        if not isinstance(index_node, torch.fx.Node):
-            return None, 0
-
-        target_name = str(index_node.target)
-        target_short_name = getattr(index_node.target, "__name__", "")
-        if "aten.add" not in target_name and target_short_name not in (
-            "add.Tensor",
-            "add.default",
-        ):
-            return None, 0
-        if len(index_node.args) < 2:
-            return None, 0
-
-        return self._infer_add_index_block_and_bias(
-            index_node.args[0], index_node.args[1], sym_to_block_id
-        )
-
-    def _infer_add_index_block_and_bias(
-        self,
-        left_index: object,
-        right_index: object,
-        sym_to_block_id: dict[str, int],
-    ) -> tuple[int | None, int]:
-        left_block, left_bias = self.infer_index_block_and_bias(
-            left_index, sym_to_block_id
-        )
-        right_block, right_bias = self.infer_index_block_and_bias(
-            right_index, sym_to_block_id
-        )
-        if left_block is not None and right_block is None:
-            return left_block, left_bias + right_bias
-        if right_block is not None and left_block is None:
-            return right_block, right_bias + left_bias
-        return None, 0
-
-    def infer_block_id_from_index_symbolic(
-        self, index_node: object, sym_to_block_id: dict[str, int]
-    ) -> int | None:
-        """Infer a block id from symbolic FX metadata."""
-        import sympy
-        import torch
-        import torch.fx
-
-        if not isinstance(index_node, torch.fx.Node):
-            return None
-        value = index_node.meta.get("val")
-        if isinstance(value, torch.SymInt):
-            # Symbol origins are authoritative; the uN name heuristic below is a
-            # fallback and mis-maps grid symbols, whose names are unrelated to
-            # block ids.
-            origin_info = self.symbol_info(value)
-            if origin_info is not None:
-                return origin_info[0]
-            symbol = str(value)
-            if symbol in sym_to_block_id:
-                return sym_to_block_id[symbol]
-            expression = getattr(getattr(value, "node", None), "expr", None)
-            if (
-                isinstance(expression, sympy.Symbol)
-                and id(expression) in self.block_symint_to_id
-            ):
-                return self.block_symint_to_id[id(expression)]
-
-        target_name = getattr(index_node.target, "__name__", "")
-        if target_name == "_get_symnode" and index_node.args:
-            return block_id_from_key(index_node.args[0])
-        if target_name not in ("sym_size.int", "sym_size_int"):
-            return None
-        if len(index_node.args) < 2:
-            return None
-        tensor_node = index_node.args[0]
-        if not isinstance(tensor_node, torch.fx.Node):
-            return None
-        tensor_value = tensor_node.meta.get("val")
-        if not isinstance(tensor_value, torch.Tensor):
-            return None
-        dimension_index = int(index_node.args[1])
-        # The node's own metadata may have been replaced by a concrete hint, so
-        # recover the block recorded when the shape was still symbolic.
-        recorded = self.placeholder_dim_to_block_id.get(
-            (id(tensor_node), dimension_index)
-        )
-        if recorded is not None:
-            return recorded
-        dimension = tensor_value.shape[dimension_index]
-        dimension_origin = self.symbol_info(dimension)
-        if dimension_origin is not None:
-            return dimension_origin[0]
-        dimension_expression = getattr(getattr(dimension, "node", None), "expr", None)
-        if isinstance(dimension_expression, sympy.Symbol):
-            resolved = self.block_symint_to_id.get(id(dimension_expression))
-            if resolved is not None:
-                return resolved
-        return sym_to_block_id.get(str(dimension))
+        descriptor = resolve_index_descriptor(self, index_node)
+        return descriptor.block_id, descriptor.bias
 
     def lower_graph(self, graph: torch.fx.Graph) -> ir.Value | None:
         """Lower an FX graph through the builder callback."""
@@ -424,7 +306,7 @@ class BuildContext:
                 self.block_id_to_iv[block_id] = previous
 
     @contextmanager
-    def push_store_ctx(self, store_context: dict[str, Any]) -> Generator[None]:
+    def push_store_ctx(self, store_context: ForStoreContext) -> Generator[None]:
         """Push and reliably remove a synthetic store context."""
         self.for_store_ctx_stack.append(store_context)
         try:

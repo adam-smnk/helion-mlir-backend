@@ -32,9 +32,9 @@ import torch.fx
 
 from .support import NodeLoweringError
 from .support import block_id_from_key
-from .support import block_id_from_symbol
 
 if TYPE_CHECKING:
+    from helion._compiler.compile_environment import CompileEnvironment
     import mlir.ir as ir
 
 log = logging.getLogger(__name__)
@@ -93,8 +93,7 @@ def preprocess_aten_nodes(
     aten_nodes: list[torch.fx.Node],
     mlir_module: ir.Module,
     block_id_to_size: dict[int, int] | None = None,
-    block_hint_to_id: dict[int, int] | None = None,
-    block_symint_to_id: dict[int, int] | None = None,
+    env: CompileEnvironment | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
     arg_position_overrides: dict[int, dict[int, torch.Tensor]] | None = None,
 ) -> dict[int, tuple[str, list[ir.Type]]]:
@@ -133,8 +132,7 @@ def preprocess_aten_nodes(
         aten_nodes,
         block_id_to_size or {},
         _build_aten_subgraph,
-        block_hint_to_id or {},
-        block_symint_to_id or {},
+        env,
         block_id_to_upper_bound or {},
         arg_position_overrides or {},
     )
@@ -178,8 +176,7 @@ def preprocess_aten_nodes(
 def _build_aten_subgraph(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int] | None = None,
-    block_hint_to_id: dict[int, int] | None = None,
-    block_symint_to_id: dict[int, int] | None = None,
+    env: CompileEnvironment | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
     arg_position_override: dict[int, torch.Tensor] | None = None,
 ) -> tuple[torch.fx.Graph, list[int]]:
@@ -205,8 +202,7 @@ def _build_aten_subgraph(
                 concrete_val = _fake_tensor_from_node_meta(
                     arg,
                     block_id_to_size or {},
-                    block_hint_to_id or {},
-                    block_symint_to_id or {},
+                    env,
                     block_id_to_upper_bound or {},
                 )
             if concrete_val is not None:
@@ -220,8 +216,7 @@ def _build_aten_subgraph(
                         bound_shape = _resolve_dims(
                             tm_shape,
                             block_id_to_size or {},
-                            block_hint_to_id or {},
-                            block_symint_to_id or {},
+                            env,
                             block_id_to_upper_bound or {},
                         )
                 if bound_shape is None:
@@ -230,8 +225,7 @@ def _build_aten_subgraph(
                         bound_shape = _resolve_dims(
                             arg_val.shape,
                             block_id_to_size or {},
-                            block_hint_to_id or {},
-                            block_symint_to_id or {},
+                            env,
                             block_id_to_upper_bound or {},
                         )
                 if bound_shape is not None and len(bound_shape) == len(
@@ -310,8 +304,7 @@ def _build_aten_subgraph(
         concrete_result = _result_tensor_from_node_meta(
             node,
             block_id_to_size or {},
-            block_hint_to_id or {},
-            block_symint_to_id or {},
+            env,
             block_id_to_upper_bound or {},
         )
 
@@ -326,8 +319,7 @@ def _build_aten_subgraph(
 def _result_tensor_from_node_meta(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int],
-    block_symint_to_id: dict[int, int],
+    env: CompileEnvironment | None,
     block_id_to_upper_bound: dict[int, int],
 ) -> torch.Tensor | None:
     """Construct a concrete result tensor from fallback FX metadata."""
@@ -337,8 +329,7 @@ def _result_tensor_from_node_meta(
             _resolve_dims(
                 result_val.shape,
                 block_id_to_size,
-                block_hint_to_id,
-                block_symint_to_id,
+                env,
                 block_id_to_upper_bound,
             ),
             dtype=result_val.dtype,
@@ -350,8 +341,7 @@ def _result_tensor_from_node_meta(
                     _resolve_dims(
                         value.shape,
                         block_id_to_size,
-                        block_hint_to_id,
-                        block_symint_to_id,
+                        env,
                         block_id_to_upper_bound,
                     ),
                     dtype=value.dtype,
@@ -359,8 +349,7 @@ def _result_tensor_from_node_meta(
     return _fake_tensor_from_node_meta(
         node,
         block_id_to_size,
-        block_hint_to_id,
-        block_symint_to_id,
+        env,
         block_id_to_upper_bound,
     )
 
@@ -547,8 +536,7 @@ def _is_scalar_load_index(index_node: object) -> bool:
 def _fake_tensor_from_load_node(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int] | None,
-    block_symint_to_id: dict[int, int] | None,
+    env: CompileEnvironment | None,
     block_id_to_upper_bound: dict[int, int] | None,
 ) -> torch.Tensor | None:
     """Infer the bounded result shape for a Helion indexed load."""
@@ -569,8 +557,7 @@ def _fake_tensor_from_load_node(
     source = _fake_tensor_from_node_meta(
         tensor_arg,
         block_id_to_size,
-        block_hint_to_id,
-        block_symint_to_id,
+        env,
         block_id_to_upper_bound,
     )
     if source is None:
@@ -580,8 +567,7 @@ def _fake_tensor_from_load_node(
         idx_fake = _fake_tensor_from_node_meta(
             index_nodes[0],
             block_id_to_size,
-            block_hint_to_id,
-            block_symint_to_id,
+            env,
             block_id_to_upper_bound,
         )
         if isinstance(idx_fake, torch.Tensor):
@@ -589,8 +575,7 @@ def _fake_tensor_from_load_node(
                 _resolve_dims(
                     idx_fake.shape,
                     block_id_to_size,
-                    block_hint_to_id,
-                    block_symint_to_id,
+                    env,
                     block_id_to_upper_bound,
                 ),
                 dtype=source.dtype,
@@ -608,7 +593,7 @@ def _fake_tensor_from_load_node(
             continue
 
         extent = src_shape[dim]
-        block_id = _block_id_from_load_index(idx_node, block_symint_to_id)
+        block_id = _block_id_from_load_index(idx_node, env)
 
         if block_id is not None and block_id in block_id_to_size:
             mapped = int(block_id_to_size[block_id])
@@ -630,8 +615,7 @@ def _fake_tensor_from_load_node(
 def _evaluate_fake_aten_node(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int] | None,
-    block_symint_to_id: dict[int, int] | None,
+    env: CompileEnvironment | None,
     block_id_to_upper_bound: dict[int, int] | None,
 ) -> torch.Tensor | None:
     """Evaluate an ATen node on recursively constructed fake operands."""
@@ -644,8 +628,7 @@ def _evaluate_fake_aten_node(
             concrete = _fake_tensor_from_node_meta(
                 arg,
                 block_id_to_size,
-                block_hint_to_id,
-                block_symint_to_id,
+                env,
                 block_id_to_upper_bound,
             )
             if concrete is not None:
@@ -664,8 +647,7 @@ def _evaluate_fake_aten_node(
             concrete = _fake_tensor_from_node_meta(
                 value,
                 block_id_to_size,
-                block_hint_to_id,
-                block_symint_to_id,
+                env,
                 block_id_to_upper_bound,
             )
             if concrete is not None:
@@ -714,16 +696,14 @@ def _evaluate_fake_aten_node(
 def _fake_tensor_from_node_meta(
     node: torch.fx.Node,
     block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int] | None = None,
-    block_symint_to_id: dict[int, int] | None = None,
+    env: CompileEnvironment | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
 ) -> torch.Tensor | None:
     """Construct a concrete fake tensor from ``node.meta`` when possible."""
     load_result = _fake_tensor_from_load_node(
         node,
         block_id_to_size,
-        block_hint_to_id,
-        block_symint_to_id,
+        env,
         block_id_to_upper_bound,
     )
     if load_result is not None:
@@ -733,8 +713,7 @@ def _fake_tensor_from_node_meta(
     evaluated = _evaluate_fake_aten_node(
         node,
         block_id_to_size,
-        block_hint_to_id,
-        block_symint_to_id,
+        env,
         block_id_to_upper_bound,
     )
     if evaluated is not None:
@@ -745,8 +724,7 @@ def _fake_tensor_from_node_meta(
         shape = _resolve_dims(
             val.shape,
             block_id_to_size,
-            block_hint_to_id,
-            block_symint_to_id,
+            env,
             block_id_to_upper_bound,
         )
         return torch.zeros(shape, dtype=val.dtype)
@@ -763,8 +741,7 @@ def _fake_tensor_from_node_meta(
     concrete_shape = _resolve_dims(
         shape,
         block_id_to_size,
-        block_hint_to_id,
-        block_symint_to_id,
+        env,
         block_id_to_upper_bound,
     )
     return torch.zeros(concrete_shape, dtype=dtype)
@@ -773,8 +750,7 @@ def _fake_tensor_from_node_meta(
 def _resolve_dims(
     dims: tuple[object, ...] | list[object],
     block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int] | None = None,
-    block_symint_to_id: dict[int, int] | None = None,
+    env: CompileEnvironment | None = None,
     block_id_to_upper_bound: dict[int, int] | None = None,
 ) -> list[int]:
     """Resolve a sequence of dims (possibly SymInt) to concrete integer sizes."""
@@ -784,8 +760,7 @@ def _resolve_dims(
             resolved = _resolve_symint_dim(
                 d,
                 block_id_to_size,
-                block_hint_to_id,
-                block_symint_to_id,
+                env,
                 block_id_to_upper_bound,
             )
             if resolved is not None:
@@ -797,7 +772,7 @@ def _resolve_dims(
 
 def _block_id_from_load_index(
     index_node: object,
-    block_symint_to_id: dict[int, int] | None,
+    env: CompileEnvironment | None,
 ) -> int | None:
     if not isinstance(index_node, torch.fx.Node):
         return None
@@ -808,50 +783,24 @@ def _block_id_from_load_index(
             return block_id
 
     value = index_node.meta.get("val")
-    if not isinstance(value, torch.SymInt):
+    if not isinstance(value, torch.SymInt) or env is None:
         return None
-    block_id = block_id_from_symbol(str(value))
-    if block_id is not None:
-        return block_id
-
-    import sympy
-
-    expression = getattr(getattr(value, "node", None), "expr", None)
-    if not isinstance(expression, sympy.Symbol):
-        return None
-    block_id = block_id_from_symbol(str(expression))
-    if block_id is not None:
-        return block_id
-    if block_symint_to_id is not None:
-        return block_symint_to_id.get(id(expression))
-    return None
+    return env.get_block_id(value)
 
 
 def _resolve_symint_dim(
     dimension: torch.SymInt,
     block_id_to_size: dict[int, int],
-    block_hint_to_id: dict[int, int] | None,
-    block_symint_to_id: dict[int, int] | None,
+    env: CompileEnvironment | None,
     block_id_to_upper_bound: dict[int, int] | None,
 ) -> int | None:
-    del block_hint_to_id
     try:
         hint_value = int(dimension)
     except Exception:
         hint_value = None
 
-    import sympy
-
-    expression = getattr(getattr(dimension, "node", None), "expr", None)
-    candidates = [block_id_from_symbol(str(dimension))]
-    if isinstance(expression, sympy.Symbol):
-        candidates.append(block_id_from_symbol(str(expression)))
-        if block_symint_to_id is not None:
-            candidates.append(block_symint_to_id.get(id(expression)))
-
-    for block_id in candidates:
-        if block_id is None or block_id not in block_id_to_size:
-            continue
+    block_id = env.get_block_id(dimension) if env is not None else None
+    if block_id is not None and block_id in block_id_to_size:
         resolved = _clamp_by_upper_bound(
             block_id_to_size[block_id], block_id, block_id_to_upper_bound
         )

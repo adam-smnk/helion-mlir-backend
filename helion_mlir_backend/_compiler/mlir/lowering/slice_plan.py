@@ -70,9 +70,9 @@ def plan_slice(
     import mlir.ir as ir
 
     from ..support.errors import NodeLoweringError
+    from ..support.index_meta import resolve_index_descriptor
 
     base_rank = len(base_type.shape)
-    sym_to_block_id = ctx.build_sym_to_block_id()
     dims: list[DimSlice] = []
 
     for dimension, index_node in enumerate(index_nodes):
@@ -92,26 +92,23 @@ def plan_slice(
             )
             continue
 
+        descriptor = resolve_index_descriptor(ctx, index_node)
+
         # Scalar index: grid/tile.begin or literal int.
-        if ctx.is_scalar_index_node(index_node):
-            block_id: int | None = None
+        if descriptor.is_scalar:
+            block_id = descriptor.block_id
             scalar_value: ir.Value | None = None
 
-            # Resolve from symbol origin if available.
-            symbol_info = ctx.node_symbol_info(index_node)
-            if symbol_info is not None:
-                block_id = symbol_info[0]
-
-            # Fallback: try to get the value directly.
-            if block_id is None:
-                scalar_value = ctx.get_value(index_node)
-            elif block_id in ctx.block_id_to_iv:
+            if block_id is not None and block_id in ctx.block_id_to_iv:
                 scalar_value = ctx.block_id_to_iv[block_id]
+            else:
+                # Fallback: try to get the value directly.
+                scalar_value = ctx.get_value(index_node)
 
             offset = (
                 ctx.cast_to_index(scalar_value)
                 if scalar_value is not None
-                else ctx.index_const(0)
+                else ctx.index_const(descriptor.bias)
             )
             # If the base tensor's own extent here is 1, this dimension has
             # already been reduced to a single local slot (e.g. a synthetic
@@ -131,7 +128,7 @@ def plan_slice(
             continue
 
         # Tile index: must resolve to a block id.
-        block_id, bias = ctx.infer_index_block_and_bias(index_node, sym_to_block_id)
+        block_id, bias = descriptor.block_id, descriptor.bias
         if block_id is None:
             raise NodeLoweringError(
                 index_node,

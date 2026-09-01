@@ -224,7 +224,7 @@ class MLIRModuleBuilder:
         return OutputTensorResolver(self.hf).resolve(tensor_params)
 
     def _resolve_block_sizes(self) -> None:
-        """Populate ``_block_id_to_size`` and SymInt identity maps from the config."""
+        """Populate ``block_id_to_size`` from the active config."""
         for bs in self.env.block_sizes:
             # from_config requires HostFunction.current() — active via `with self.hf:`.
             config_val = bs.from_config(self.config)
@@ -238,33 +238,6 @@ class MLIRModuleBuilder:
             else:
                 size = int(size)
             self.context.block_id_to_size[bs.block_id] = size
-
-        # Build hint-value → block_id by scanning _get_symnode nodes.
-        import contextlib
-
-        for graph_info in self.hf.device_ir.graphs:
-            for node in graph_info.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                tname = getattr(node.target, "__name__", "")
-                if tname == "_get_symnode" and node.args:
-                    key = node.args[0]
-                    block_id = block_id_from_key(key)
-                    if block_id is not None:
-                        val = node.meta.get("val")
-                        if (
-                            val is not None
-                            and block_id in self.context.block_id_to_size
-                        ):
-                            # Use sympy Symbol identity — stable because sympy caches symbols.
-                            if isinstance(val, torch.SymInt):
-                                import sympy as _sympy
-
-                                expr = getattr(getattr(val, "node", None), "expr", None)
-                                if isinstance(expr, _sympy.Symbol):
-                                    self.context.block_symint_to_id[id(expr)] = block_id
-                            with contextlib.suppress(TypeError, ValueError):
-                                self.context.block_hint_to_id[int(val)] = block_id
 
     def _resolve_block_upper_bounds(self) -> None:
         """Infer static upper bounds per block_id from ``_for_loop`` nodes."""
@@ -394,6 +367,10 @@ class MLIRModuleBuilder:
                 ]
 
                 if not self._helper_signature_matches(func_name, input_mlir_vals):
+                    # Expected mismatch: the pre-built helper was generated
+                    # from a "typical" tile shape before codegen; rebuild a
+                    # variant from the concrete operand types actually bound
+                    # at this call site (e.g. a boundary tile).
                     rebuilt = self._rebuild_aten_helper_for_call(
                         node,
                         input_mlir_vals,
@@ -402,20 +379,18 @@ class MLIRModuleBuilder:
                         func_name, return_types = rebuilt
 
                 if not self._helper_signature_matches(func_name, input_mlir_vals):
-                    if len(input_mlir_vals) == 1 and self._helper_is_identity(
-                        func_name
-                    ):
-                        return input_mlir_vals[0]
-                    if len(input_mlir_vals) == 1 and len(return_types) == 1:
-                        from .aten_bridge import lower_max_reduce_from_tensor
-
-                        reduced = lower_max_reduce_from_tensor(
-                            self.context, input_mlir_vals[0]
-                        )
-                        if reduced is not None and str(reduced.type) == str(
-                            return_types[0]
-                        ):
-                            return reduced
+                    raise NodeLoweringError(
+                        node,
+                        reason=(
+                            f"ATen helper '{func_name}' signature does not match "
+                            f"operand types {[str(v.type) for v in input_mlir_vals]} "
+                            "even after rebuilding"
+                        ),
+                        recovery_hint=(
+                            "Check that node.meta['val'] reflects the concrete "
+                            "tile shape at this call site"
+                        ),
+                    )
 
                 call = func_d.CallOp(return_types, func_name, input_mlir_vals)
                 return call.results[0] if call.results else None
@@ -688,8 +663,7 @@ class MLIRModuleBuilder:
             aten_nodes,
             module,
             self.context.block_id_to_size,
-            self.context.block_hint_to_id,
-            self.context.block_symint_to_id,
+            self.env,
             self.context.block_id_to_upper_bound,
         )
         self.context.node_to_aten_func = entries
@@ -705,12 +679,6 @@ class MLIRModuleBuilder:
         if self._helper_table is None:
             return False
         return self._helper_table.signature_matches(func_name, input_mlir_vals)
-
-    def _helper_is_identity(self, func_name: str) -> bool:
-        """Return True if helper body is `return arg0` with no intermediate ops."""
-        if self._helper_table is None:
-            return False
-        return self._helper_table.is_identity(func_name)
 
     def _rebuild_aten_helper_for_call(
         self,

@@ -14,7 +14,6 @@ from __future__ import annotations
 from .aten_prepass import refresh_aten_tensor_meta
 from .block_ids import SCALAR_SYMBOL_KINDS
 from .block_ids import block_id_from_key
-from .block_ids import block_id_from_symbol
 from .block_ids import symbol_origin_info
 from .errors import DynamicShapeError
 from .errors import ModuleBuilderError
@@ -23,6 +22,8 @@ from .errors import ShapeError
 from .errors import UnsupportedOperationError
 from .errors import ValueNotFoundError
 from .errors import safe_int_conversion
+from .index_meta import IndexDescriptor
+from .index_meta import resolve_index_descriptor
 from .node_dispatch import lower_helion_node
 from .symbolic_shape_restoration import restore_symbolic_shapes_in_bodies
 from .type_utils import get_zero_attr
@@ -33,17 +34,18 @@ from .type_utils import torch_tensor_to_mlir_type
 __all__ = [
     "SCALAR_SYMBOL_KINDS",
     "DynamicShapeError",
+    "IndexDescriptor",
     "ModuleBuilderError",
     "NodeLoweringError",
     "ShapeError",
     "UnsupportedOperationError",
     "ValueNotFoundError",
     "block_id_from_key",
-    "block_id_from_symbol",
     "get_zero_attr",
     "lower_helion_node",
     "mlir_dtype_to_torch",
     "refresh_aten_tensor_meta",
+    "resolve_index_descriptor",
     "restore_symbolic_shapes_in_bodies",
     "safe_int_conversion",
     "symbol_origin_info",

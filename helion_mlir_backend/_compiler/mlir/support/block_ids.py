@@ -11,14 +11,6 @@ def block_id_from_key(value: object) -> int | None:
     return int(suffix) if suffix.isdigit() else None
 
 
-def block_id_from_symbol(value: object) -> int | None:
-    """Return a block id from a symbolic ``uN`` name."""
-    if not isinstance(value, str) or not value.startswith("u"):
-        return None
-    suffix = value[1:]
-    return int(suffix) if suffix.isdigit() else None
-
-
 #: Symbol kinds that denote a scalar position rather than a tile extent.
 SCALAR_SYMBOL_KINDS = frozenset(
     {"grid", "tile_begin", "tile_end", "tile_id", "tile_count"}
