@@ -50,7 +50,14 @@ def materialize_host_tensor_alias_shape(
     base_value: ir.Value,
     alias_node: torch.fx.Node,
 ) -> ir.Value | None:
-    """Materialize a static flatten-style alias when its shape differs."""
+    """Materialize a static reshape-style alias when its shape differs.
+
+    A host-side ``.view()``/``.reshape()`` written outside the tiled loop
+    produces a ``_host_tensor`` node that resolves to the *base* parameter's
+    SSA value, which still carries the base shape. Emit the shape change so
+    downstream slices see the alias's real geometry instead of silently
+    using the base type.
+    """
     from mlir.dialects import tensor as tensor_d
     import mlir.ir as ir
 
@@ -67,14 +74,38 @@ def materialize_host_tensor_alias_shape(
     if alias_shape is None or base_shape == alias_shape:
         return base_value
 
-    if len(alias_shape) != 1:
+    alias_shape = [int(dimension) for dimension in alias_shape]
+    if any(dimension < 0 for dimension in base_shape + alias_shape):
+        # Dynamic extents have no static reassociation; bail out.
         return None
+
     base_numel = 1
     for dimension in base_shape:
         base_numel *= dimension
-    if base_numel != int(alias_shape[0]):
+    alias_numel = 1
+    for dimension in alias_shape:
+        alias_numel *= dimension
+    if base_numel != alias_numel:
         return None
 
     result_type = ir.RankedTensorType.get(alias_shape, element_type)
-    reassociation = [list(range(len(base_shape)))]
-    return tensor_d.CollapseShapeOp(result_type, base_value, reassociation).result
+
+    if len(alias_shape) == 1:
+        reassociation = [list(range(len(base_shape)))]
+        return tensor_d.CollapseShapeOp(result_type, base_value, reassociation).result
+
+    # General static N-D -> M-D relayout. Collapse to 1-D first so a single
+    # reassociation is always valid, then expand into the alias shape.
+    flat_value = base_value
+    if len(base_shape) != 1:
+        flat_type = ir.RankedTensorType.get([base_numel], element_type)
+        flat_value = tensor_d.CollapseShapeOp(
+            flat_type, base_value, [list(range(len(base_shape)))]
+        ).result
+    return tensor_d.ExpandShapeOp(
+        result_type,
+        flat_value,
+        [list(range(len(alias_shape)))],
+        [],
+        alias_shape,
+    ).result

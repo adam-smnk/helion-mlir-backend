@@ -10,7 +10,7 @@ This document lists current limitations for the MLIR backend in this repository.
   `tests/test_mlir_execution.py`, `tests/test_mlir_integration.py`,
   `tests/test_index_descriptor.py`, `tests/test_reduce_ops.py`, and
   `tests/test_property_kernels.py` (property-based fuzz coverage).
-- The current suite contains 185 passing tests.
+- The current suite contains 191 passing tests.
 - Both explicit generate-and-execute flow and direct backend="mlir" flow are exercised.
 - All example scripts under `examples/` are kept runnable and are re-verified
   after backend changes (`uv run python examples/<name>.py`).
@@ -199,6 +199,35 @@ unsupported MLIR operations must be added to the appropriate MLIR lowering or
 ATen bridge module.
 
 ## Out of Scope for This Backend Today
+
+## 13) Implicit Transpose in a Store Is Rejected
+
+A store must index its destination in the same dimension order the value was
+loaded. Helion traces an implicit transpose such as
+
+```python
+for tile_p, tile_k, tile_n in hl.tile([panels, k, bn]):
+  out[tile_p, tile_k, tile_n] = source[tile_k, tile_p, tile_n]  # rejected
+```
+
+without reporting an error, but the traced value has shape
+`[tile_k, tile_p, tile_n]` while the destination slice needs
+`[tile_p, tile_k, tile_n]`. The backend raises
+`UnsupportedOperationError("store with transposed or mismatched tile layout")`
+rather than emitting an out-of-bounds `tensor.parallel_insert_slice`.
+
+Reorder explicitly instead:
+
+```python
+out[tile_p, tile_k, tile_n] = source[tile_k, tile_p, tile_n].permute(1, 0, 2)
+```
+
+The equivalent `hl.grid()`/`hl.tile()` spellings that index the destination in
+load order (for example `grid(panel) + tile([k, n])`) are supported directly.
+
+Note that `hl.grid()` loops are not tunable and consume no `block_sizes` slot;
+only `hl.tile()` loops do. Supplying a config sized for the grid loops silently
+assigns the wrong block size to the tiled loops.
 
 - Full dynamic-shape-first lowering model.
 - GPU runtime execution path parity with CPU path in this backend.

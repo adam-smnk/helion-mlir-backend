@@ -1375,3 +1375,155 @@ class TestConfigurableBlockSizes:
         )
 
         assert _allclose(result, A + B)
+
+
+class TestPackCopyTileLayouts:
+    """Regressions for logical-transpose pack/copy kernels.
+
+    ``source: [K, PANELS, BN] -> out: [PANELS, K, BN]`` exercises nested loop
+    block-id resolution and store/insert tile geometry validation.
+    """
+
+    @staticmethod
+    def _inputs(panels: int = 4, k: int = 64, bn: int = 16):
+        torch.manual_seed(7)
+        return torch.randn(k, panels, bn), panels, k, bn
+
+    def test_grid_panel_tile_k_scalar_grid_n_is_exact(self):
+        """grid(panel) + tile(k) + scalar grid(n) must not swap block ids.
+
+        The outer ``hl.tile`` body is a pure wrapper whose own symbol only
+        appears in the innermost graph, so block-id resolution previously
+        adopted the inner grid's id and emitted swapped induction variables.
+        """
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[32]),
+        )
+        def pack(source: torch.Tensor) -> torch.Tensor:
+            k, panels, bn = source.shape
+            out = torch.empty((panels, k, bn), dtype=source.dtype, device=source.device)
+            for panel in hl.grid(panels):
+                for tile_k in hl.tile(k):
+                    for n_idx in hl.grid(bn):
+                        out[panel, tile_k, n_idx] = source[tile_k, panel, n_idx]
+            return out
+
+        source, _, _, _ = self._inputs()
+        result = pack(source)
+        expected = source.permute(1, 0, 2)
+        assert result.shape == expected.shape
+        assert torch.equal(result, expected)
+
+    def test_grid_panel_tile_k_and_n_is_exact(self):
+        """grid(panel) + tile([k, n]) lowers and is numerically exact."""
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[32, 16]),
+        )
+        def pack(source: torch.Tensor) -> torch.Tensor:
+            k, panels, bn = source.shape
+            out = torch.empty((panels, k, bn), dtype=source.dtype, device=source.device)
+            for panel in hl.grid(panels):
+                for tile_k, tile_n in hl.tile([k, bn]):
+                    out[panel, tile_k, tile_n] = source[tile_k, panel, tile_n]
+            return out
+
+        source, _, _, _ = self._inputs()
+        result = pack(source)
+        assert torch.equal(result, source.permute(1, 0, 2))
+
+    def test_explicit_permute_pack_copy_is_exact(self):
+        """The supported spelling of a transposing pack uses ``.permute()``."""
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[2, 32, 16]),
+        )
+        def pack(source: torch.Tensor) -> torch.Tensor:
+            k, panels, bn = source.shape
+            out = torch.empty((panels, k, bn), dtype=source.dtype, device=source.device)
+            for tile_p, tile_k, tile_n in hl.tile([panels, k, bn]):
+                out[tile_p, tile_k, tile_n] = source[tile_k, tile_p, tile_n].permute(
+                    1, 0, 2
+                )
+            return out
+
+        source, _, _, _ = self._inputs()
+        result = pack(source)
+        assert torch.equal(result, source.permute(1, 0, 2))
+
+    def test_implicit_transpose_store_raises_clear_diagnostic(self):
+        """An implicit transpose store is rejected instead of writing OOB.
+
+        Helion traces ``out[a, b, c] = src[b, a, c]`` without complaint even
+        though the value's tile order does not match the destination slice.
+        The backend must diagnose it rather than emit an out-of-bounds insert.
+        """
+        from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+
+        @helion.kernel(static_shapes=True)
+        def pack(source: torch.Tensor) -> torch.Tensor:
+            k, panels, bn = source.shape
+            out = torch.empty((panels, k, bn), dtype=source.dtype, device=source.device)
+            for tile_p, tile_k, tile_n in hl.tile([panels, k, bn]):
+                out[tile_p, tile_k, tile_n] = source[tile_k, tile_p, tile_n]
+            return out
+
+        source, _, _, _ = self._inputs()
+        with pytest.raises(UnsupportedOperationError, match="transposed or mismatched"):
+            generate_mlir(pack, [source], config=helion.Config(block_sizes=[2, 32, 16]))
+
+
+class TestHostSideViewAlias:
+    """Regressions for host-side ``.view()`` aliases used inside the loop."""
+
+    def test_rank_preserving_host_view_is_materialized(self):
+        """A 2-D -> 2-D host view must change the value's MLIR shape.
+
+        Previously the alias silently resolved to the base parameter's SSA
+        value, producing an out-of-bounds insert of ``tensor<8x16>`` into
+        ``tensor<16x8>``.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def reshape_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros((16, 8), dtype=x.dtype, device=x.device)
+            reshaped = x.view(16, 8)
+            for _ in hl.tile(16):
+                out[:, :] = reshaped
+            return out
+
+        module = generate_mlir(
+            reshape_kernel,
+            [torch.randn(8, 16)],
+            config=helion.Config(block_sizes=[8, 16]),
+        )
+        assert module.operation.verify()
+        ir_str = str(module)
+        assert "tensor.expand_shape" in ir_str
+        assert "[16, 8] [1, 1] : tensor<16x8xf32> into tensor<16x8xf32>" in ir_str
+
+    def test_rank_preserving_host_view_executes_exactly(self):
+        """The materialized host view produces correct numerics."""
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[8, 16]),
+        )
+        def reshape_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros((16, 8), dtype=x.dtype, device=x.device)
+            reshaped = x.view(16, 8)
+            for _ in hl.tile(16):
+                out[:, :] = reshaped
+            return out
+
+        torch.manual_seed(3)
+        x = torch.randn(8, 16)
+        assert torch.equal(reshape_kernel(x), x.view(16, 8))
