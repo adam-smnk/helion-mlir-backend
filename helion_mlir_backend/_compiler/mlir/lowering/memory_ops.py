@@ -201,9 +201,49 @@ def _store_via_deferred_target(
         reduction = target_rank - len(value_shape)
         static_sizes = [1] * reduction + value_shape
 
+    _validate_store_fits_destination(ctx, node, index_nodes, static_sizes)
+
     ctx.forall_insert_slices.append(
         (value, offsets, static_sizes, _target_tensor_id(node))
     )
+
+
+def _validate_store_fits_destination(
+    ctx: BuildContext,
+    node: torch.fx.Node,
+    index_nodes: list | tuple,
+    static_sizes: list[int],
+) -> None:
+    """Reject a store whose slice would write past the destination tensor.
+
+    A slice can never exceed its tensor's extent, so an oversized dimension
+    always means the value's tile layout does not line up with the order the
+    destination is indexed. The usual cause is an implicit transpose such as
+    ``out[a, b] = src[b, a]``, which Helion traces without rejecting even
+    though the traced value shape does not match the destination slice.
+    """
+    from ..support import UnsupportedOperationError
+
+    dest_shape = ctx.shape_from_node_meta(node.args[0])
+    if dest_shape is None or len(dest_shape) != len(static_sizes):
+        return
+    for dim, (size, extent) in enumerate(zip(static_sizes, dest_shape, strict=True)):
+        if int(size) <= int(extent):
+            continue
+        raise UnsupportedOperationError(
+            "store with transposed or mismatched tile layout",
+            reason=(
+                f"storing a tile of size {int(size)} into dimension {dim} of a "
+                f"destination whose extent is only {int(extent)} (slice sizes "
+                f"{[int(s) for s in static_sizes]}, destination shape "
+                f"{[int(d) for d in dest_shape]}); the stored value's tile order "
+                "does not match the order the destination is indexed"
+            ),
+            alternatives=[
+                "reorder explicitly, e.g. out[a, b] = src[b, a].permute(1, 0)",
+                "index the destination in the same order the value is loaded",
+            ],
+        )
 
 
 def _target_tensor_id(node: torch.fx.Node) -> int | None:

@@ -247,6 +247,9 @@ def build_kernel_body(
                             ],
                         )
                     destination = shared_outs[index]
+                _validate_parallel_insert_fits(
+                    static_sizes, ir.RankedTensorType(destination.type)
+                )
                 tensor_d.ParallelInsertSliceOp(
                     value,
                     destination,
@@ -259,6 +262,37 @@ def build_kernel_body(
                 )
 
     return list(forall.results)
+
+
+def _validate_parallel_insert_fits(
+    static_sizes: list[int], destination_type: ir.RankedTensorType
+) -> None:
+    """Reject a terminal insert that would write past the output tensor.
+
+    Catches wrong tile geometry (e.g. a synthetic accumulator sized from the
+    wrong loop's extent) before it becomes an out-of-bounds write at runtime.
+    """
+    from ..support import UnsupportedOperationError
+
+    dest_shape = [int(d) for d in destination_type.shape]
+    if len(dest_shape) != len(static_sizes):
+        return
+    for dim, (size, extent) in enumerate(zip(static_sizes, dest_shape, strict=True)):
+        if int(size) <= extent:
+            continue
+        raise UnsupportedOperationError(
+            "output tile larger than the destination dimension",
+            reason=(
+                f"writing a tile of size {int(size)} into dimension {dim} of an "
+                f"output whose extent is only {extent} (tile sizes "
+                f"{[int(s) for s in static_sizes]}, output shape {dest_shape}); "
+                "the per-iteration tile geometry does not match the output"
+            ),
+            alternatives=[
+                "index the output in the same order the value is computed",
+                "reorder the value explicitly with .permute() before storing",
+            ],
+        )
 
 
 def _phase_graph_closure(
@@ -327,30 +361,54 @@ def _validate_multi_output_shapes(
 
 
 def _find_reused_block_id(
-    ctx: BuildContext, graph: torch.fx.Graph, max_depth: int = 8
+    ctx: BuildContext,
+    graph: torch.fx.Graph,
+    upper_bound: object = None,
+    max_depth: int = 8,
 ) -> int | None:
     """Resolve the single new block id introduced by a loop whose ``_for_loop``
     node reused an already-mapped (outer) block id.
 
     Helion can nest several loop levels between the reused id's introduction
     and the level whose real identity we need (e.g. ``grid -> grid -> tile``
-    3+ levels deep), so the body at this exact level may be a pure wrapper —
+    3+ levels deep), so the body at this exact level may be a pure wrapper --
     nothing but one further ``_for_loop`` call. Unwrap those wrapper levels
     one at a time until a body with actual scalar symbol references is found.
-    Returns ``None`` if no single unambiguous candidate is found.
+
+    Unwrapping can surface block ids belonging to *deeper* levels as well as
+    this one (e.g. an inner ``hl.grid()`` under an outer ``hl.tile()``), so
+    this level's declared extent is preferred as the authoritative signal
+    before falling back to a lone scalar-symbol candidate. Returns ``None``
+    if no single unambiguous candidate is found.
     """
+    from ..support import block_id_from_key
+
     device_ir = ctx.host_function.device_ir
     current_graph = graph
     for _ in range(max_depth):
-        candidates = {
+        scalar_candidates = {
             info[0]
             for body_node in current_graph.nodes
             if (info := ctx.node_symbol_info(body_node)) is not None
             and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
             and info[0] not in ctx.block_id_to_iv
         }
-        if candidates:
-            return next(iter(candidates)) if len(candidates) == 1 else None
+        all_candidates = set(scalar_candidates)
+        all_candidates.update(
+            candidate
+            for body_node in current_graph.nodes
+            if getattr(body_node.target, "__name__", "") == "_get_symnode"
+            and body_node.args
+            and (candidate := block_id_from_key(body_node.args[0])) is not None
+            and candidate not in ctx.block_id_to_iv
+        )
+        if all_candidates:
+            by_extent = _block_id_matching_extent(ctx, all_candidates, upper_bound)
+            if by_extent is not None:
+                return by_extent
+            if len(scalar_candidates) == 1:
+                return next(iter(scalar_candidates))
+            return None
         call_nodes = [n for n in current_graph.nodes if n.op == "call_function"]
         if (
             len(call_nodes) == 1
@@ -455,6 +513,33 @@ def _resolve_multi_block_ids(
     return resolved
 
 
+def _block_id_matching_extent(
+    ctx: BuildContext, candidates: set[int], upper_bound: object
+) -> int | None:
+    """The unique candidate block id whose real size hint is *upper_bound*.
+
+    A nested loop's declared extent is its own dimension's size, so it
+    identifies which of several candidate block ids the level owns. Returns
+    ``None`` unless exactly one candidate matches, so an ambiguous case keeps
+    the raw declaration rather than guessing.
+    """
+    if not isinstance(upper_bound, int):
+        return None
+    matches = []
+    for candidate in candidates:
+        block_info = next(
+            (b for b in ctx.env.block_sizes if b.block_id == candidate), None
+        )
+        if block_info is None:
+            continue
+        try:
+            if int(block_info.size_hint()) == upper_bound:
+                matches.append(candidate)
+        except (TypeError, ValueError):
+            continue
+    return matches[0] if len(matches) == 1 else None
+
+
 def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     """Lower a (possibly multi-dimensional) nested scf.for loop with optional
     synthetic store, recursing one ``scf.for`` per block id to arbitrary depth.
@@ -495,11 +580,18 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             candidate = next(iter(body_block_ids))
             if candidate != block_id:
                 block_id = candidate
+        elif len(body_block_ids) > 1:
+            # Several new block ids live below this level (e.g. a nested
+            # hl.grid() inside an hl.tile()), so the body alone is ambiguous.
+            # This level's own declared extent identifies which one it owns.
+            candidate = _block_id_matching_extent(ctx, body_block_ids, upper_bounds[0])
+            if candidate is not None:
+                block_id = candidate
         elif not body_block_ids and block_id in ctx.block_id_to_iv:
             # Direct body is a pure wrapper with no symbols at this level
             # (loop nested 3+ levels deep); unwrap further nested
             # ``_for_loop`` wrappers to find the block id introduced here.
-            resolved = _find_reused_block_id(ctx, body_graph)
+            resolved = _find_reused_block_id(ctx, body_graph, upper_bounds[0])
             if resolved is not None:
                 block_id = resolved
         block_ids = [block_id]
