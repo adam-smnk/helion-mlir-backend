@@ -330,7 +330,75 @@ Only compare performance after confirming that both runs produce the same
 numerical result. A slow kernel may have a wrong block-size configuration even
 when its MLIR is valid.
 
-## 10. A Disciplined Validation Loop
+## 10. Packing and Vectorized Transposes
+
+Packing is a useful example of a kernel where source-level tile shape affects
+the cost of a later vectorized operation. For a layout change from
+`[K, Panels, BN]` to `[Panels, K, BN]`, a working pattern is:
+
+```python
+@helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[1, 8, 32]),
+)
+def pack_panels(source: torch.Tensor) -> torch.Tensor:
+    k, panels, bn = source.shape
+    out = torch.empty((panels, k, bn), dtype=source.dtype, device=source.device)
+    for panel, tile_k, tile_n in hl.tile([panels, k, bn]):
+        out[panel, tile_k, tile_n] = source[tile_k, panel, tile_n].permute(
+            1, 0, 2
+        )
+    return out
+```
+
+The unit panel tile is intentional. The `K` sub-tile of `8` and contiguous
+`BN` tile of `32` make each transpose input `[8, 1, 32]` and output
+`[1, 8, 32]`. With the current vectorizing pipeline, this lowers to a
+`vector<256xbf16>` transpose temporary and retains `vector<32xbf16>` loads and
+stores.
+
+Using a `K` tile of `32` instead produces a `vector<1024xbf16>` transpose
+temporary. It is mathematically equivalent, but creates a much larger shuffle
+sequence. In the tested `512 x 512` BF16 workload, `K=8` was faster than `K=16`
+and `K=32` despite requiring more loop iterations.
+
+The alternative spelling below avoids an explicit transpose by making the
+panel index scalar:
+
+```python
+for panel in hl.grid(panels):
+    for tile_k, tile_n in hl.tile([k, bn]):
+        out[panel, tile_k, tile_n] = source[tile_k, panel, tile_n]
+```
+
+This does lower to `vector<32xbf16>` loads and stores, but it was slower in the
+tested pipeline because it introduces nested OpenMP work and per-panel
+temporary handling. Avoiding a `linalg.transpose` in the source is therefore
+not automatically faster.
+
+### Measure enough work
+
+Small packing workloads are dominated by fixed costs: JIT compilation and
+cache setup on the first call, OpenMP launch/scheduling, tensor temporaries,
+and slice insertion. Compare warmed-up calls and use a workload large enough
+to amortize those costs. In this environment, the `512 x 512` case showed a
+large gap to native PyTorch, while `4096 x 4096` reached approximately native
+bandwidth at both four and eight threads, within normal run-to-run variation.
+
+For post-pipeline inspection, set:
+
+```bash
+HELION_MLIR_DUMP_LOWERED=1 HELION_MLIR_PIPELINE=1 \
+  OMP_NUM_THREADS=4 uv run python your_kernel.py
+```
+
+Look for the actual vector element counts, not only the presence of the word
+`vector`. For this packing pattern, `vector<32xbf16>` load/store operations are
+expected, while the transpose temporary should be kept small enough for the
+target register and shuffle hardware.
+
+## 11. A Disciplined Validation Loop
 
 For every new kernel, validate in this order:
 
@@ -363,12 +431,14 @@ HELION_MLIR_DUMP_PRE_LOWERING=1 uv run python your_repro.py
 For generated MLIR, use `generate_mlir()` and print the module, or capture the
 pre-lowering dump around a direct kernel call.
 
-## 11. Common Symptoms and Likely Causes
+## 12. Common Symptoms and Likely Causes
 
 | Symptom | Likely cause | First check |
 | --- | --- | --- |
 | Abort only with `HELION_MLIR_PIPELINE=1` | AMX benchmark pipeline does not support the pattern | Unset the variable and retry |
 | Correct output but unexpectedly slow | Wrong positional `block_sizes` entry, often because `hl.grid()` was counted | Inspect generated loop steps |
+| Small copy is far slower than native PyTorch | Fixed JIT/OpenMP/tensor overhead dominates the workload | Warm up and repeat at a larger shape |
+| Large transpose temporary in lowered IR | Transpose tile is too large for the vectorization path | Reduce the transposed tile dimension and inspect vector widths |
 | `output tile larger than the destination dimension` | Wrong loop/block ID resolution or mismatched tile geometry | Compare loop extent and output slice sizes |
 | `store with transposed or mismatched tile layout` | Value axes and destination axes are in different orders | Add an explicit `.permute(...)` or align indexing |
 | Segmentation fault during insert/store | Invalid slice geometry reached low-level code | Reproduce with current guards and inspect insert sizes |
@@ -377,7 +447,7 @@ pre-lowering dump around a direct kernel call.
 | Source inspection error | Kernel was defined dynamically or in an unavailable source context | Move it to a real `.py` file |
 | Correct shape assertion but wrong values | Test data is symmetric or the axis order is wrong | Use random nonsymmetric tensors and `torch.testing.assert_close` |
 
-## 12. Authoring Checklist
+## 13. Authoring Checklist
 
 Before considering a kernel complete, confirm:
 
@@ -395,6 +465,10 @@ Before considering a kernel complete, confirm:
 - [ ] Correctness was tested with the scalar pipeline before benchmarking.
 - [ ] Generated loop steps and extract/insert slice sizes were inspected for a
       new or nontrivial pattern.
+- [ ] Post-pipeline vector widths and transpose temporary sizes were inspected
+    for performance-sensitive packing kernels.
+- [ ] Performance was compared after warm-up on a workload large enough to
+    amortize JIT, OpenMP, and tensor-management overhead.
 
 ## Related Documentation
 
