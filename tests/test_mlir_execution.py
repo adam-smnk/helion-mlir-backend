@@ -356,7 +356,9 @@ class TestExecuteMlir:
     def test_block_packing_kernels_execute_mlir(self):
         """Nested tiled A/B panel packing matches contiguous PyTorch references."""
         from helion_block_pack import pack_a
+        from helion_block_pack import pack_a_panels
         from helion_block_pack import pack_b
+        from helion_block_pack import pack_b_panels
 
         torch.manual_seed(41)
         a = torch.randn(64, 64, dtype=torch.bfloat16)
@@ -373,6 +375,20 @@ class TestExecuteMlir:
             packed_b,
             b.view(64, 2, 32).permute(1, 0, 2).contiguous(),
         )
+
+        b_module = generate_mlir(pack_b_panels, [b.view(64, 2, 32).contiguous()])
+        b_ir = str(b_module)
+        assert "scf.forall (%arg1, %arg2, %arg3)" in b_ir
+        assert "step (1, 8, 32)" in b_ir
+        assert "linalg.transpose" in b_ir
+        assert "permutation = [1, 0, 2]" in b_ir
+
+        a_module = generate_mlir(pack_a_panels, [a.view(64, 2, 32).contiguous()])
+        a_ir = str(a_module)
+        assert "scf.forall (%arg1, %arg2, %arg3)" in a_ir
+        assert "step (1, 8, 32)" in a_ir
+        assert "linalg.transpose" in a_ir
+        assert "permutation = [1, 0, 2]" in a_ir
 
     def test_unpack_grid_tile_reordered_store_execute_mlir(self):
         """Store index order can differ from loop declaration order.

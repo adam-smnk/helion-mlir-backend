@@ -12,8 +12,11 @@ so that each cache tile the matmul consumes is contiguous:
 The ``A`` side is only needed for a fully blocked layout; ``a.view(M/BM, BM, K)``
 is already free and block-row contiguous.
 
-These use a nested panel-grid plus K-tile loop so the copy is exposed to MLIR as
-bounded vector-shaped chunks rather than one large extract/insert.
+These use a three-dimensional ``[panel, K, block-width]`` tile with a unit
+panel tile and an 8-row K sub-tile. The explicit permutation makes the value
+shape match the output slice. Keeping the transpose tile small is intentional:
+it limits the vector shuffle temporary to the working register tile instead of
+materializing the entire 32-row block at once.
 
 The packed operands are not used by helion_matmul_bf16.py yet: the packed-RHS
 matmul formulation currently miscomputes, and whole-K matmul still hits the
@@ -37,30 +40,28 @@ import helion_mlir_backend  # noqa: F401
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
-    config=helion.Config(block_sizes=[1, 32, 32]),
+    config=helion.Config(block_sizes=[1, 8, 32]),
 )
 def pack_b_panels(b3: Tensor) -> Tensor:
     """``[K, N/BN, BN]`` -> ``[N/BN, K, BN]``, one contiguous panel per column block."""
     k, nbn, bn = b3.shape
     out = torch.empty((nbn, k, bn), dtype=b3.dtype, device=b3.device)
-    for j in hl.grid(nbn):
-        for tk in hl.tile(k):
-            out[j, tk, :] = b3[tk, j, :]
+    for j, tk, tn in hl.tile([nbn, k, bn]):
+        out[j, tk, tn] = b3[tk, j, tn].permute(1, 0, 2)
     return out
 
 
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
-    config=helion.Config(block_sizes=[1, 32, 32]),
+    config=helion.Config(block_sizes=[1, 8, 32]),
 )
 def pack_a_panels(a3: Tensor) -> Tensor:
     """``[M, K/BK, BK]`` -> ``[K/BK, M, BK]``, one contiguous panel per K block."""
     m, nbk, bk = a3.shape
     out = torch.empty((nbk, m, bk), dtype=a3.dtype, device=a3.device)
-    for kb in hl.grid(nbk):
-        for tm in hl.tile(m):
-            out[kb, tm, :] = a3[tm, kb, :]
+    for kb, tm, tk in hl.tile([nbk, m, bk]):
+        out[kb, tm, tk] = a3[tm, kb, tk].permute(1, 0, 2)
     return out
 
 
