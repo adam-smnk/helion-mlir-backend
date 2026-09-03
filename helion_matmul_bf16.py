@@ -10,16 +10,16 @@ single socket:
     PYTHONPATH=~/llvm-project/build/tools/mlir/python_packages/mlir_core:$PYTHONPATH \
     uv run python helion_matmul_bf16.py
 
-The packed-RHS path packs B into column panels with `helion_block_pack`'s
-validated `pack_b_panels`, then runs one plain 2D matmul call per panel from
-ordinary (eager, untraced) Python. Writing each panel's `[M, BN]` result
-directly into a slice of a flat `[M, N]` output tensor avoids the rank-4
-blocked-output store that the MLIR backend cannot lower: keeping the panel
-loop outside the traced kernel sidesteps that entirely, at the cost of one
-kernel launch per panel. Register blocking, VNNI packing and AMX tile
-selection inside each panel matmul are done by the lighthouse pipeline, which
-recognises a `linalg.matmul ins(bf16, bf16) outs(f32)` contraction on an
-amx_tile target and lowers it to `tdpbf16ps`.
+The optimized packed path uses a true blocked 4D contraction:
+``[MB, KB, BM, BK] @ [NB, KB, BK, BN] -> [MB, NB, BM, BN]``.
+That is the shape lighthouse's block-packing pipeline expects: the major block
+axes and minor register-tile axes are all part of a single `linalg.contract`,
+so AMX lowering can see the complete M/N/K geometry at once.
+
+The older host-panel path remains as a fallback/comparison point. It computes
+one packed-B panel at a time with a plain 2D contract and writes directly into
+a flat `[M, N]` result, avoiding problematic in-kernel panel stores at the cost
+of one kernel launch per panel.
 """
 
 from __future__ import annotations
@@ -32,10 +32,10 @@ from typing import TYPE_CHECKING
 
 import helion
 import helion.language as hl
+import helion_block_pack
 import torch
 from torch import Tensor
 
-import helion_block_pack
 import helion_mlir_backend  # noqa: F401
 
 # Helion probes tile shapes during tracing and torch logs the recovered failures.
@@ -55,6 +55,9 @@ TILE_K = int(os.environ.get("HELION_MATMUL_TILE_K", "32"))
 PACK_BN = int(os.environ.get("HELION_MATMUL_PACK_BN", "256"))
 PACK_TILE_M = int(os.environ.get("HELION_MATMUL_PACK_TILE_M", "128"))
 PACK_TILE_K = int(os.environ.get("HELION_MATMUL_PACK_TILE_K", "32"))
+MMT4D_BLOCK_M = int(os.environ.get("HELION_MATMUL_MMT4D_BLOCK_M", "32"))
+MMT4D_BLOCK_N = int(os.environ.get("HELION_MATMUL_MMT4D_BLOCK_N", "32"))
+MMT4D_BLOCK_K = int(os.environ.get("HELION_MATMUL_MMT4D_BLOCK_K", "32"))
 WARMUP_ITERS = 5
 BENCHMARK_ITERS = 20
 SAMPLES = 7
@@ -118,8 +121,40 @@ def matmul_bf16_panel_mlir(a: Tensor, b_panel: Tensor) -> Tensor:
     for tile_m, tile_n in hl.tile([m, bn]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, a[tile_m, tile_k], b_panel[tile_k, tile_n])
+            acc = acc + torch.einsum(
+                "mk,kn->mn", a[tile_m, tile_k], b_panel[tile_k, tile_n]
+            )
         out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[1, 1]),
+)
+def matmul_bf16_mmt4d_mlir(a4: Tensor, b4: Tensor) -> Tensor:
+    """Blocked 4D bf16 matmul, matching lighthouse's packed contract shape."""
+    blocks_m, blocks_k, block_m, block_k = a4.shape
+    blocks_n, blocks_k2, block_k2, block_n = b4.shape
+    assert blocks_k == blocks_k2, "major K mismatch"
+    assert block_k == block_k2, "minor K mismatch"
+
+    out = torch.empty(
+        (blocks_m, blocks_n, block_m, block_n),
+        dtype=torch.float32,
+        device=a4.device,
+    )
+    for tile_blocks_m, tile_blocks_n in hl.tile([blocks_m, blocks_n]):
+        acc = hl.zeros(
+            [tile_blocks_m, tile_blocks_n, block_m, block_n], dtype=torch.float32
+        )
+        acc = acc + torch.einsum(
+            "akmc,bkcn->abmn",
+            a4[tile_blocks_m, :, :, :],
+            b4[tile_blocks_n, :, :, :],
+        )
+        out[tile_blocks_m, tile_blocks_n, :, :] = acc
     return out
 
 
@@ -142,6 +177,81 @@ def matmul_bf16_flat_packed(a: Tensor, packed_b: Tensor) -> Tensor:
         )
     return out
 
+
+@helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[1, 1, 8, 32]),
+)
+def pack_a_mmt4d_kernel(a4_src: Tensor) -> Tensor:
+    """Pack A from ``[M/BM, BM, K/BK, BK]`` to ``[M/BM, K/BK, BM, BK]``."""
+    blocks_m, block_m, blocks_k, block_k = a4_src.shape
+    out = torch.empty(
+        (blocks_m, blocks_k, block_m, block_k),
+        dtype=a4_src.dtype,
+        device=a4_src.device,
+    )
+    for block_mi, block_ki, tile_m, tile_k in hl.tile(
+        [blocks_m, blocks_k, block_m, block_k]
+    ):
+        out[block_mi, block_ki, tile_m, tile_k] = a4_src[
+            block_mi, tile_m, block_ki, tile_k
+        ].permute(0, 2, 1, 3)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[1, 1, 8, 32]),
+)
+def unpack_mmt4d_kernel(out4: Tensor) -> Tensor:
+    """Unpack ``[M/BM, N/BN, BM, BN]`` to ``[M/BM, BM, N/BN, BN]``."""
+    blocks_m, blocks_n, block_m, block_n = out4.shape
+    out = torch.empty(
+        (blocks_m, block_m, blocks_n, block_n),
+        dtype=out4.dtype,
+        device=out4.device,
+    )
+    for block_mi, block_ni, tile_m, tile_n in hl.tile(
+        [blocks_m, blocks_n, block_m, block_n]
+    ):
+        out[block_mi, tile_m, block_ni, tile_n] = out4[
+            block_mi, block_ni, tile_m, tile_n
+        ].permute(0, 2, 1, 3)
+    return out
+
+
+def pack_a_mmt4d(a: Tensor) -> Tensor:
+    """Pack row-major A into ``[M/BM, K/BK, BM, BK]``."""
+    m, k = a.shape
+    return pack_a_mmt4d_kernel(
+        a.view(
+            m // MMT4D_BLOCK_M,
+            MMT4D_BLOCK_M,
+            k // MMT4D_BLOCK_K,
+            MMT4D_BLOCK_K,
+        ).contiguous()
+    )
+
+
+def pack_b_mmt4d(b: Tensor) -> Tensor:
+    """Pack row-major B into ``[N/BN, K/BK, BK, BN]``."""
+    packed_panel = helion_block_pack.pack_b(b, MMT4D_BLOCK_N)
+    k, n = b.shape
+    return packed_panel.view(
+        n // MMT4D_BLOCK_N, k // MMT4D_BLOCK_K, MMT4D_BLOCK_K, MMT4D_BLOCK_N
+    )
+
+
+def unpack_mmt4d(out4: Tensor) -> Tensor:
+    """Return row-major ``[M, N]`` from ``[M/BM, N/BN, BM, BN]``."""
+    blocks_m, blocks_n, block_m, block_n = out4.shape
+    return (
+        unpack_mmt4d_kernel(out4)
+        .contiguous()
+        .view(blocks_m * block_m, blocks_n * block_n)
+    )
 
 
 def benchmark(name: str, operation: Callable[[], object]) -> float:
@@ -191,11 +301,28 @@ def main() -> None:
         )
     if PACK_TILE_K != AMX_REDUCTION_TILE:
         raise ValueError(f"PACK_TILE_K must be {AMX_REDUCTION_TILE} for AMX bf16")
+    if any(
+        block != AMX_PARALLEL_TILE
+        for block in (MMT4D_BLOCK_M, MMT4D_BLOCK_N, MMT4D_BLOCK_K)
+    ):
+        raise ValueError(
+            f"MMT4D_BLOCK_M/N/K must all be {AMX_PARALLEL_TILE} for AMX bf16"
+        )
     if any(SIZE % tile for tile in (TILE_M, TILE_N, TILE_K)):
         raise ValueError(
             f"Tile sizes must divide {SIZE} for this fixed-shape benchmark"
         )
-    if any(SIZE % tile for tile in (PACK_TILE_M, PACK_BN, PACK_TILE_K)):
+    if any(
+        SIZE % tile
+        for tile in (
+            PACK_TILE_M,
+            PACK_BN,
+            PACK_TILE_K,
+            MMT4D_BLOCK_M,
+            MMT4D_BLOCK_N,
+            MMT4D_BLOCK_K,
+        )
+    ):
         raise ValueError(
             f"Packed tile sizes must divide {SIZE} for this fixed-shape benchmark"
         )
@@ -212,7 +339,8 @@ def main() -> None:
     print(
         f"bf16 {SIZE}x{SIZE} @ {SIZE}x{SIZE} -> f32; "
         f"row-major tiles={TILE_M}x{TILE_N}x{TILE_K}; "
-        f"packed panels={panels_n}x{PACK_BN} tiles={PACK_TILE_M}x{PACK_BN}x{PACK_TILE_K}"
+        f"host panels={panels_n}x{PACK_BN}; "
+        f"mmt4d blocks={MMT4D_BLOCK_M}x{MMT4D_BLOCK_N}x{MMT4D_BLOCK_K}"
     )
     print(
         f"{tiles_m * tiles_n} output tiles over {threads} threads; "
@@ -220,13 +348,18 @@ def main() -> None:
     )
 
     compile_start = time.perf_counter()
+    a4 = pack_a_mmt4d(a)
+    b4 = pack_b_mmt4d(b)
+    mmt4d_blocked_result = matmul_bf16_mmt4d_mlir(a4, b4)
     packed_b = helion_block_pack.pack_b(b, PACK_BN)
-    helion_packed_result = matmul_bf16_flat_packed(a, packed_b)
+    helion_panel_result = matmul_bf16_flat_packed(a, packed_b)
     compile_ms = (time.perf_counter() - compile_start) * 1_000
-    print(f"Helion first call    {compile_ms:8.3f} ms (includes pack + MLIR JIT)")
+    print(f"Helion first call    {compile_ms:8.3f} ms (includes packs + MLIR JIT)")
 
     reference = a.to(torch.float32) @ b.to(torch.float32)
-    check_numerics("Helion packed (f32)", helion_packed_result, reference)
+    helion_mmt4d_result = unpack_mmt4d(mmt4d_blocked_result)
+    check_numerics("Helion mmt4d (f32)", helion_mmt4d_result, reference)
+    check_numerics("Helion panel (f32)", helion_panel_result, reference)
     row_major_result = matmul_bf16_mlir(a, b)
     check_numerics("Helion row-major", row_major_result, reference)
     # torch.mm keeps the bf16 output dtype, so its error is dominated by the
@@ -234,29 +367,56 @@ def main() -> None:
     check_numerics("PyTorch eager (bf16)", torch.mm(a, b), reference)
 
     with torch.inference_mode():
-        pack_ms = benchmark("1 pack B (helion)", lambda: helion_block_pack.pack_b(b, PACK_BN))
-        packed_matmul_ms = benchmark(
-            "2 matmul (helion)",
+        pack_a_ms = benchmark("1a pack A (helion)", lambda: pack_a_mmt4d(a))
+        pack_b_mmt4d_ms = benchmark("1b pack B (helion)", lambda: pack_b_mmt4d(b))
+        mmt4d_matmul_ms = benchmark(
+            "2a mmt4d (helion)",
+            lambda: matmul_bf16_mmt4d_mlir(a4, b4),
+        )
+        mmt4d_unpack_ms = benchmark(
+            "3a unpack (helion)",
+            lambda: unpack_mmt4d(mmt4d_blocked_result),
+        )
+        mmt4d_total_ms = benchmark(
+            "mmt4d e2e (1+2+3)",
+            lambda: unpack_mmt4d(
+                matmul_bf16_mmt4d_mlir(pack_a_mmt4d(a), pack_b_mmt4d(b))
+            ),
+        )
+        pack_ms = benchmark(
+            "1 pack B (helion)", lambda: helion_block_pack.pack_b(b, PACK_BN)
+        )
+        panel_matmul_ms = benchmark(
+            "2 panel (helion)",
             lambda: matmul_bf16_flat_packed(a, packed_b),
         )
         # Comparable with torch.mm: both stages, result already row-major [M, N].
-        packed_total_ms = benchmark(
-            "packed e2e (1+2)",
+        panel_total_ms = benchmark(
+            "panel e2e (1+2)",
             lambda: matmul_bf16_flat_packed(a, helion_block_pack.pack_b(b, PACK_BN)),
         )
         row_major_ms = benchmark("Helion row-major", lambda: matmul_bf16_mlir(a, b))
         eager_ms = benchmark("PyTorch eager", lambda: torch.mm(a, b))
 
     flops = 2 * SIZE**3
-    stage_sum_ms = pack_ms + packed_matmul_ms
-    print(f"stage sum            {stage_sum_ms:8.3f} ms")
-    print(f"e2e minus stage sum  {packed_total_ms - stage_sum_ms:8.3f} ms (alloc/cold)")
-    print(f"matmul only          {flops / (packed_matmul_ms * 1e6):8.1f} GFLOP/s")
-    print(f"packed e2e           {flops / (packed_total_ms * 1e6):8.1f} GFLOP/s")
+    mmt4d_stage_sum_ms = pack_a_ms + pack_b_mmt4d_ms + mmt4d_matmul_ms + mmt4d_unpack_ms
+    panel_stage_sum_ms = pack_ms + panel_matmul_ms
+    print(f"mmt4d stage sum      {mmt4d_stage_sum_ms:8.3f} ms")
+    print(
+        f"mmt4d e2e - stages   {mmt4d_total_ms - mmt4d_stage_sum_ms:8.3f} ms (alloc/cold)"
+    )
+    print(f"panel stage sum      {panel_stage_sum_ms:8.3f} ms")
+    print(
+        f"panel e2e - stages   {panel_total_ms - panel_stage_sum_ms:8.3f} ms (alloc/cold)"
+    )
+    print(f"mmt4d matmul only    {flops / (mmt4d_matmul_ms * 1e6):8.1f} GFLOP/s")
+    print(f"mmt4d e2e            {flops / (mmt4d_total_ms * 1e6):8.1f} GFLOP/s")
+    print(f"panel matmul only    {flops / (panel_matmul_ms * 1e6):8.1f} GFLOP/s")
+    print(f"panel e2e            {flops / (panel_total_ms * 1e6):8.1f} GFLOP/s")
     print(f"Helion row-major     {flops / (row_major_ms * 1e6):8.1f} GFLOP/s")
     print(f"PyTorch eager        {flops / (eager_ms * 1e6):8.1f} GFLOP/s")
-    print(f"packed e2e / PyTorch {eager_ms / packed_total_ms:8.3f}x")
-    print(f"packed e2e / row-major {row_major_ms / packed_total_ms:8.3f}x")
+    print(f"mmt4d e2e / PyTorch  {eager_ms / mmt4d_total_ms:8.3f}x")
+    print(f"mmt4d e2e / row-major {row_major_ms / mmt4d_total_ms:8.3f}x")
 
 
 if __name__ == "__main__":
