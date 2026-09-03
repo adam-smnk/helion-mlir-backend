@@ -45,6 +45,13 @@ def aten_target_matches(node: torch.fx.Node, *names: str) -> bool:
 
 def lower_custom_aten(builder: object, node: torch.fx.Node) -> ir.Value | None:
     """Try the registered custom ATen lowerers in precedence order."""
+    from ..einsum_capture import is_einsum_node
+
+    if is_einsum_node(node):
+        from ..lowering import lower_einsum
+
+        return lower_einsum(builder.context, node)
+
     if aten_target_matches(
         node,
         "aten.view",
@@ -241,6 +248,7 @@ def lower_add_matmul_accumulate(
 ) -> ir.Value | None:
     """Lower ``acc + matmul`` into a loop-carried accumulator update."""
     from ..aten_lowering import normalized_aten_args
+    from ..einsum_capture import is_einsum_node
     from ..lowering import emit_matmul_like
 
     args = list(normalized_aten_args(node))
@@ -248,11 +256,16 @@ def lower_add_matmul_accumulate(
         return None
     accumulator_node: torch.fx.Node | None = None
     matmul_node: torch.fx.Node | None = None
+    einsum_node: torch.fx.Node | None = None
     for first, second in ((args[0], args[1]), (args[1], args[0])):
         if not isinstance(first, torch.fx.Node) or not isinstance(
             second, torch.fx.Node
         ):
             continue
+        if is_einsum_node(second):
+            accumulator_node = first
+            einsum_node = second
+            break
         if aten_target_matches(
             second,
             "aten.mm",
@@ -265,11 +278,20 @@ def lower_add_matmul_accumulate(
             accumulator_node = first
             matmul_node = second
             break
-    if accumulator_node is None or matmul_node is None:
+    if accumulator_node is None:
         return None
     accumulator = ctx.get_value(accumulator_node)
+    if accumulator is None:
+        return None
+
+    if einsum_node is not None:
+        from ..lowering import lower_einsum
+
+        return lower_einsum(ctx, einsum_node, out=accumulator)
+
+    assert matmul_node is not None
     matmul_args = list(normalized_aten_args(matmul_node))
-    if accumulator is None or len(matmul_args) < 2:
+    if len(matmul_args) < 2:
         return None
     from ..lowering import resolve_contraction_operand
 

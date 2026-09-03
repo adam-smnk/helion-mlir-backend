@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .control_flow import build_kernel_body
 from .control_flow import lower_nested_for_loop
+from .einsum_ops import lower_einsum
 from .host_tensor_ops import lower_host_tensor
 from .host_tensor_ops import materialize_host_tensor_alias_shape
 from .host_tensor_ops import resolve_host_tensor_alias_value
@@ -30,6 +31,7 @@ __all__ = [
     "emit_matmul_like",
     "is_transpose_node",
     "lower_baddbmm",
+    "lower_einsum",
     "lower_flat_gather",
     "lower_full",
     "lower_getitem",
