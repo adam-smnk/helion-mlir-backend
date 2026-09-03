@@ -10,10 +10,16 @@ single socket:
     PYTHONPATH=~/llvm-project/build/tools/mlir/python_packages/mlir_core:$PYTHONPATH \
     uv run python helion_matmul_bf16.py
 
-The optimized path packs the RHS into column panels before matmul. Register
-blocking, VNNI packing and AMX tile selection are done by the lighthouse
-pipeline, which recognises a `linalg.matmul ins(bf16, bf16) outs(f32)`
-contraction on an amx_tile target and lowers it to `tdpbf16ps`.
+The packed-RHS path packs B into column panels with `helion_block_pack`'s
+validated `pack_b_panels`, then runs one plain 2D matmul call per panel from
+ordinary (eager, untraced) Python. Writing each panel's `[M, BN]` result
+directly into a slice of a flat `[M, N]` output tensor avoids the rank-4
+blocked-output store that the MLIR backend cannot lower: keeping the panel
+loop outside the traced kernel sidesteps that entirely, at the cost of one
+kernel launch per panel. Register blocking, VNNI packing and AMX tile
+selection inside each panel matmul are done by the lighthouse pipeline, which
+recognises a `linalg.matmul ins(bf16, bf16) outs(f32)` contraction on an
+amx_tile target and lowers it to `tdpbf16ps`.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import helion.language as hl
 import torch
 from torch import Tensor
 
+import helion_block_pack
 import helion_mlir_backend  # noqa: F401
 
 # Helion probes tile shapes during tracing and torch logs the recovered failures.
@@ -42,12 +49,12 @@ SIZE = 4096
 TILE_M = int(os.environ.get("HELION_MATMUL_TILE_M", "128"))
 TILE_N = int(os.environ.get("HELION_MATMUL_TILE_N", "1024"))
 TILE_K = int(os.environ.get("HELION_MATMUL_TILE_K", "32"))
-PACK_TILE_M = int(os.environ.get("HELION_MATMUL_PACK_TILE_M", "16"))
-PACK_TILE_N = int(os.environ.get("HELION_MATMUL_PACK_TILE_N", "32"))
+# Panel width for the packed path: each panel is one host-side matmul call, so
+# this also sets the per-panel N tile. 256 was the sweep optimum (128/512/1024
+# were all slower) at 4096x4096, 4 threads.
+PACK_BN = int(os.environ.get("HELION_MATMUL_PACK_BN", "256"))
+PACK_TILE_M = int(os.environ.get("HELION_MATMUL_PACK_TILE_M", "128"))
 PACK_TILE_K = int(os.environ.get("HELION_MATMUL_PACK_TILE_K", "32"))
-# Cache-level M block; the packed grid iterates (m_block, n_panel) so an A block
-# stays resident while all N panels stream past it.
-PACK_BLOCK_M = int(os.environ.get("HELION_MATMUL_PACK_BLOCK_M", "512"))
 WARMUP_ITERS = 5
 BENCHMARK_ITERS = 20
 SAMPLES = 7
@@ -58,21 +65,6 @@ SAMPLES = 7
 # survives to LLVM translation and the ExecutionEngine fails to build.
 AMX_PARALLEL_TILE = 32
 AMX_REDUCTION_TILE = 32
-
-
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, PACK_TILE_K, PACK_TILE_N]),
-)
-def pack_b_panels_bf16(b3: Tensor) -> Tensor:
-    """Pack ``B`` from ``[K, N/BN, BN]`` to ``[N/BN, K, BN]``."""
-    k, panels_n, block_n = b3.shape
-    out = torch.empty((panels_n, k, block_n), dtype=b3.dtype, device=b3.device)
-    for panel_n in hl.grid(panels_n):
-        for tile_k in hl.tile(k):
-            out[panel_n, tile_k, :] = b3[tile_k, panel_n, :]
-    return out
 
 
 @helion.kernel(
@@ -110,67 +102,46 @@ def matmul_bf16_mlir(x: Tensor, y: Tensor) -> Tensor:
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
-    config=helion.Config(block_sizes=[PACK_TILE_M, PACK_TILE_K]),
+    config=helion.Config(block_sizes=[PACK_TILE_M, PACK_BN, PACK_TILE_K]),
 )
-def matmul_bf16_packed_b_mlir(a3: Tensor, packed_b: Tensor) -> Tensor:
-    """Blocked ``A @ B`` from ``[M/BM, BM, K]`` and packed RHS ``[N/BN, K, BN]``.
+def matmul_bf16_panel_mlir(a: Tensor, b_panel: Tensor) -> Tensor:
+    """Plain 2D ``A @ B_panel`` for one packed column panel, ``[M, K] x [K, BN]``.
 
-    `PACK_TILE_M`/`PACK_TILE_N` are pinned to 16x32: larger register tiles either
-    fail AMX conversion or abort in MLIR, so the inner contraction is exactly two
-    `tdpbf16ps` accumulator chains held in AMX tile registers across the K loop.
+    Identical shape to `matmul_bf16_mlir` other than a fixed ``BN``-wide N tile;
+    kept as its own kernel so a distinct config can pin the panel width.
     """
-    m_blocks, block_m, k = a3.shape
-    panels_n, k2, block_n = packed_b.shape
+    m, k = a.shape
+    k2, bn = b_panel.shape
     assert k == k2, "matmul dimension mismatch"
 
-    out = torch.empty(
-        (m_blocks, panels_n, block_m, block_n),
-        dtype=torch.float32,
-        device=a3.device,
-    )
-    for m_block, panel_n in hl.grid([m_blocks, panels_n]):
-        for tile_m in hl.tile(block_m):
-            acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
-            for tile_k in hl.tile(k):
-                acc = torch.addmm(
-                    acc,
-                    a3[m_block, tile_m, tile_k],
-                    packed_b[panel_n, tile_k, :],
-                )
-            out[m_block, panel_n, tile_m, :] = acc
+    out = torch.empty((m, bn), dtype=torch.float32, device=a.device)
+    for tile_m, tile_n in hl.tile([m, bn]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b_panel[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
     return out
 
 
-def pack_a_host_shape(a: Tensor) -> Tensor:
-    """View ``A`` as ``[M/BM, BM, K]``; row-major A makes this a free reshape."""
-    m, k = a.shape
-    return a.view(m // PACK_BLOCK_M, PACK_BLOCK_M, k)
+def matmul_bf16_flat_packed(a: Tensor, packed_b: Tensor) -> Tensor:
+    """Row-major ``[M, N]`` from ``A`` and panel-packed ``B`` (``[N/BN, K, BN]``).
 
-
-def pack_b_host_shape(b: Tensor) -> Tensor:
-    """View ``B`` as ``[K, N/BN, BN]`` before device-side panel packing."""
-    k, n = b.shape
-    return b.view(k, n // PACK_TILE_N, PACK_TILE_N).contiguous()
-
-
-def unpack_blocked(blocked_out: Tensor) -> Tensor:
-    """Convert ``[M/BM, N/BN, BM, BN]`` back to row-major ``[M, N]``.
-
-    Eager torch, not a Helion kernel: the required store pattern indexes a rank-4
-    destination as (scalar, tile, scalar, full), which the MLIR backend either
-    miscompiles or crashes on.
+    The panel loop runs in plain eager Python, not inside a traced kernel: that
+    is what lets each panel's result land straight in a slice of a flat 2D
+    output, instead of a blocked ``[M/BM, N/BN, BM, BN]`` tensor whose unblocking
+    store the MLIR backend cannot lower (see the AMX gaps doc for the crash).
     """
-    m_blocks, panels_n, block_m, block_n = blocked_out.shape
-    return (
-        blocked_out.permute(0, 2, 1, 3)
-        .contiguous()
-        .view(m_blocks * block_m, panels_n * block_n)
-    )
+    m, k = a.shape
+    panels_n, k2, bn = packed_b.shape
+    assert k == k2, "matmul dimension mismatch"
 
+    out = torch.empty((m, panels_n * bn), dtype=torch.float32, device=a.device)
+    for panel in range(panels_n):
+        out[:, panel * bn : (panel + 1) * bn] = matmul_bf16_panel_mlir(
+            a, packed_b[panel]
+        )
+    return out
 
-def matmul_bf16_packed_end_to_end(a3: Tensor, b3: Tensor) -> Tensor:
-    """Full packed path returning row-major ``[M, N]``, as ``torch.mm`` does."""
-    return unpack_blocked(matmul_bf16_packed_b_mlir(a3, pack_b_panels_bf16(b3)))
 
 
 def benchmark(name: str, operation: Callable[[], object]) -> float:
@@ -220,17 +191,11 @@ def main() -> None:
         )
     if PACK_TILE_K != AMX_REDUCTION_TILE:
         raise ValueError(f"PACK_TILE_K must be {AMX_REDUCTION_TILE} for AMX bf16")
-    if PACK_TILE_N != AMX_PARALLEL_TILE:
-        raise ValueError(f"PACK_TILE_N must be {AMX_PARALLEL_TILE} for AMX bf16")
-    if SIZE % PACK_BLOCK_M or PACK_BLOCK_M % PACK_TILE_M:
-        raise ValueError(
-            f"PACK_BLOCK_M must divide {SIZE} and be a multiple of PACK_TILE_M"
-        )
     if any(SIZE % tile for tile in (TILE_M, TILE_N, TILE_K)):
         raise ValueError(
             f"Tile sizes must divide {SIZE} for this fixed-shape benchmark"
         )
-    if any(SIZE % tile for tile in (PACK_TILE_M, PACK_TILE_N, PACK_TILE_K)):
+    if any(SIZE % tile for tile in (PACK_TILE_M, PACK_BN, PACK_TILE_K)):
         raise ValueError(
             f"Packed tile sizes must divide {SIZE} for this fixed-shape benchmark"
         )
@@ -243,28 +208,25 @@ def main() -> None:
 
     tiles_m, tiles_n = SIZE // TILE_M, SIZE // TILE_N
     accumulator_bytes = TILE_M * TILE_N * 4
+    panels_n = SIZE // PACK_BN
     print(
         f"bf16 {SIZE}x{SIZE} @ {SIZE}x{SIZE} -> f32; "
         f"row-major tiles={TILE_M}x{TILE_N}x{TILE_K}; "
-        f"packed block_m={PACK_BLOCK_M} "
-        f"tiles={PACK_TILE_M}x{PACK_TILE_N}x{PACK_TILE_K}"
+        f"packed panels={panels_n}x{PACK_BN} tiles={PACK_TILE_M}x{PACK_BN}x{PACK_TILE_K}"
     )
     print(
         f"{tiles_m * tiles_n} output tiles over {threads} threads; "
         f"{accumulator_bytes / 1024:.0f} KiB L2-resident accumulator per tile"
     )
 
-    b3 = pack_b_host_shape(b)
-    a3 = pack_a_host_shape(a)
     compile_start = time.perf_counter()
-    packed_b = pack_b_panels_bf16(b3)
-    helion_blocked_result = matmul_bf16_packed_b_mlir(a3, packed_b)
+    packed_b = helion_block_pack.pack_b(b, PACK_BN)
+    helion_packed_result = matmul_bf16_flat_packed(a, packed_b)
     compile_ms = (time.perf_counter() - compile_start) * 1_000
     print(f"Helion first call    {compile_ms:8.3f} ms (includes pack + MLIR JIT)")
 
     reference = a.to(torch.float32) @ b.to(torch.float32)
-    helion_result = unpack_blocked(helion_blocked_result)
-    check_numerics("Helion packed (f32)", helion_result, reference)
+    check_numerics("Helion packed (f32)", helion_packed_result, reference)
     row_major_result = matmul_bf16_mlir(a, b)
     check_numerics("Helion row-major", row_major_result, reference)
     # torch.mm keeps the bf16 output dtype, so its error is dominated by the
@@ -272,25 +234,21 @@ def main() -> None:
     check_numerics("PyTorch eager (bf16)", torch.mm(a, b), reference)
 
     with torch.inference_mode():
-        pack_ms = benchmark("1 pack B (helion)", lambda: pack_b_panels_bf16(b3))
+        pack_ms = benchmark("1 pack B (helion)", lambda: helion_block_pack.pack_b(b, PACK_BN))
         packed_matmul_ms = benchmark(
             "2 matmul (helion)",
-            lambda: matmul_bf16_packed_b_mlir(a3, packed_b),
+            lambda: matmul_bf16_flat_packed(a, packed_b),
         )
-        unpack_ms = benchmark(
-            "3 unpack (eager)",
-            lambda: unpack_blocked(helion_blocked_result),
-        )
-        # Comparable with torch.mm: all three stages, result row-major [M, N].
+        # Comparable with torch.mm: both stages, result already row-major [M, N].
         packed_total_ms = benchmark(
-            "packed e2e (1+2+3)",
-            lambda: matmul_bf16_packed_end_to_end(a3, b3),
+            "packed e2e (1+2)",
+            lambda: matmul_bf16_flat_packed(a, helion_block_pack.pack_b(b, PACK_BN)),
         )
         row_major_ms = benchmark("Helion row-major", lambda: matmul_bf16_mlir(a, b))
         eager_ms = benchmark("PyTorch eager", lambda: torch.mm(a, b))
 
     flops = 2 * SIZE**3
-    stage_sum_ms = pack_ms + packed_matmul_ms + unpack_ms
+    stage_sum_ms = pack_ms + packed_matmul_ms
     print(f"stage sum            {stage_sum_ms:8.3f} ms")
     print(f"e2e minus stage sum  {packed_total_ms - stage_sum_ms:8.3f} ms (alloc/cold)")
     print(f"matmul only          {flops / (packed_matmul_ms * 1e6):8.1f} GFLOP/s")
@@ -298,6 +256,7 @@ def main() -> None:
     print(f"Helion row-major     {flops / (row_major_ms * 1e6):8.1f} GFLOP/s")
     print(f"PyTorch eager        {flops / (eager_ms * 1e6):8.1f} GFLOP/s")
     print(f"packed e2e / PyTorch {eager_ms / packed_total_ms:8.3f}x")
+    print(f"packed e2e / row-major {row_major_ms / packed_total_ms:8.3f}x")
 
 
 if __name__ == "__main__":
