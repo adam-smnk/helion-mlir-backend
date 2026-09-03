@@ -60,6 +60,34 @@ Examples validated in current tests include:
 - Elementwise add/mul style kernels.
 - Fused scale-add style patterns.
 - Nested tiled matmul accumulation patterns.
+- Two-operand `torch.einsum` contractions (see below).
+
+### `torch.einsum`
+
+A two-operand einsum is captured before PyTorch's dispatcher decomposes it and
+emitted as one `linalg.contract`, but only when the equation matches that op's
+semantics: two operands, no ellipsis, no repeated subscript within an operand
+or in the output, every output subscript present in some input, and every
+contracted subscript present in both inputs. Multiple contracted dimensions
+are supported.
+
+Broadcasting by *omitting* a subscript from one operand (`"bmk,kn->bmn"`) is
+supported and costs nothing — the dimension is simply absent from that
+operand's indexing map. Broadcasting a *size-1* dimension against a larger one
+is not: `linalg.contract` requires matching extents, so such equations stay on
+the decomposed path. Ellipsis (`"...ij,...jk->...ik"`) is rejected outright.
+
+Shared subscripts are compared by *symbol* rather than by value, so tile
+extents are matched without evaluating them (which would install a shape guard
+on an unbacked SymInt). When equality cannot be proven and one side is
+statically 1, the equation is conservatively left to PyTorch, since that is the
+case einsum would silently broadcast.
+
+Anything else falls back to PyTorch's decomposition, which is correct but
+subject to the coverage of the resulting primitives — e.g. `"kk,kn->kn"`
+decomposes to `aten.diagonal`, which Helion's shared lowering pass rejects.
+Reduction-free equations (`"ij,ij->ij"`, `"m,n->mn"`) are excluded from the
+direct path on purpose so they keep their elementwise lowering.
 
 ## 5) Nested Reduction Semantics Are Sensitive
 

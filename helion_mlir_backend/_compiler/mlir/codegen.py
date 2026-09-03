@@ -816,6 +816,7 @@ class MLIRModuleBuilder:
         from .aten_bridge import aten_target_matches
         from .aten_lowering import is_aten_op
         from .aten_lowering import preprocess_aten_nodes
+        from .einsum_capture import is_einsum_node
 
         # Propagate symbolic shapes from outer _for_loop iter-args into inner
         # loop body placeholders BEFORE scanning ATen nodes.  Without this,
@@ -836,6 +837,8 @@ class MLIRModuleBuilder:
         for graph in search_graphs:
             for node in graph.nodes:
                 if is_aten_op(node):
+                    if is_einsum_node(node):
+                        continue
                     if aten_target_matches(
                         node,
                         "aten.mm",

@@ -207,6 +207,54 @@ Keep the reduction accumulator's shape equal to the output tile shape. Make the
 reduction loop explicit and verify that the operands use compatible inner
 axes: `[tile_m, tile_k] @ [tile_k, tile_n]`.
 
+### Contractions written as `torch.einsum`
+
+A two-operand `torch.einsum` is lowered directly to a single `linalg.contract`
+whenever the equation fits that op's semantics. This keeps the contraction
+intact instead of letting PyTorch expand it into a
+`permute`/`view`/`bmm`/`view`/`permute` chain, so transposes and batch axes
+become indexing maps rather than data movement:
+
+```python
+for tile_m, tile_n in hl.tile([m, n]):
+    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    for tile_k in hl.tile(k):
+        acc = acc + torch.einsum(
+            "mk,nk->mn", a[tile_m, tile_k], b[tile_n, tile_k]
+        )
+    out[tile_m, tile_n] = acc
+```
+
+An equation qualifies when it has exactly two operands, no ellipsis, no
+repeated subscript within a single operand or in the output, every output
+subscript present in at least one input, and every contracted subscript
+present in *both* inputs. Multiple contracted dimensions are fine
+(`"mkl,kln->mn"` contracts `k` and `l` in one op). Reduction-free equations
+(`"ij,ij->ij"`, `"m,n->mn"`) deliberately keep their elementwise lowering.
+
+Broadcasting comes in two forms and they behave differently:
+
+- *Omitting* a subscript from one operand is supported and free — it simply
+  drops that dimension from the operand's indexing map. `"bmk,kn->bmn"`
+  broadcasts a shared 2-D matrix across the batch with no data movement.
+- Relying on a *size-1* dimension to broadcast against a larger one
+  (`"mk,kn->mn"` with `k=1` on one side) is **not** taken by this path.
+  `linalg.contract` requires both operands to agree on a contracted extent, so
+  the equation is left to PyTorch's decomposition. Prefer an explicit
+  `expand`/`broadcast_to`, or omit the subscript instead.
+
+A shared subscript backed by a tile extent is matched by *symbol*, so
+`x[tile_m, tile_k]` against `y[tile_k, tile_n]` is recognised as one
+contraction without the compiler having to evaluate the tile size.
+
+Equations outside that set — three or more operands, a single operand, a
+diagonal like `"kk,kn->kn"`, or a dimension summed out of only one operand
+like `"mkl,kn->mn"` — silently fall back to PyTorch's decomposition. That
+fallback is still correct, just less direct, and some of the resulting op
+chains hit other backend limitations. If you need predictable codegen, prefer
+an equation from the qualifying set or write the contraction as
+`torch.matmul`.
+
 ## 5. Understand Reshape, Broadcast, and Permute
 
 These operations are not interchangeable:

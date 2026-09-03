@@ -74,10 +74,17 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 - `load_slice_ops.py`, `load_ops.py`: tile loads and gathers
 - `memory_ops.py`: getitem and stores
 - `matmul_ops.py`: matmul-family lowering
+- `einsum_ops.py`: captured `torch.einsum` -> `linalg.contract`
 - `subscript_ops.py`: tensor subscripts
 - `host_tensor_ops.py`: host arguments and alias materialization
 - `tensor_creation_ops.py`: `full` and `zeros`
 - `tile_index_ops.py`: tile-index tensor generation
+
+`einsum_capture.py` (at the package root) is the one piece that runs *before*
+codegen: it installs a `TorchFunctionMode` around Helion's device-IR lowering
+so a contractible `torch.einsum` is recorded as a single custom op instead of
+being expanded by PyTorch's dispatcher. Non-contractible equations are left to
+that expansion.
 
 #### 5. **ATen Bridge and Support**
 
@@ -93,6 +100,7 @@ Shared utilities live under [support/](../helion_mlir_backend/_compiler/mlir/sup
 - `block_ids.py`: canonical block-key and symbolic-name parsing
 - `symbolic_shape_restoration.py`: nested loop metadata repair
 - `aten_prepass.py`: ATen metadata refresh
+- `einsum_spec.py`: einsum equation analysis against `linalg.contract` semantics
 - `node_dispatch.py`, `type_utils.py`, and `errors.py`
 
 #### 6. **Type System: torch_dtype_to_mlir()**
@@ -205,6 +213,7 @@ linalg.generic with custom compute block:
 | Operation | MLIR Mapping | Pattern |
 |-----------|--------------|---------|
 | Matrix Multiply | `linalg.matmul` | `C = A @ B` |
+| Einsum (2 operands) | `linalg.contract` | `torch.einsum("mk,kn->mn", a, b)` |
 | Addition | `linalg.generic` | Element-wise add |
 | Multiplication | `linalg.generic` | Element-wise mul |
 | ReLU | `linalg.generic` | Element-wise max(x, 0) |

@@ -780,23 +780,24 @@ class TestAdvancedOperations:
 
 
 class TestEinsumDecomposition:
-    """Tests for the decomposition-based approach to torch.einsum lowering.
+    """Tests for einsum equations that deliberately keep the decomposed path.
 
-    torch.einsum is fully decomposed by PyTorch's inductor decomposition table
-    (aten.einsum.default → mul/permute/bmm/view) before the MLIR backend sees
-    the FX graph. There is no 'einsum' node in the graph; the backend lowers
-    the resulting primitives instead:
+    Contracting einsums are captured before dispatch and lowered directly to
+    ``linalg.contract`` (see tests/test_einsum_contract.py).  Capture requires
+    at least one contracted dimension, so a purely element-wise equation is
+    left alone: ``aten::einsum`` is ``CompositeImplicitAutograd``, so the
+    dispatcher expands it into ``mul``/``permute``/``view`` before Helion's
+    tracer records anything, and the backend lowers those primitives instead.
 
-        einsum 'ij,ij->ij'  →  mul + permute  →  linalg.generic + linalg.transpose
-        einsum 'ij,jk->ik'  →  unsqueeze + permute + bmm + view  →  linalg.matmul
-        einsum 'abcd,abcd->abcd'  →  same as elemwise above
+        einsum 'ij,ij->ij'        →  mul (+ permute)  →  linalg.generic
+        einsum 'abcd,abcd->abcd'  →  same as above
+        einsum 'ij,jk->ik'        →  captured         →  linalg.contract
 
-    These tests verify that the entire chain from einsum notation down to linalg
-    operations works correctly.
+    These tests pin the element-wise half of that split.
     """
 
     def test_einsum_elemwise_2d_decomposes_to_linalg_generic(self):
-        """einsum('ij,ij->ij') decomposes to mul+permute → linalg.generic."""
+        """einsum('ij,ij->ij') has no contracted dim → mul → linalg.generic."""
 
         @helion.kernel(static_shapes=True)
         def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -815,9 +816,10 @@ class TestEinsumDecomposition:
         ir_str = str(module)
         assert "func.func" in ir_str
         assert "linalg.generic" in ir_str  # from decomposed mul
+        assert "linalg.contract" not in ir_str
 
     def test_einsum_4d_elemwise_decomposes_to_linalg_generic(self):
-        """einsum('abcd,abcd->abcd') decomposes to mul+permute → linalg.generic (4D)."""
+        """einsum('abcd,abcd->abcd') has no contracted dim → mul → linalg.generic."""
 
         @helion.kernel(static_shapes=True)
         def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -839,6 +841,7 @@ class TestEinsumDecomposition:
         assert "func.func" in ir_str
         assert "scf.forall" in ir_str
         assert "linalg.generic" in ir_str  # from decomposed mul
+        assert "linalg.contract" not in ir_str
 
     def test_einsum_5d_elemwise_decomposes_to_linalg(self):
         """5D element-wise mul (equiv. to einsum 'abcde,abcde->abcde') → linalg.generic."""

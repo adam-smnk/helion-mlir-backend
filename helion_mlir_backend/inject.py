@@ -19,12 +19,16 @@ def install() -> bool:
 
         from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
         from helion_mlir_backend._compiler.mlir.bound_kernel import mlir_compile_config
+        from helion_mlir_backend._compiler.mlir.einsum_capture import (
+            install_einsum_capture,
+        )
     except Exception as exc:
         log.debug("External MLIR backend registration unavailable: %s", exc)
         return False
 
     register_compiler_backend(MLIRBackend)
     _patch_bound_kernel(BoundKernel, MLIRBackend, mlir_compile_config)
+    install_einsum_capture()
     return True
 
 
