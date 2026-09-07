@@ -10,6 +10,10 @@ single socket:
     PYTHONPATH=~/llvm-project/build/tools/mlir/python_packages/mlir_core:$PYTHONPATH \
     uv run python helion_matmul_bf16.py
 
+Shapes default to 4096 cubed and are overridden independently with
+``HELION_MATMUL_M``, ``HELION_MATMUL_N`` and ``HELION_MATMUL_K``. Every tile and
+block size must divide its own extent, not a single square size.
+
 The optimized packed path uses a true blocked 4D contraction:
 ``[MB, KB, BM, BK] @ [NB, KB, BK, BN] -> [MB, NB, BM, BN]``.
 That is the shape lighthouse's block-packing pipeline expects: the major block
@@ -46,7 +50,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-SIZE = 4096
+SIZE_M = int(os.environ.get("HELION_MATMUL_M", "4096"))
+SIZE_N = int(os.environ.get("HELION_MATMUL_N", "4096"))
+SIZE_K = int(os.environ.get("HELION_MATMUL_K", "4096"))
 TILE_M = int(os.environ.get("HELION_MATMUL_TILE_M", "128"))
 TILE_N = int(os.environ.get("HELION_MATMUL_TILE_N", "1024"))
 TILE_K = int(os.environ.get("HELION_MATMUL_TILE_K", "32"))
@@ -310,17 +316,17 @@ def benchmark(name: str, operation: Callable[[], object]) -> float:
 
 def strict_small_shape_check() -> None:
     """Bit-exact gate: {-1,0,1} inputs keep every partial sum exact in bf16."""
-    size = 256
+    rows, depth, cols = 128, 192, 256
     generator = torch.Generator().manual_seed(0)
-    a = helion_numerics.small_integer_matrix(size, size, generator).to(torch.bfloat16)
-    b = helion_numerics.small_integer_matrix(size, size, generator).to(torch.bfloat16)
-    # |sum| <= K = 256 = 2**8, the largest integer bf16 still represents exactly.
+    a = helion_numerics.small_integer_matrix(rows, depth, generator).to(torch.bfloat16)
+    b = helion_numerics.small_integer_matrix(depth, cols, generator).to(torch.bfloat16)
+    # |sum| <= K = 192 < 256 = 2**8, the largest integer bf16 represents exactly.
     exact = (a.double() @ b.double()).to(torch.bfloat16)
 
     a4 = pack_a_mmt4d(a)
     b4 = pack_b_mmt4d(b)
     packed_b = helion_block_pack.pack_b(b, PACK_BN)
-    print(f"strict bit-exact check at {size}x{size} (integer inputs)")
+    print(f"strict bit-exact check at {rows}x{depth} @ {depth}x{cols} (integer inputs)")
     helion_numerics.assert_bitwise_equal(
         "  mmt4d", unpack_mmt4d(matmul_bf16_mmt4d_mlir(a4, b4)), exact
     )
@@ -366,36 +372,33 @@ def main() -> None:
         raise ValueError(
             f"MMT4D_BLOCK_M/N/K must all be {AMX_PARALLEL_TILE} for AMX bf16"
         )
-    if any(SIZE % tile for tile in (TILE_M, TILE_N, TILE_K)):
-        raise ValueError(
-            f"Tile sizes must divide {SIZE} for this fixed-shape benchmark"
-        )
-    if any(
-        SIZE % tile
-        for tile in (
-            PACK_TILE_M,
-            PACK_BN,
-            PACK_TILE_K,
-            MMT4D_BLOCK_M,
-            MMT4D_BLOCK_N,
-            MMT4D_BLOCK_K,
-        )
+    for extent, tile, label in (
+        (SIZE_M, TILE_M, "TILE_M"),
+        (SIZE_N, TILE_N, "TILE_N"),
+        (SIZE_K, TILE_K, "TILE_K"),
+        (SIZE_M, PACK_TILE_M, "PACK_TILE_M"),
+        (SIZE_N, PACK_BN, "PACK_BN"),
+        (SIZE_K, PACK_TILE_K, "PACK_TILE_K"),
+        (SIZE_M, MMT4D_BLOCK_M, "MMT4D_BLOCK_M"),
+        (SIZE_N, MMT4D_BLOCK_N, "MMT4D_BLOCK_N"),
+        (SIZE_K, MMT4D_BLOCK_K, "MMT4D_BLOCK_K"),
     ):
-        raise ValueError(
-            f"Packed tile sizes must divide {SIZE} for this fixed-shape benchmark"
-        )
+        if extent % tile:
+            raise ValueError(
+                f"{label}={tile} must divide its extent {extent} for this benchmark"
+            )
 
     threads = int(os.environ.get("OMP_NUM_THREADS", "64"))
     torch.set_num_threads(threads)
     torch.manual_seed(0)
-    a = torch.randn((SIZE, SIZE), dtype=torch.float32).to(torch.bfloat16)
-    b = torch.randn((SIZE, SIZE), dtype=torch.float32).to(torch.bfloat16)
+    a = torch.randn((SIZE_M, SIZE_K), dtype=torch.float32).to(torch.bfloat16)
+    b = torch.randn((SIZE_K, SIZE_N), dtype=torch.float32).to(torch.bfloat16)
 
-    tiles_m, tiles_n = SIZE // TILE_M, SIZE // TILE_N
+    tiles_m, tiles_n = SIZE_M // TILE_M, SIZE_N // TILE_N
     accumulator_bytes = TILE_M * TILE_N * 4
-    panels_n = SIZE // PACK_BN
+    panels_n = SIZE_N // PACK_BN
     print(
-        f"bf16 {SIZE}x{SIZE} @ {SIZE}x{SIZE}; f32 accum, bf16 packed outputs; "
+        f"bf16 {SIZE_M}x{SIZE_K} @ {SIZE_K}x{SIZE_N}; f32 accum, bf16 packed outputs; "
         f"row-major tiles={TILE_M}x{TILE_N}x{TILE_K}; "
         f"host panels={panels_n}x{PACK_BN}; "
         f"mmt4d blocks={MMT4D_BLOCK_M}x{MMT4D_BLOCK_N}x{MMT4D_BLOCK_K}"
@@ -483,7 +486,7 @@ def main() -> None:
         row_major_ms = benchmark("Helion row-major", lambda: matmul_bf16_mlir(a, b))
         eager_ms = benchmark("PyTorch eager", lambda: torch.mm(a, b))
 
-    flops = 2 * SIZE**3
+    flops = 2 * SIZE_M * SIZE_N * SIZE_K
     mmt4d_stage_sum_ms = pack_a_ms + pack_b_mmt4d_ms + mmt4d_matmul_ms + mmt4d_unpack_ms
     merged_stage_sum_ms = pack_a_ms + pack_b_mmt4d_ms + mmt4d_merged_ms
     panel_stage_sum_ms = pack_ms + panel_matmul_ms
