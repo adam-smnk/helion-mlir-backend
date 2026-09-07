@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 import helion
 import helion.language as hl
 import helion_block_pack
+import helion_numerics
 import torch
 from torch import Tensor
 
@@ -307,20 +308,30 @@ def benchmark(name: str, operation: Callable[[], object]) -> float:
     return median_ms
 
 
-def check_numerics(name: str, actual: Tensor, reference_f32: Tensor) -> None:
-    """Compare against an f32 reference using bf16-appropriate tolerances."""
-    actual_f32 = actual.to(torch.float32)
-    abs_err = (actual_f32 - reference_f32).abs()
-    rel_err = abs_err / reference_f32.abs().clamp_min(1e-6)
-    print(
-        f"{name:20s} max abs {abs_err.max().item():.3e}, "
-        f"mean abs {abs_err.mean().item():.3e}, "
-        f"max rel {rel_err.max().item():.3e}"
+def strict_small_shape_check() -> None:
+    """Bit-exact gate: {-1,0,1} inputs keep every partial sum exact in bf16."""
+    size = 256
+    generator = torch.Generator().manual_seed(0)
+    a = helion_numerics.small_integer_matrix(size, size, generator).to(torch.bfloat16)
+    b = helion_numerics.small_integer_matrix(size, size, generator).to(torch.bfloat16)
+    # |sum| <= K = 256 = 2**8, the largest integer bf16 still represents exactly.
+    exact = (a.double() @ b.double()).to(torch.bfloat16)
+
+    a4 = pack_a_mmt4d(a)
+    b4 = pack_b_mmt4d(b)
+    packed_b = helion_block_pack.pack_b(b, PACK_BN)
+    print(f"strict bit-exact check at {size}x{size} (integer inputs)")
+    helion_numerics.assert_bitwise_equal(
+        "  mmt4d", unpack_mmt4d(matmul_bf16_mmt4d_mlir(a4, b4)), exact
     )
-    # bf16 has 8 mantissa bits, so a single rounding is ~2^-8; allow a few ulp
-    # for the different summation order plus an absolute floor for near-zero
-    # entries of a K=4096 random-normal reduction.
-    torch.testing.assert_close(actual_f32, reference_f32, rtol=3e-2, atol=1.0)
+    helion_numerics.assert_bitwise_equal(
+        "  merged",
+        view_merged_mmt4d(matmul_bf16_mmt4d_merged_unpack_mlir(a4, b4)),
+        exact,
+    )
+    helion_numerics.assert_bitwise_equal(
+        "  panel", matmul_bf16_flat_packed(a, packed_b), exact
+    )
 
 
 def check_bf16_semantics(name: str, actual: Tensor, reference_bf16: Tensor) -> None:
@@ -332,7 +343,6 @@ def check_bf16_semantics(name: str, actual: Tensor, reference_bf16: Tensor) -> N
         f"max bf16 delta {abs_err.max().item():.3e}"
     )
     assert actual.dtype == reference_bf16.dtype
-    torch.testing.assert_close(actual, reference_bf16, rtol=3e-2, atol=1.0)
 
 
 def main() -> None:
@@ -395,6 +405,8 @@ def main() -> None:
         f"{accumulator_bytes / 1024:.0f} KiB L2-resident accumulator per tile"
     )
 
+    strict_small_shape_check()
+
     compile_start = time.perf_counter()
     a4 = pack_a_mmt4d(a)
     b4 = pack_b_mmt4d(b)
@@ -405,21 +417,29 @@ def main() -> None:
     compile_ms = (time.perf_counter() - compile_start) * 1_000
     print(f"Helion first call    {compile_ms:8.3f} ms (includes packs + MLIR JIT)")
 
-    reference = a.to(torch.float32) @ b.to(torch.float32)
+    reference64 = a.double() @ b.double()
     torch_result = torch.mm(a, b)
     helion_mmt4d_result = unpack_mmt4d(mmt4d_blocked_result)
     helion_merged_result = view_merged_mmt4d(mmt4d_merged_result)
-    check_numerics("Helion mmt4d (bf16)", helion_mmt4d_result, reference)
-    check_numerics("Helion merged (bf16)", helion_merged_result, reference)
-    check_numerics("Helion panel (bf16)", helion_panel_result, reference)
+    row_major_result = matmul_bf16_mlir(a, b)
+    # bf16 outputs sit at half an ulp from f64 truth no matter the schedule, so
+    # the test is whether Helion is less accurate than eager, not bit-identical.
+    helion_numerics.report_accuracy("PyTorch eager (bf16)", torch_result, reference64)
+    helion_numerics.report_accuracy(
+        "Helion row-major f32", row_major_result, reference64
+    )
+    helion_numerics.assert_no_worse_than(
+        "Helion mmt4d", helion_mmt4d_result, torch_result, reference64
+    )
+    helion_numerics.assert_no_worse_than(
+        "Helion merged", helion_merged_result, torch_result, reference64
+    )
+    helion_numerics.assert_no_worse_than(
+        "Helion panel", helion_panel_result, torch_result, reference64
+    )
     check_bf16_semantics("Helion mmt4d", helion_mmt4d_result, torch_result)
     check_bf16_semantics("Helion merged", helion_merged_result, torch_result)
     check_bf16_semantics("Helion panel", helion_panel_result, torch_result)
-    row_major_result = matmul_bf16_mlir(a, b)
-    check_numerics("Helion row-major", row_major_result, reference)
-    # torch.mm keeps the bf16 output dtype, so its error is dominated by the
-    # final rounding rather than by the accumulation.
-    check_numerics("PyTorch eager (bf16)", torch_result, reference)
 
     with torch.inference_mode():
         pack_a_ms = benchmark("1a pack A (helion)", lambda: pack_a_mmt4d(a))
