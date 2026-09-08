@@ -11,6 +11,18 @@ Use MLIR APIs directly from this package:
 - `from helion_mlir_backend import generate_mlir`
 - `settings.backend = "mlir"` in Helion flows
 
+## Requirements
+
+The project extended Helion which targets Linux systems and requires a recent Python, PyTorch, and MLIR environment:
+- Linux-based OS
+- Python 3.10 or later
+- PyTorch 2.12 or later
+- Helion 1.2 or later
+- llvm/lighthouse
+
+For development, this repo is developed and tested against dependencies pulled by the `dev` dependency-group.
+External users must supply compatible versions themselves.
+
 ## Install
 
 ```bash

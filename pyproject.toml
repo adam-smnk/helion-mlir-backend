@@ -8,19 +8,19 @@ version = "0.1.0"
 description = "Workspace environment for local editable Helion and torch-mlir development"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
+# Users must supply their own compatible dependencies.
+dependencies = []
+
+# Set of fixed runtime dependencies for development and testing.
+[dependency-groups]
+dev = [
   "PyYAML",
   "numpy",
   "python-dotenv",
-	"helion",
-	"torch-mlir==20260529.826",
-  "torch==2.12.1+cu130",
+  "helion",
+  "torch==2.13.0+cu130",
   "ml-dtypes",
-  "lighthouse",
-]
-
-[dependency-groups]
-dev = [
+  "lighthouse[ingress_torch_mlir]",
   "ruff==0.14.5", # Python linter and formatter
   "pre-commit", # Tool to manage and apply pre-commit hooks
   "pytest>=8.0.0",
