@@ -65,6 +65,26 @@ def _block_id_to_out_dim_from_terminal_store(
     return None
 
 
+def _resolve_grid_upper_bound(
+    ctx: BuildContext, block_id: int, out_dim_size: int
+) -> int:
+    """The outer ``scf.forall``'s real upper bound for one grid block id.
+
+    Prefers the tile loop's own declared domain size (``hl.tile([m, ...])``'s
+    ``m``, tracked in ``block_id_to_domain_size``) over the output tensor's
+    matching dimension. These normally agree, but can genuinely differ when
+    the loop's domain is smaller than the output it writes into (e.g. a
+    smaller, unpadded loop storing into a larger, separately-allocated
+    padded output) -- using the output's (larger) shape there would make the
+    generated ``scf.forall`` iterate past the loop's real domain, reading
+    out of bounds from any *input* tensor sized to that same domain.
+    """
+    domain_size = ctx.block_id_to_domain_size.get(block_id)
+    if domain_size is not None and domain_size > 0:
+        return min(domain_size, out_dim_size)
+    return out_dim_size
+
+
 def build_kernel_body(
     ctx: BuildContext,
     out_tensors: list[torch.Tensor],
@@ -147,7 +167,9 @@ def build_kernel_body(
                 ],
             )
     ubs = [
-        out_shape[block_id_to_out_dim.get(bid, idx)]
+        _resolve_grid_upper_bound(
+            ctx, bid, out_shape[block_id_to_out_dim.get(bid, idx)]
+        )
         for idx, bid in enumerate(grid_block_ids_flat)
     ]
     steps = [ctx.block_id_to_size[block_id] for block_id in grid_block_ids_flat]
@@ -190,8 +212,14 @@ def build_kernel_body(
         else:
             ctx.block_id_to_upper_bound[block_id] = min(previous, int(upper_bound))
 
+    output_search_graphs = (
+        phase_graphs
+        if phase_graphs is not None
+        else [gi.graph for gi in ctx.host_function.device_ir.graphs]
+    )
     output_emptys = [
-        tensor_d.EmptyOp(
+        _existing_output_value(ctx, tensor, output_search_graphs)
+        or tensor_d.EmptyOp(
             [int(d) for d in tensor.shape],
             torch_dtype_to_mlir(tensor.dtype),
         ).result
@@ -293,6 +321,41 @@ def _validate_parallel_insert_fits(
                 "reorder the value explicitly with .permute() before storing",
             ],
         )
+
+
+def _existing_output_value(
+    ctx: BuildContext,
+    tensor: torch.Tensor,
+    graphs: list[torch.fx.Graph],
+) -> ir.Value | None:
+    """The already-lowered value for *tensor*, if some earlier node already
+    produced it (e.g. ``torch.zeros``/``torch.full``) in the same phase, or
+    if it is itself one of this phase's own function parameters (a value an
+    earlier phase already computed and the multi-phase driver threaded in by
+    name -- see ``bound_kernel.py``/``phase_plan.py``).
+
+    A tile loop's ``shared_outs`` init must preserve whatever the host-level
+    output variable already held, not unconditionally reset it via a fresh
+    ``tensor.empty()`` -- that silently discards real initialization (e.g.
+    zero-padding written before a loop that only covers part of the tensor,
+    or by an earlier phase entirely), replacing it with uninitialized memory
+    for anything the loop doesn't touch.
+    """
+    from ..phase_plan import resolve_host_variable_name
+
+    name = resolve_host_variable_name(ctx.host_function, tensor)
+    if name is not None and name in ctx.param_to_value:
+        return ctx.param_to_value[name]
+
+    # Matched by object identity against each node's traced fake value,
+    # which is how the same underlying tensor is tracked across FX nodes.
+    for graph in graphs:
+        for node in graph.nodes:
+            if node.meta.get("val") is tensor:
+                value = ctx.node_to_value.get(node)
+                if value is not None:
+                    return value
+    return None
 
 
 def _phase_graph_closure(

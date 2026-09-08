@@ -288,18 +288,22 @@ class HelionMLIRExecutor:
 
         def jit_wrapper(
             *input_tensors: torch.Tensor,
+            out_tensors: list[torch.Tensor] | None = None,
         ) -> torch.Tensor | list[torch.Tensor]:
-            # Pre-allocate contiguous output buffers.
-            outputs = [
-                torch.empty(
-                    m.shape,
-                    dtype=m.dtype,
-                    device=m.device,
-                    memory_format=torch.contiguous_format,
-                )
-                for m in result_meta
-            ]
-            # TorchMemoryManager ciface convention: output first, then inputs.
+            if out_tensors is not None:
+                outputs = out_tensors
+            else:
+                # Pre-allocate contiguous output buffers.
+                outputs = [
+                    torch.empty(
+                        m.shape,
+                        dtype=m.dtype,
+                        device=m.device,
+                        memory_format=torch.contiguous_format,
+                    )
+                    for m in result_meta
+                ]
+            # TorchMemoryManager ciface convention: outputs first, then inputs.
             runner.execute(entry_func, [*outputs, *input_tensors])
             return outputs[0] if len(outputs) == 1 else outputs
 

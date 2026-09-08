@@ -195,8 +195,10 @@ def _build_aten_subgraph(
 
     for i, arg in enumerate(node_args):
         if isinstance(arg, torch.fx.Node):
-            concrete_val = None
-            if arg_position_override is not None and i in arg_position_override:
+            is_override = (
+                arg_position_override is not None and i in arg_position_override
+            )
+            if is_override:
                 concrete_val = arg_position_override[i]
             else:
                 concrete_val = _fake_tensor_from_node_meta(
@@ -206,37 +208,54 @@ def _build_aten_subgraph(
                     block_id_to_upper_bound or {},
                 )
             if concrete_val is not None:
-                # Keep helper placeholders bounded by traced tensor metadata
-                # so helper signatures match boundary tiles (e.g. 8x16 vs 16x16).
-                bound_shape: list[int] | None = None
-                tmeta = arg.meta.get("tensor_meta")
-                if tmeta is not None:
-                    tm_shape = getattr(tmeta, "shape", None)
-                    if tm_shape is not None:
-                        bound_shape = _resolve_dims(
-                            tm_shape,
-                            block_id_to_size or {},
-                            env,
-                            block_id_to_upper_bound or {},
-                        )
-                if bound_shape is None:
-                    arg_val = arg.meta.get("val")
-                    if isinstance(arg_val, torch.Tensor):
-                        bound_shape = _resolve_dims(
-                            arg_val.shape,
-                            block_id_to_size or {},
-                            env,
-                            block_id_to_upper_bound or {},
-                        )
-                if bound_shape is not None and len(bound_shape) == len(
-                    concrete_val.shape
-                ):
-                    clipped = [
-                        min(int(concrete_val.shape[d]), int(bound_shape[d]))
-                        for d in range(len(bound_shape))
-                    ]
-                    if tuple(clipped) != tuple(int(s) for s in concrete_val.shape):
-                        concrete_val = torch.zeros(clipped, dtype=concrete_val.dtype)
+                if not is_override:
+                    # Keep helper placeholders bounded by traced tensor metadata
+                    # so helper signatures match boundary tiles (e.g. 8x16 vs 16x16).
+                    #
+                    # Skipped entirely when *is_override*: an override comes from
+                    # `rebuild_aten_helper_for_call`, built directly from the real
+                    # MLIR value's shape at the actual call site -- it is already
+                    # authoritative and needs no further "bounding". Applying this
+                    # clip to it anyway is what caused the historical "ATen helper
+                    # signature does not match ... even after rebuilding" failure:
+                    # a dim that can't be mapped to a real block_id falls back to
+                    # the SymInt's bare hint (Helion's `create_block_var` defaults
+                    # hints to 64 -- see helion/_compiler/compile_environment.py),
+                    # silently clipping the correct override shape down to a
+                    # phantom "tensor<...x64>" and permanently desyncing the
+                    # rebuilt helper from the call site for any tile above 64
+                    # elements.
+                    bound_shape: list[int] | None = None
+                    tmeta = arg.meta.get("tensor_meta")
+                    if tmeta is not None:
+                        tm_shape = getattr(tmeta, "shape", None)
+                        if tm_shape is not None:
+                            bound_shape = _resolve_dims_or_none(
+                                tm_shape,
+                                block_id_to_size or {},
+                                env,
+                                block_id_to_upper_bound or {},
+                            )
+                    if bound_shape is None:
+                        arg_val = arg.meta.get("val")
+                        if isinstance(arg_val, torch.Tensor):
+                            bound_shape = _resolve_dims_or_none(
+                                arg_val.shape,
+                                block_id_to_size or {},
+                                env,
+                                block_id_to_upper_bound or {},
+                            )
+                    if bound_shape is not None and len(bound_shape) == len(
+                        concrete_val.shape
+                    ):
+                        clipped = [
+                            min(int(concrete_val.shape[d]), int(bound_shape[d]))
+                            for d in range(len(bound_shape))
+                        ]
+                        if tuple(clipped) != tuple(int(s) for s in concrete_val.shape):
+                            concrete_val = torch.zeros(
+                                clipped, dtype=concrete_val.dtype
+                            )
 
                 ph = g.placeholder(f"arg{i}")
                 ph.meta["val"] = concrete_val
@@ -780,6 +799,39 @@ def _resolve_dims(
                 result.append(resolved)
                 continue
         result.append(int(d))
+    return result
+
+
+def _resolve_dims_or_none(
+    dims: tuple[object, ...] | list[object],
+    block_id_to_size: dict[int, int],
+    env: CompileEnvironment | None = None,
+    block_id_to_upper_bound: dict[int, int] | None = None,
+) -> list[int] | None:
+    """Like ``_resolve_dims``, but ``None`` if any SymInt dim lacks a real block_id.
+
+    ``_resolve_dims`` silently falls back to a SymInt's bare hint (default 64,
+    see ``CompileEnvironment.create_block_var``) when it can't map a dim to a
+    registered block_id. That fallback is fine for *best-effort* shape
+    reporting, but unsafe as a clip/bound for an already-known-correct
+    concrete shape: it would clip any larger dim down to the phantom hint.
+    Callers that use the result to bound another shape should use this
+    strict variant and skip bounding entirely when it returns ``None``.
+    """
+    result = []
+    for d in dims:
+        if isinstance(d, torch.SymInt):
+            resolved = _resolve_symint_dim(
+                d,
+                block_id_to_size,
+                env,
+                block_id_to_upper_bound,
+            )
+            if resolved is None:
+                return None
+            result.append(resolved)
+        else:
+            result.append(int(d))
     return result
 
 

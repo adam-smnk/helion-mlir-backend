@@ -202,6 +202,7 @@ def build_phase_plans(
     from .output_resolver import OutputTensorResolver
 
     known_names: set[str] = set(declared_param_names) | set(extra_host_tensor_names)
+    produced_by_earlier_phase: set[str] = set()
     resolver = OutputTensorResolver(hf)
     plans: list[PhasePlan] = []
     for phase_index, phase in enumerate(hf.device_ir.phases):
@@ -210,11 +211,19 @@ def build_phase_plans(
         # A store's destination is itself referenced via `_host_tensor(name)`
         # (to get the tensor to store into), so it shows up in the raw scan
         # below even though the phase only *writes* it, never reads its
-        # existing value -- exclude a phase's own outputs from its inputs.
+        # existing value -- exclude a phase's own *freshly allocated*
+        # outputs from its inputs. But if the name was already produced by
+        # an *earlier* phase, this phase is doing an in-place/partial update
+        # of an existing buffer (e.g. a zero-fill phase followed by a
+        # partial-overwrite phase) and must still receive it as an input so
+        # the driver threads the real, already-computed tensor through
+        # instead of the phase's own compiled function allocating a fresh,
+        # uninitialized buffer for it.
         own_output_names = {
             name
             for _, tensor in outputs
             if (name := resolve_host_variable_name(hf, tensor)) is not None
+            and name not in produced_by_earlier_phase
         }
 
         referenced = _phase_host_tensor_names(hf, phase.roots)
@@ -228,6 +237,7 @@ def build_phase_plans(
             resolved_name = resolve_host_variable_name(hf, tensor)
             if resolved_name is not None:
                 known_names.add(resolved_name)
+                produced_by_earlier_phase.add(resolved_name)
 
         plans.append(
             PhasePlan(

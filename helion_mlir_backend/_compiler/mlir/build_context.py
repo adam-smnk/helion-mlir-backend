@@ -36,6 +36,14 @@ class BuildContext:
 
     block_id_to_size: dict[int, int] = field(default_factory=dict)
     block_id_to_upper_bound: dict[int, int] = field(default_factory=dict)
+    # The real extent of the dimension a block id tiles (e.g. ``m`` in
+    # ``for tile_m in hl.tile([m])``), independent of any output tensor's
+    # shape. Populated once from ``env.block_sizes`` (see
+    # ``codegen.py::_resolve_block_sizes``); used to bound the outer
+    # ``scf.forall`` by the loop's own declared domain instead of an output
+    # tensor's shape, which can be larger (e.g. a padded output written by a
+    # smaller, unpadded loop).
+    block_id_to_domain_size: dict[int, int] = field(default_factory=dict)
 
     # Written directly once per outer grid block id (build_kernel_body) then
     # save/restored per nested scf.for level via enter_for_loop(); read

@@ -40,6 +40,7 @@ the ordinary ATen portions of each tile body.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from dataclasses import field
 import logging
@@ -406,6 +407,8 @@ class MLIRModuleBuilder:
             else:
                 size = int(size)
             self.context.block_id_to_size[bs.block_id] = size
+            with contextlib.suppress(TypeError, ValueError):
+                self.context.block_id_to_domain_size[bs.block_id] = bs.size_hint()
 
     def _resolve_block_upper_bounds(self) -> None:
         """Infer static upper bounds per block_id from ``_for_loop`` nodes.
