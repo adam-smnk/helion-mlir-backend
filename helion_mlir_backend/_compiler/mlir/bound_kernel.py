@@ -105,11 +105,25 @@ def _build_multi_phase_driver(
     def run(*args: object) -> object:
         real_args = [a for a in args if isinstance(a, torch.Tensor)]
         names = dict(zip(tensor_param_names, real_args, strict=True))
-        names.update(host_prefix_fn(*real_args))
+        # ``host_prefix_fn`` re-executes the kernel's own host-level Python
+        # statements (see host_prefix.py), so it needs the *full* original
+        # argument list -- including non-tensor ``hl.constexpr`` args -- not
+        # just the tensors. Passing only ``real_args`` here silently dropped
+        # constexpr-only params, causing a missing-positional-arguments
+        # TypeError whenever a phase didn't itself reference one of them.
+        names.update(host_prefix_fn(*args))
 
         for phase, jit_fn in zip(phase_modules, phase_callables, strict=True):
             phase_inputs = [names[name] for name in phase.input_names]
-            phase_result = jit_fn(*phase_inputs)
+            existing_outs = [
+                names[oname]
+                for oname in phase.output_names
+                if oname in names and isinstance(names[oname], torch.Tensor)
+            ]
+            out_tensors = (
+                existing_outs if len(existing_outs) == len(phase.output_names) else None
+            )
+            phase_result = jit_fn(*phase_inputs, out_tensors=out_tensors)
             results = phase_result if isinstance(phase_result, list) else [phase_result]
             names.update(zip(phase.output_names, results, strict=True))
 

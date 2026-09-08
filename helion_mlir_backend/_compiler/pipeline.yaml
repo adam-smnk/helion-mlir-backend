@@ -1,5 +1,9 @@
 # This is an optimizing pipeline for kernel_bench matmul-like kernels.
 Pipeline:
+  - pass: symbol-dce
+  - pass: cse
+  - pass: canonicalize
+
   - pass: "linalg-fuse-elementwise-ops"
   - pass: "linalg-morph-ops{named-to-category generic-to-category}"
   - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"

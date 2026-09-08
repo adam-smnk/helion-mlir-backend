@@ -7,6 +7,8 @@ Covers both execution paths:
 
 from __future__ import annotations
 
+import math
+
 import helion
 import helion.language as hl
 import pytest
@@ -1543,3 +1545,196 @@ class TestHostSideViewAlias:
         torch.manual_seed(3)
         x = torch.randn(8, 16)
         assert torch.equal(reshape_kernel(x), x.view(16, 8))
+
+
+class TestGenericAtenHelperBoundaryTileRegression:
+    """Regression: generic ATen-helper ops must work for tiles > 64 elements.
+
+    Root cause: ``rebuild_aten_helper_for_call`` rebuilds a per-call-site
+    helper using the *real* MLIR operand shapes (authoritative), but
+    ``_build_aten_subgraph`` used to re-clip that already-correct shape
+    against a "bound" independently re-derived from FX SymInt metadata. When
+    a dim's SymInt couldn't be mapped back to a real block_id, resolution
+    silently fell back to the SymInt's bare hint -- and Helion's
+    ``CompileEnvironment.create_block_var`` defaults that hint to 64 -- so the
+    rebuilt helper got clipped down to a phantom ``tensor<...x64>`` signature
+    that then permanently mismatched the real call site for any tile whose
+    last dim exceeds 64 elements. Fixed by never re-clipping an
+    already-authoritative override shape (see ``aten_lowering.py``).
+
+    These ops (``relu``, ``abs``, ``maximum``, elementwise scalar multiply)
+    all go through the generic ATen-helper path -- unlike matmul/einsum,
+    which have dedicated direct lowering and never hit this bug -- so they
+    are the right coverage for this regression, independent of any one op.
+    """
+
+    @staticmethod
+    def _relu_kernel():
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[8, 1024]),
+        )
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                out[tile] = torch.relu(x[tile])
+            return out
+
+        return kernel
+
+    @staticmethod
+    def _abs_kernel():
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[8, 1024]),
+        )
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                out[tile] = torch.abs(x[tile])
+            return out
+
+        return kernel
+
+    @pytest.mark.parametrize("n", [64, 65, 96, 512, 1024, 4096])
+    def test_relu_above_64_elements(self, n):
+        kernel = self._relu_kernel()
+        torch.manual_seed(0)
+        x = torch.randn(16, n)
+        assert _allclose(kernel(x), torch.relu(x))
+
+    @pytest.mark.parametrize("n", [64, 96, 512, 4096])
+    def test_abs_above_64_elements(self, n):
+        kernel = self._abs_kernel()
+        torch.manual_seed(1)
+        x = torch.randn(16, n)
+        assert _allclose(kernel(x), torch.abs(x))
+
+    @pytest.mark.parametrize("n", [64, 96, 512, 4096])
+    def test_scalar_mul_above_64_elements(self, n):
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[8, 1024]),
+        )
+        def scalar_mul_kernel(a: torch.Tensor, s: hl.constexpr) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(a.shape):
+                out[tile] = a[tile] * s
+            return out
+
+        torch.manual_seed(2)
+        a = torch.randn(16, n)
+        assert _allclose(scalar_mul_kernel(a, hl.constexpr(math.pi)), a * math.pi)
+
+    @pytest.mark.parametrize("n", [64, 96, 512, 4096])
+    def test_maximum_above_64_elements(self, n):
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[8, 1024]),
+        )
+        def maximum_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                out[tile] = torch.maximum(x[tile], y[tile])
+            return out
+
+        torch.manual_seed(3)
+        x = torch.randn(16, n)
+        y = torch.randn(16, n)
+        assert _allclose(maximum_kernel(x, y), torch.maximum(x, y))
+
+    def test_leaky_relu_above_64_elements(self):
+        """``torch.nn.functional.leaky_relu`` needs both the shape fix and
+
+        `hl.constexpr` for its ``negative_slope`` scalar (a dynamic float arg
+        can't be lowered by this backend at all -- see ``elementwise.py``).
+        """
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[8, 1024]),
+        )
+        def leaky_relu_kernel(
+            x: torch.Tensor, negative_slope: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                out[tile] = torch.nn.functional.leaky_relu(
+                    x[tile], negative_slope=negative_slope
+                )
+            return out
+
+        torch.manual_seed(4)
+        x = torch.randn(16, 4096)
+        actual = leaky_relu_kernel(x, hl.constexpr(0.01))
+        expected = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+        assert _allclose(actual, expected)
+
+
+class TestPaddedPackingAndMultiPhaseExecution:
+    """Regression tests for 4D blocked packing, irregular shape matmul,
+
+    and multi-phase in-place buffer preservation.
+    """
+
+    def test_pack_b_blocked_shape_and_square_matmul_execution(self):
+        """Regression test for pack_b_blocked 4D view return and square matmul."""
+        from helion_mlir_cpu_utils.matmul import matmul
+        from helion_mlir_cpu_utils.matmul import pack_b_blocked
+
+        b = torch.randn(128, 128, dtype=torch.float32)
+        b4 = pack_b_blocked(b)
+        assert b4.ndim == 4
+        assert b4.shape == (4, 4, 32, 32)
+
+        a = torch.randn(128, 128, dtype=torch.float32)
+        actual = matmul(a, b)
+        expected = a @ b
+        assert _allclose(actual, expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_matmul_irregular_shapes_padded_packing(self, dtype):
+        """Irregular (non-32-divisible) shapes pad inside packing kernels."""
+        from helion_mlir_cpu_utils.matmul import matmul
+
+        torch.manual_seed(5)
+        a = torch.randn(37, 19, dtype=dtype)
+        b = torch.randn(19, 45, dtype=dtype)
+
+        actual = matmul(a, b)
+        expected = a @ b
+        atol = 1e-4 if dtype == torch.float32 else 0.5
+        assert torch.allclose(actual.float(), expected.float(), atol=atol)
+
+    def test_multiphase_inplace_buffer_preservation(self):
+        """Multi-phase kernel preserves Phase 0's zeros in unwritten slice."""
+
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[32, 32, 32, 32]),
+        )
+        def pad_copy_two_phase(
+            a: torch.Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr
+        ) -> torch.Tensor:
+            m, k = a.shape
+            out = torch.empty((int(m_pad), int(k_pad)), dtype=a.dtype, device=a.device)
+            for tile_m, tile_k in hl.tile([int(m_pad), int(k_pad)]):
+                out[tile_m, tile_k] = hl.zeros([tile_m, tile_k], dtype=a.dtype)
+            hl.barrier()
+            for tile_m, tile_k in hl.tile([m, k]):
+                out[tile_m, tile_k] = a[tile_m, tile_k]
+            return out
+
+        torch.manual_seed(6)
+        a = torch.randn(32, 19)
+        actual = pad_copy_two_phase(a, hl.constexpr(64), hl.constexpr(32))
+
+        expected = torch.zeros(64, 32)
+        expected[:32, :19] = a
+        assert torch.equal(actual, expected)
