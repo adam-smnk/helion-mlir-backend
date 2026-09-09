@@ -70,7 +70,7 @@ def _pack_a_kernel(a: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tenso
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
-    config=helion.Config(block_sizes=[1, 8, 32]),
+    config=helion.Config(block_sizes=[1, 4096]),
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
@@ -86,8 +86,15 @@ def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tenso
         b3 = pad.reshape(depth, panels, 32)
 
     out = torch.empty((panels, depth, 32), dtype=b.dtype, device=b.device)
-    for panel, tile_k, tile_n in hl.tile([panels, depth, 32]):
-        out[panel, tile_k, tile_n] = b3[tile_k, panel, tile_n].permute(1, 0, 2)
+    # Nested (not combined) tile loops: each block-count dim gets its own
+    # ragged-safe mask and a much larger per-iteration chunk than tiling the
+    # raw depth extent directly (previously ~65k tiny 8x32 iterations).
+    # depth block is intentionally large (>= any realistic K): oversized
+    # block sizes on this *inner nested* dim safely clamp via masking,
+    # unlike the outer/store-position ``panel`` dim (must stay 1).
+    for panel in hl.tile(panels):
+        for tile_k in hl.tile(depth):
+            out[panel, tile_k, :] = b3[tile_k, panel, :].permute(1, 0, 2)
     return out
 
 
@@ -189,11 +196,11 @@ def _pack_a_kernel_t(a_t: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> T
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
-    config=helion.Config(block_sizes=[1, 8, 32]),
+    config=helion.Config(block_sizes=[1, 4096]),
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
-    """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad/BK, BK, BN]``."""
+    """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad, BN]``."""
     n, k = int(b_t.shape[0]), int(b_t.shape[1])
     depth = int(k_pad)
     panels = int(n_pad) // 32
@@ -205,10 +212,29 @@ def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> T
         b3 = pad.reshape(panels, 32, depth)
 
     out = torch.empty((panels, depth, 32), dtype=b_t.dtype, device=b_t.device)
-    for panel, tile_k, tile_n in hl.tile([panels, depth, 32]):
-        out[panel, tile_k, tile_n] = b3[panel, tile_n, tile_k].permute(0, 2, 1)
-    res = out.view(panels, depth // 32, 32, 32)
-    return res  # noqa: RET504
+    # See _pack_b_kernel: depth block intentionally oversized (safe on this
+    # inner nested dim), panel block stays 1 (outer/store-position dim).
+    for panel in hl.tile(panels):
+        for tile_k in hl.tile(depth):
+            out[panel, tile_k, :] = b3[panel, :, tile_k].permute(0, 2, 1)
+    return out
+
+
+# Wider panel tiles reduce loop overhead for MLP-sized weights. Rewrapping the
+# original functions keeps one implementation while retaining a safe block-1
+# fallback for outputs with fewer than eight panels.
+_pack_b_kernel_wide = helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[8, 4096]),
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)(_pack_b_kernel.fn)
+_pack_b_kernel_t_wide = helion.kernel(
+    static_shapes=True,
+    backend="mlir",
+    config=helion.Config(block_sizes=[8, 4096]),
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)(_pack_b_kernel_t.fn)
 
 
 def pack_a_blocked(
@@ -238,7 +264,8 @@ def pack_b_blocked(
     k, n = int(b.shape[0]), int(b.shape[1])
     k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
     n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
-    panels = _pack_b_kernel(b, hl.constexpr(k_target), hl.constexpr(n_target))
+    pack_kernel = _pack_b_kernel_wide if n_target // BLOCK_N >= 8 else _pack_b_kernel
+    panels = pack_kernel(b, hl.constexpr(k_target), hl.constexpr(n_target))
     return panels.view(n_target // BLOCK_N, k_target // BLOCK_K, BLOCK_K, BLOCK_N)
 
 
@@ -249,7 +276,10 @@ def pack_b_blocked_t(
     n, k = int(b_t.shape[0]), int(b_t.shape[1])
     k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
     n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
-    panels = _pack_b_kernel_t(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
+    pack_kernel = (
+        _pack_b_kernel_t_wide if n_target // BLOCK_N >= 8 else _pack_b_kernel_t
+    )
+    panels = pack_kernel(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
     return panels.view(n_target // BLOCK_N, k_target // BLOCK_K, BLOCK_K, BLOCK_N)
 
 
@@ -352,6 +382,63 @@ def matmul(
         out4 = _matmul_blocked_kernel_bias(a4, b4, bias3, epilogue)
     out = out4.reshape(m_pad, n_pad)
     return out[:m, :n]
+
+
+def matmul_prepacked_b(
+    a: Tensor,
+    b4: Tensor,
+    n: int,
+    bias: Tensor | None = None,
+    epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
+) -> Tensor:
+    """Multiply row-major ``a`` by a RHS produced by ``pack_b_blocked_t``.
+
+    Only the runtime activation is packed on each call. ``n`` is the original
+    output width before padding; callers own the lifetime and invalidation of
+    ``b4`` and must repack it when the source weight changes.
+    """
+    if a.dim() != 2 or b4.dim() != 4:
+        raise ValueError(
+            f"matmul_prepacked_b() expects rank-2 a and rank-4 b4, got "
+            f"a.shape={tuple(a.shape)} and b4.shape={tuple(b4.shape)}"
+        )
+    if a.dtype != b4.dtype or a.device != b4.device:
+        raise ValueError(
+            "matmul_prepacked_b() requires matching dtype and device: "
+            f"a=({a.dtype}, {a.device}), b4=({b4.dtype}, {b4.device})"
+        )
+
+    blocks_n, blocks_k, block_k, block_n = map(int, b4.shape)
+    if block_k != BLOCK_K or block_n != BLOCK_N:
+        raise ValueError(
+            f"invalid packed RHS block shape {tuple(b4.shape)}; "
+            f"expected trailing dimensions ({BLOCK_K}, {BLOCK_N})"
+        )
+
+    m, k = map(int, a.shape)
+    m_pad = _round_up(m, BLOCK_M)
+    k_pad = _round_up(k, BLOCK_K)
+    n_pad = blocks_n * BLOCK_N
+    if (
+        blocks_k * BLOCK_K != k_pad
+        or not 0 < n <= n_pad
+        or _round_up(n, BLOCK_N) != n_pad
+    ):
+        raise ValueError(
+            f"packed RHS shape {tuple(b4.shape)} is incompatible with "
+            f"a.shape={tuple(a.shape)} and n={n}"
+        )
+
+    a4 = pack_a_blocked(a, m_pad=m_pad, k_pad=k_pad)
+    if bias is None:
+        out4 = _matmul_blocked_kernel(a4, b4, epilogue)
+    else:
+        if bias.dim() != 1 or int(bias.shape[0]) != n:
+            raise ValueError(f"bias must have shape ({n},), got {tuple(bias.shape)}")
+        bias_padded = _pad_to(bias.reshape(1, -1), (1, n_pad)).reshape(-1)
+        bias3 = bias_padded.reshape(blocks_n, 1, BLOCK_N)
+        out4 = _matmul_blocked_kernel_bias(a4, b4, bias3, epilogue)
+    return out4.reshape(m_pad, n_pad)[:m, :n]
 
 
 def bmm(a: Tensor, b: Tensor) -> Tensor:

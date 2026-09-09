@@ -8,6 +8,7 @@ from .elementwise import scalar_mul
 from .matmul import bmm
 from .matmul import identity_epilogue
 from .matmul import matmul
+from .matmul import matmul_prepacked_b
 from .matmul import pack_a_blocked
 from .matmul import pack_a_blocked_t
 from .matmul import pack_b_blocked
@@ -21,6 +22,7 @@ __all__ = [
     "identity_epilogue",
     "leaky_relu",
     "matmul",
+    "matmul_prepacked_b",
     "matvec",
     "pack_a_blocked",
     "pack_a_blocked_t",

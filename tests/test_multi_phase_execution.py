@@ -17,6 +17,12 @@ import torch
 import helion_mlir_backend  # noqa: F401 registers "mlir" backend
 
 
+@pytest.fixture(autouse=True)
+def _use_scalar_pipeline(monkeypatch):
+    """The AMX-specialized pipeline does not support multi-phase kernels."""
+    monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
+
+
 def test_two_phase_barrier_kernel_direct_call():
     @helion.kernel(static_shapes=True, backend="mlir")
     def two_phase_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
