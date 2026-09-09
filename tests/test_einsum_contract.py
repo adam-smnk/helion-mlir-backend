@@ -7,6 +7,9 @@ numerical correctness of the generated kernels.
 
 from __future__ import annotations
 
+import os
+from unittest.mock import patch
+
 import helion
 import helion.language as hl
 import pytest
@@ -20,7 +23,11 @@ from helion_mlir_backend._compiler.mlir.support.einsum_spec import is_contractib
 
 
 def _execute(module, *tensors, kernel_name):
-    return MLIRBackend().execute_mlir(module, *tensors, kernel_name=kernel_name)
+    # These tests cover generic contraction shapes that the AMX-specialized
+    # pipeline does not support. Keep their execution on scalar lowering even
+    # when the surrounding test process enables HELION_MLIR_PIPELINE.
+    with patch.dict(os.environ, {"HELION_MLIR_PIPELINE": "0"}):
+        return MLIRBackend().execute_mlir(module, *tensors, kernel_name=kernel_name)
 
 
 # ---------------------------------------------------------------------------

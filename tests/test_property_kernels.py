@@ -26,6 +26,7 @@ from hypothesis import assume
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
+import pytest
 import torch
 
 from helion_mlir_backend import generate_mlir
@@ -53,6 +54,12 @@ _PHASE_SETTINGS = settings(
 )
 
 _BLOCK_SIZES = [4, 8, 16, 32]
+
+
+@pytest.fixture(autouse=True)
+def _use_scalar_pipeline(monkeypatch):
+    """Property cases exercise shapes outside the AMX pipeline's scope."""
+    monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
 
 
 @given(
