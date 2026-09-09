@@ -22,6 +22,7 @@ kernel followed by a separate elementwise kernel.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Callable
 
 import helion
@@ -30,6 +31,9 @@ import torch
 from torch import Tensor
 
 import helion_mlir_backend  # noqa: F401
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import Kernel
 
 # AMX bf16 register tile. All three extents must divide by this to use the
 # blocked path.
@@ -89,9 +93,8 @@ def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tenso
     # Nested (not combined) tile loops: each block-count dim gets its own
     # ragged-safe mask and a much larger per-iteration chunk than tiling the
     # raw depth extent directly (previously ~65k tiny 8x32 iterations).
-    # depth block is intentionally large (>= any realistic K): oversized
-    # block sizes on this *inner nested* dim safely clamp via masking,
-    # unlike the outer/store-position ``panel`` dim (must stay 1).
+    # The public wrapper rewraps this function with exact-divisor panel/depth
+    # blocks for each padded shape, avoiding unsafe ragged stores.
     for panel in hl.tile(panels):
         for tile_k in hl.tile(depth):
             out[panel, tile_k, :] = b3[tile_k, panel, :].permute(1, 0, 2)
@@ -173,6 +176,47 @@ def _matmul_blocked_kernel_bias(
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
+    config=helion.Config(block_sizes=[1, 1]),
+)
+def _matmul_blocked_kernel_affine(
+    a4: Tensor,
+    b4: Tensor,
+    bias3: Tensor,
+    scale3: Tensor,
+    post_bias3: Tensor,
+    epilogue: Callable[[Tensor], Tensor],
+) -> Tensor:
+    """Blocked matmul with ``(acc + bias) * scale + post_bias`` epilogue."""
+    blocks_m, blocks_k, block_m, block_k = a4.shape
+    blocks_n, blocks_k2, block_k2, block_n = b4.shape
+    assert blocks_k == blocks_k2, "major K mismatch"
+    assert block_k == block_k2, "minor K mismatch"
+
+    out = torch.empty(
+        (blocks_m, block_m, blocks_n, block_n),
+        dtype=a4.dtype,
+        device=a4.device,
+    )
+    for tile_blocks_m, tile_blocks_n in hl.tile([blocks_m, blocks_n]):
+        acc = hl.zeros(
+            [tile_blocks_m, tile_blocks_n, block_m, block_n], dtype=torch.float32
+        )
+        acc = acc + torch.einsum(
+            "akmc,bkcn->abmn",
+            a4[tile_blocks_m, :, :, :],
+            b4[tile_blocks_n, :, :, :],
+        )
+        y = epilogue(
+            (acc + bias3[tile_blocks_n, :, :]) * scale3[tile_blocks_n, :, :]
+            + post_bias3[tile_blocks_n, :, :]
+        )
+        out[tile_blocks_m, :, tile_blocks_n, :] = y.permute(0, 2, 1, 3).to(a4.dtype)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    backend="mlir",
     config=helion.Config(block_sizes=[1, 1, 8, 32]),
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
@@ -220,9 +264,7 @@ def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> T
     return out
 
 
-# Wider panel tiles reduce loop overhead for MLP-sized weights. Rewrapping the
-# original functions keeps one implementation while retaining a safe block-1
-# fallback for outputs with fewer than eight panels.
+# Seed the shape-specialized caches with the common MLP configuration.
 _pack_b_kernel_wide = helion.kernel(
     static_shapes=True,
     backend="mlir",
@@ -235,6 +277,9 @@ _pack_b_kernel_t_wide = helion.kernel(
     config=helion.Config(block_sizes=[8, 4096]),
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )(_pack_b_kernel_t.fn)
+
+_pack_b_kernel_configs = {(8, 4096): _pack_b_kernel_wide}
+_pack_b_kernel_t_configs = {(8, 4096): _pack_b_kernel_t_wide}
 
 
 def pack_a_blocked(
@@ -257,6 +302,29 @@ def pack_a_blocked_t(
     return _pack_a_kernel_t(a_t, hl.constexpr(m_target), hl.constexpr(k_target))
 
 
+def _pack_b_block_sizes(n_target: int, k_target: int) -> tuple[int, int]:
+    panels = n_target // BLOCK_N
+    panel_block = next(
+        (candidate for candidate in range(8, 1, -1) if panels % candidate == 0),
+        panels,
+    )
+    return panel_block, k_target
+
+
+def _pack_b_kernel_for_shape(n_target: int, k_target: int, transposed: bool) -> Kernel:
+    block_sizes = _pack_b_block_sizes(n_target, k_target)
+    configs = _pack_b_kernel_t_configs if transposed else _pack_b_kernel_configs
+    if block_sizes not in configs:
+        source = _pack_b_kernel_t if transposed else _pack_b_kernel
+        configs[block_sizes] = helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=list(block_sizes)),
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )(source.fn)
+    return configs[block_sizes]
+
+
 def pack_b_blocked(
     b: Tensor, k_pad: int | None = None, n_pad: int | None = None
 ) -> Tensor:
@@ -264,7 +332,7 @@ def pack_b_blocked(
     k, n = int(b.shape[0]), int(b.shape[1])
     k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
     n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
-    pack_kernel = _pack_b_kernel_wide if n_target // BLOCK_N >= 8 else _pack_b_kernel
+    pack_kernel = _pack_b_kernel_for_shape(n_target, k_target, transposed=False)
     panels = pack_kernel(b, hl.constexpr(k_target), hl.constexpr(n_target))
     return panels.view(n_target // BLOCK_N, k_target // BLOCK_K, BLOCK_K, BLOCK_N)
 
@@ -276,9 +344,7 @@ def pack_b_blocked_t(
     n, k = int(b_t.shape[0]), int(b_t.shape[1])
     k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
     n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
-    pack_kernel = (
-        _pack_b_kernel_t_wide if n_target // BLOCK_N >= 8 else _pack_b_kernel_t
-    )
+    pack_kernel = _pack_b_kernel_for_shape(n_target, k_target, transposed=True)
     panels = pack_kernel(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
     return panels.view(n_target // BLOCK_N, k_target // BLOCK_K, BLOCK_K, BLOCK_N)
 
@@ -438,6 +504,60 @@ def matmul_prepacked_b(
         bias_padded = _pad_to(bias.reshape(1, -1), (1, n_pad)).reshape(-1)
         bias3 = bias_padded.reshape(blocks_n, 1, BLOCK_N)
         out4 = _matmul_blocked_kernel_bias(a4, b4, bias3, epilogue)
+    return out4.reshape(m_pad, n_pad)[:m, :n]
+
+
+def matmul_prepacked_b_affine(
+    a: Tensor,
+    b4: Tensor,
+    n: int,
+    bias: Tensor | None,
+    post_scale: Tensor,
+    post_bias: Tensor | None = None,
+    epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
+) -> Tensor:
+    """Prepacked RHS matmul with a per-output affine post-op."""
+    blocks_n, blocks_k, block_k, block_n = map(int, b4.shape)
+    m, k = map(int, a.shape)
+    m_pad = _round_up(m, BLOCK_M)
+    k_pad = _round_up(k, BLOCK_K)
+    n_pad = blocks_n * BLOCK_N
+    if (
+        a.dim() != 2
+        or b4.dim() != 4
+        or a.dtype != b4.dtype
+        or a.device != b4.device
+        or block_k != BLOCK_K
+        or block_n != BLOCK_N
+        or blocks_k * BLOCK_K != k_pad
+        or not 0 < n <= n_pad
+        or _round_up(n, BLOCK_N) != n_pad
+    ):
+        raise ValueError(
+            f"packed RHS shape {tuple(b4.shape)} is incompatible with "
+            f"a.shape={tuple(a.shape)} and n={n}"
+        )
+
+    def prepare(vector: Tensor | None, fill: float) -> Tensor:
+        if vector is None:
+            return torch.full((n_pad,), fill, dtype=a.dtype, device=a.device)
+        if vector.dim() > 1 or (
+            vector.dim() == 1 and int(vector.shape[0]) not in (1, n)
+        ):
+            raise ValueError(
+                f"affine vector must be scalar or have shape (1,) or ({n},), "
+                f"got {tuple(vector.shape)}"
+            )
+        vector = vector.to(dtype=a.dtype, device=a.device)
+        if vector.numel() == 1:
+            return vector.expand(n_pad).contiguous()
+        return _pad_to(vector.reshape(1, -1), (1, n_pad)).reshape(-1)
+
+    a4 = pack_a_blocked(a, m_pad=m_pad, k_pad=k_pad)
+    bias3 = prepare(bias, 0.0).reshape(blocks_n, 1, BLOCK_N)
+    scale3 = prepare(post_scale, 1.0).reshape(blocks_n, 1, BLOCK_N)
+    post_bias3 = prepare(post_bias, 0.0).reshape(blocks_n, 1, BLOCK_N)
+    out4 = _matmul_blocked_kernel_affine(a4, b4, bias3, scale3, post_bias3, epilogue)
     return out4.reshape(m_pad, n_pad)[:m, :n]
 
 
