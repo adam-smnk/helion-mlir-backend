@@ -1757,6 +1757,36 @@ class TestPaddedPackingAndMultiPhaseExecution:
 
         torch.testing.assert_close(actual, expected)
 
+    def test_prepacked_rhs_affine_matmul_matches_reference(self):
+        """Explicit scale/post-bias tensors fuse without tensor closures."""
+        from helion_mlir_cpu_utils.matmul import matmul_prepacked_b_affine
+        from helion_mlir_cpu_utils.matmul import pack_b_blocked_t
+
+        torch.manual_seed(8)
+        a = torch.randn(32, 64, dtype=torch.bfloat16)
+        weight = torch.randn(96, 64, dtype=torch.bfloat16)
+        bias = torch.randn(96, dtype=torch.bfloat16)
+        scale = torch.rand(96, dtype=torch.bfloat16)
+        post_bias = torch.randn(1, dtype=torch.bfloat16)
+
+        actual = matmul_prepacked_b_affine(
+            a,
+            pack_b_blocked_t(weight),
+            96,
+            bias,
+            scale,
+            post_bias,
+            torch.relu,
+        )
+        expected = torch.relu(
+            (a.float() @ weight.float().T + bias.float()) * scale.float()
+            + post_bias.float()
+        ).to(torch.bfloat16)
+
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=1e-2, atol=4e-2
+        )
+
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_matmul_irregular_shapes_padded_packing(self, dtype):
         """Irregular (non-32-divisible) shapes pad inside packing kernels."""
@@ -1830,3 +1860,23 @@ class TestPaddedPackingAndMultiPhaseExecution:
         b4_t = pack_b_blocked_t(b_t)
         expected_t = b_t.reshape(3, 32, 4, 32).permute(0, 2, 3, 1)
         assert torch.equal(b4_t, expected_t)
+
+    def test_pack_b_block_sizes_exactly_divide_padded_shape(self):
+        """Packing blocks must never create ragged panel or depth tiles."""
+        from helion_mlir_cpu_utils.matmul import _pack_b_block_sizes
+
+        assert _pack_b_block_sizes(4096, 4096) == (8, 4096)
+        assert _pack_b_block_sizes(5952, 2976) == (6, 2976)
+        assert _pack_b_block_sizes(352, 96) == (11, 96)
+
+    def test_ragged_panel_count_matmul_execution(self):
+        """Regression: ragged block-8 panel stores corrupted the native heap."""
+        from helion_mlir_cpu_utils.matmul import matmul
+
+        torch.manual_seed(9)
+        a = torch.randn(65, 47, dtype=torch.bfloat16)
+        b = torch.randn(47, 372, dtype=torch.bfloat16)
+
+        actual = matmul(a, b)
+        expected = a.float() @ b.float()
+        torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=0.5)
