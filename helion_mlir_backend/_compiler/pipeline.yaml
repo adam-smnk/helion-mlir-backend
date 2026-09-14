@@ -1,34 +1,47 @@
-# This is an optimizing pipeline for kernel_bench matmul-like kernels.
+# The default MLIR optimizing pipeline.
 Pipeline:
+  # Cleanup freshly imported IR.
+  - pass: symbol-dce
+  - pass: cse
+  - pass: canonicalize
+
+  # Based on Lighthouse's x86 pipeline.
+  # Skips packing as the entry-level IR from Helion already contains parallel loops.
   - pass: "linalg-fuse-elementwise-ops"
   - pass: "linalg-morph-ops{named-to-category generic-to-category}"
   - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
   - pass: cse
   - pass: canonicalize
 
-  ## CPU specific register tiling (depends on uArch & data type)
-  - schedule: "x86/register_tiling.py[gen=matmul_register_tiling] {
-                                                                    target=linalg.contract
-                                                                    reg_tile_batch=0
-                                                                    reg_tile_m=8
-                                                                    reg_tile_n=32
-                                                                    reg_tile_k=1
-                                                                  }"
-  - schedule: "x86/register_tiling.py[gen=matmul_register_unroll] {
-                                                                    target=linalg.contract
-                                                                    batch=0
-                                                                    reg_tile_m=8
-                                                                    reg_tile_n=32
-                                                                    reg_tile_k=1
-                                                                    reg_unroll_m=1
-                                                                    reg_unroll_n=16
-                                                                    reg_unroll_k=1
-                                                                  }"
+  - schedule: "sfc.py[gen=remap]"
+
+  ## CPU register-level tiling flow (strategy-driven)
   - pass: "linalg-morph-ops{named-to-category generic-to-named}"
-  - schedule: "tiling.py[gen=tile_ops]{target_op=linalg.fill tile_sizes=[1] filter_ops=True}"
-  - schedule: "tiling.py[gen=tile_ops]{target_op=linalg.generic tile_sizes=[1,1,1,8] filter_ops=True use_forall=True}"
-  - schedule: "tiling.py[gen=tile_ops]{target_op=linalg.generic tile_sizes=[1,8] filter_ops=True}"
-  # - pass: print-ir
+
+  ## 2a) Parallel register tiles: assign/propagate from contraction anchors and fuse.
+  - schedule: "tile_and_fuse.py[gen=assign_and_propagate_tile_sizes]{
+                                                                      strategy=register_parallel
+                                                                    }"
+  - schedule: "tile_and_fuse.py[gen=assign_elementwise_tile_sizes]{
+                                                                    strategy=register_parallel
+                                                                  }"
+  - schedule: "tile_and_fuse.py[gen=tile_and_fuse_annotated]"
+
+  ## 2b) Reduction register tiles: annotate K-like dims and tile ops individually.
+  - schedule: "tile_and_fuse.py[gen=assign_and_propagate_tile_sizes]{
+                                                                      strategy=register_reduction
+                                                                      propagate=False
+                                                                    }"
+  - schedule: "tile_and_fuse.py[gen=tile_annotated]{target_op=linalg.contract use_forall=False}"
+
+  ## 3) Tile+unroll: annotate final unrolled tiles, optionally propagate, then tile+unroll.
+  - schedule: "tile_and_fuse.py[gen=assign_and_propagate_tile_sizes]{
+                                                                      strategy=register_unroll
+                                                                    }"
+  - schedule: "tile_and_fuse.py[gen=assign_elementwise_tile_sizes]{
+                                                                    strategy=register_unroll
+                                                                  }"
+  - schedule: "tile_and_fuse.py[gen=tile_and_unroll_annotated]"
 
   - include: x86_64/vectorize.yaml
 
