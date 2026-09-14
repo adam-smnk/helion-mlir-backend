@@ -63,6 +63,9 @@ _SCALAR_PIPELINE_TEST_PREFIXES = (
     "test_batched_matmul_combined_tile_direct",
     "test_outer_forall_inner_scf_for_block_sizes",
     "test_outer_inner_loops_eltwise_block_sizes",
+    "test_prepacked_rhs_matmul_matches_runtime_packing",
+    "test_prepacked_rhs_affine_matmul_matches_reference",
+    "test_ragged_panel_count_matmul_execution",
     "test_matmul_irregular_shapes_padded_packing",
     "test_multiphase_inplace_buffer_preservation",
 )
