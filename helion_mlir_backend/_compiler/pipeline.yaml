@@ -7,41 +7,46 @@ Pipeline:
 
   # Based on Lighthouse's x86 pipeline.
   # Skips packing as the entry-level IR from Helion already contains parallel loops.
+  ## Initial elementwise operations fusion to group them.
   - pass: "linalg-fuse-elementwise-ops"
-  - pass: "linalg-morph-ops{named-to-category generic-to-category}"
-  - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
-  - pass: cse
-  - pass: canonicalize
 
+  ## 1) CPU cache-level tiling - improves data locality and exposes parallelism.
+  - include: x86_64/tile-and-fuse.yaml {
+                                  strategy=cache
+                                  propagate=True
+                                  use_forall=True
+                                }
+  - include: cleanup.yaml
+  # Simplify shapes.
+  - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
+  - include: cleanup.yaml
+
+  ## Remap iteration space of parallel loops for communication avoidance.
   - schedule: "sfc.py[gen=remap]"
 
-  ## CPU register-level tiling flow (strategy-driven)
-  - pass: "linalg-morph-ops{named-to-category generic-to-named}"
+  ## Normalize ops to category.
+  - pass: "linalg-categorize-ops"
 
-  ## 2a) Parallel register tiles: assign/propagate from contraction anchors and fuse.
-  - schedule: "tile_and_fuse.py[gen=assign_and_propagate_tile_sizes]{
-                                                                      strategy=register_parallel
-                                                                    }"
-  - schedule: "tile_and_fuse.py[gen=assign_elementwise_tile_sizes]{
-                                                                    strategy=register_parallel
-                                                                  }"
-  - schedule: "tile_and_fuse.py[gen=tile_and_fuse_annotated]"
+  ## 2) CPU register-level tiling - ensure data fits in registers.
+  ## Parallel register tiles: assign/propagate from contraction anchors and fuse.
+  - include: x86_64/tile-and-fuse.yaml {
+                                  strategy=register_parallel
+                                  propagate=True
+                                  use_forall=False
+                                }
+  - include: cleanup.yaml
 
-  ## 2b) Reduction register tiles: annotate K-like dims and tile ops individually.
-  - schedule: "tile_and_fuse.py[gen=assign_and_propagate_tile_sizes]{
-                                                                      strategy=register_reduction
-                                                                      propagate=False
-                                                                    }"
-  - schedule: "tile_and_fuse.py[gen=tile_annotated]{target_op=linalg.contract use_forall=False}"
+  ## Reduction register tiles: annotate K-like dims and tile ops individually.
+  - include: x86_64/tile.yaml {
+                          strategy=register_reduction
+                          propagate=False
+                          use_forall=False
+                        }
+  - include: cleanup.yaml
 
-  ## 3) Tile+unroll: annotate final unrolled tiles, optionally propagate, then tile+unroll.
-  - schedule: "tile_and_fuse.py[gen=assign_and_propagate_tile_sizes]{
-                                                                      strategy=register_unroll
-                                                                    }"
-  - schedule: "tile_and_fuse.py[gen=assign_elementwise_tile_sizes]{
-                                                                    strategy=register_unroll
-                                                                  }"
-  - schedule: "tile_and_fuse.py[gen=tile_and_unroll_annotated]"
+  ## 3) CPU register-level unrolling via tiling - ensure hardware-friendly shapes.
+  - include: x86_64/unroll-register.yaml
+  - include: cleanup.yaml
 
   - include: x86_64/vectorize.yaml
 

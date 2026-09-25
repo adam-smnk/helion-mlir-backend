@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 import torch.fx
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import mlir.ir as ir
 
     from ..build_context import BuildContext
@@ -321,11 +323,19 @@ def lower_scalar_binary(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | No
 
     from ..aten_lowering import normalized_aten_args
 
+    def _elementwise(
+        kind: linalg_d.ElementwiseKind,
+    ) -> Callable[[ir.Value, ir.Value, list[ir.Value]], ir.Value]:
+        def op(lhs: ir.Value, rhs: ir.Value, outs: list[ir.Value]) -> ir.Value:
+            return linalg_d.elementwise(lhs, rhs, outs=outs, kind=kind)
+
+        return op
+
     named_ops = {
-        "aten.add.Tensor": linalg_d.add,
-        "aten.sub.Tensor": linalg_d.sub,
-        "aten.mul.Tensor": linalg_d.mul,
-        "aten.div.Tensor": linalg_d.div,
+        "aten.add.Tensor": _elementwise(linalg_d.ElementwiseKind.add),
+        "aten.sub.Tensor": _elementwise(linalg_d.ElementwiseKind.sub),
+        "aten.mul.Tensor": _elementwise(linalg_d.ElementwiseKind.mul),
+        "aten.div.Tensor": _elementwise(linalg_d.ElementwiseKind.div),
     }
     operation = next(
         (builder for name, builder in named_ops.items() if name in str(node.target)),

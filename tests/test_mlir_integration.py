@@ -378,7 +378,7 @@ class TestScalarBlockIndices:
 
         assert "scf.forall" in ir_str
         assert "arith.index_cast" in ir_str
-        assert "linalg.add" in ir_str
+        assert "linalg.elementwise" in ir_str
 
     def test_tile_end_clamps_only_with_known_bound(self):
         """`tile.end` clamps when the extent is not a multiple of the block."""
@@ -459,7 +459,7 @@ class TestScalarBlockIndices:
         module.operation.verify()
         ir_str = str(module)
         assert "linalg.fill" in ir_str
-        assert "linalg.add" in ir_str
+        assert "linalg.elementwise" in ir_str
 
 
 class TestContractionExpressiveness:
