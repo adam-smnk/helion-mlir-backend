@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.language._gelu_tanh_approx as gelu_ops
 from mlir.dialects import linalg as linalg_d
 import mlir.ir as ir
 import torch
 
+from ..support import torch_dtype_to_mlir
 from . import emit
 from .registry import NOT_APPLICABLE
 from .registry import lowers
@@ -54,6 +56,8 @@ def lower_scalar_binary(ctx: BuildContext, node: torch.fx.Node) -> object:
     tensor_value = values[tensor_index]
     tensor_type = ir.RankedTensorType(tensor_value.type)
     element_type = tensor_type.element_type
+    if torch_dtype_to_mlir(node.meta["val"].dtype) != element_type:
+        return NOT_APPLICABLE  # type promotion: left to the helper
     scalar = emit.cast_scalar(values[scalar_index], element_type)
     if scalar is None:
         return NOT_APPLICABLE
@@ -73,6 +77,17 @@ def lower_passthrough(ctx: BuildContext, node: torch.fx.Node) -> object:
     source = node.args[0] if node.args else None
     value = ctx.get_value(source) if isinstance(source, torch.fx.Node) else None
     return NOT_APPLICABLE if value is None else value
+
+
+@lowers(gelu_ops._gelu_erf, gelu_ops._gelu_tanh_approx)
+def lower_gelu(ctx: BuildContext, node: torch.fx.Node) -> object:
+    """Helion's single-node GELU ops, as the ``aten.gelu`` helper they stand for."""
+    from ..aten_bridge import call_helper
+
+    approximate = "tanh" if node.target is gelu_ops._gelu_tanh_approx else "none"
+    return call_helper(
+        ctx, node, aten.gelu.default, (node.args[0],), {"approximate": approximate}
+    )
 
 
 def _is_tensor(value: ir.Value) -> bool:

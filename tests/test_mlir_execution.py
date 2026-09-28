@@ -1596,17 +1596,10 @@ class TestHostSideViewAlias:
 class TestGenericAtenHelperBoundaryTileRegression:
     """Regression: generic ATen-helper ops must work for tiles > 64 elements.
 
-    Root cause: ``rebuild_aten_helper_for_call`` rebuilds a per-call-site
-    helper using the *real* MLIR operand shapes (authoritative), but
-    ``_build_aten_subgraph`` used to re-clip that already-correct shape
-    against a "bound" independently re-derived from FX SymInt metadata. When
-    a dim's SymInt couldn't be mapped back to a real block_id, resolution
-    silently fell back to the SymInt's bare hint -- and Helion's
-    ``CompileEnvironment.create_block_var`` defaults that hint to 64 -- so the
-    rebuilt helper got clipped down to a phantom ``tensor<...x64>`` signature
-    that then permanently mismatched the real call site for any tile whose
-    last dim exceeds 64 elements. Fixed by never re-clipping an
-    already-authoritative override shape (see ``aten_lowering.py``).
+    Helper signatures used to be rebuilt from Helion's symbolic metadata, whose
+    unresolved block-size hints default to 64, so tiles wider than 64 got a
+    mismatching ``tensor<...x64>`` helper. Helpers are now typed from the call
+    site's MLIR operand types.
 
     These ops (``relu``, ``abs``, ``maximum``, elementwise scalar multiply)
     all go through the generic ATen-helper path -- unlike matmul/einsum,

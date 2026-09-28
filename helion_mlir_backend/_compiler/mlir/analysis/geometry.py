@@ -103,17 +103,6 @@ class KernelGeometry:
     def is_grid(self, block_id: int) -> bool:
         return self.blocks[block_id].kind == "grid"
 
-    def block_sizes(self) -> dict[int, int]:
-        return {bid: block.block_size for bid, block in self.blocks.items()}
-
-    def spans(self) -> dict[int, int]:
-        """Static spans only (block ids with runtime bounds are omitted)."""
-        return {
-            bid: block.span
-            for bid, block in self.blocks.items()
-            if block.span is not None
-        }
-
     def trip_count(self, block_id: int) -> int:
         block = self.blocks[block_id]
         if block.span is None:

@@ -17,6 +17,9 @@ def install() -> bool:
         from helion._compiler.backend_registry import register_compiler_backend
         from helion.runtime.kernel import BoundKernel
 
+        from helion_mlir_backend._compiler.mlir.aten_bridge.helpers import (
+            install_original_args_capture,
+        )
         from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
         from helion_mlir_backend._compiler.mlir.driver import mlir_compile_config
         from helion_mlir_backend._compiler.mlir.einsum_capture import (
@@ -29,6 +32,7 @@ def install() -> bool:
     register_compiler_backend(MLIRBackend)
     _patch_bound_kernel(BoundKernel, MLIRBackend, mlir_compile_config)
     install_einsum_capture()
+    install_original_args_capture()
     return True
 
 

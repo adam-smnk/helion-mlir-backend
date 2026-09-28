@@ -5,12 +5,11 @@ compilation pipeline:
 - block_ids: Block dimension identification and mapping
 - type_utils: Type conversion between torch and MLIR
 - errors: Error types and diagnostics
-- aten_prepass: ATen operation preprocessing and helper generation
+- index_meta: Index expressions to block ids
 """
 
 from __future__ import annotations
 
-from .aten_prepass import refresh_aten_tensor_meta
 from .block_ids import SCALAR_SYMBOL_KINDS
 from .block_ids import block_id_from_key
 from .block_ids import symbol_origin_info
@@ -20,10 +19,8 @@ from .errors import NodeLoweringError
 from .errors import ShapeError
 from .errors import UnsupportedOperationError
 from .errors import ValueNotFoundError
-from .errors import safe_int_conversion
 from .index_meta import IndexDescriptor
 from .index_meta import resolve_index_descriptor
-from .symbolic_shape_restoration import restore_symbolic_shapes_in_bodies
 from .type_utils import mlir_dtype_to_torch
 from .type_utils import torch_dtype_to_mlir
 from .type_utils import torch_tensor_to_mlir_type
@@ -39,10 +36,7 @@ __all__ = [
     "ValueNotFoundError",
     "block_id_from_key",
     "mlir_dtype_to_torch",
-    "refresh_aten_tensor_meta",
     "resolve_index_descriptor",
-    "restore_symbolic_shapes_in_bodies",
-    "safe_int_conversion",
     "symbol_origin_info",
     "torch_dtype_to_mlir",
     "torch_tensor_to_mlir_type",

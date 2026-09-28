@@ -89,8 +89,8 @@ def lower_node(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
 
 
 def _dispatch(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    from ..aten_bridge import is_aten_op
     from ..aten_bridge import lower_via_aten_helper
-    from ..aten_lowering import is_aten_op
     from ..support import UnsupportedOperationError
     from .method_ops import lower_call_method
 

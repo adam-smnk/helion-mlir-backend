@@ -13,6 +13,7 @@ from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
 from .lowering.tensor_state import TensorState
+from .support import DynamicShapeError
 from .support import block_id_from_key
 from .support.index_meta import resolve_index_descriptor
 
@@ -120,79 +121,31 @@ class BuildContext:
                     return value
         return arith_d.IndexCastOp(ir.IndexType.get(), value).result
 
-    def shape_from_node_meta(self, node: object) -> list[int] | None:
-        """Extract a concrete tensor shape from FX metadata."""
-        import torch.fx
-
-        if not isinstance(node, torch.fx.Node):
-            return None
-        value = node.meta.get("val")
-        if isinstance(value, torch.Tensor):
-            try:
-                return [int(dim) for dim in value.shape]
-            except (TypeError, ValueError):
-                return None
-        tensor_meta = node.meta.get("tensor_meta")
-        shape = getattr(tensor_meta, "shape", None)
-        if shape is None:
-            return None
-        try:
-            return [int(dim) for dim in shape]
-        except (TypeError, ValueError):
-            return None
-
     def shape_from_nodes(
         self, shape_nodes: list, operation_name: str = "op"
     ) -> list[int]:
-        """Resolve FX shape nodes using configured block sizes and metadata."""
+        """Static dims of a shape list: ints, block sizes (as tile extents) or constants."""
         import torch.fx
 
         shape: list[int] = []
         for shape_node in shape_nodes:
+            if isinstance(shape_node, int):
+                shape.append(shape_node)
+                continue
             if isinstance(shape_node, torch.fx.Node):
-                target = shape_node.target
-                if target is tracing_ops._get_symnode and shape_node.args:
+                if shape_node.target is tracing_ops._get_symnode:
                     block_id = block_id_from_key(shape_node.args[0])
                     if block_id is not None and block_id in self.geometry.blocks:
                         shape.append(self.geometry.tile_extent(block_id))
                         continue
-                if target is torch.ops.aten.sym_size.int and len(shape_node.args) >= 2:
-                    tensor_node, dim = shape_node.args[:2]
-                    value = (
-                        tensor_node.meta.get("val")
-                        if isinstance(tensor_node, torch.fx.Node)
-                        else None
-                    )
-                    if isinstance(value, torch.Tensor) and isinstance(dim, int):
-                        from helion_mlir_backend._compiler.mlir.aten_lowering import (
-                            _resolve_dims,
-                        )
-
-                        resolved = _resolve_dims(
-                            value.shape,
-                            self.geometry.block_sizes(),
-                            self.env,
-                            self.geometry.spans(),
-                        )
-                        if 0 <= dim < len(resolved):
-                            shape.append(resolved[dim])
-                            continue
-                value = shape_node.meta.get("val")
-                if isinstance(value, torch.SymInt):
-                    block_id = self.env.get_block_id(value)
-                    if block_id is not None and block_id in self.geometry.blocks:
-                        shape.append(self.geometry.block_size(block_id))
-                        continue
-                if value is not None:
-                    try:
-                        shape.append(int(value))
-                        continue
-                    except (TypeError, ValueError):
-                        pass
-            elif isinstance(shape_node, int):
-                shape.append(shape_node)
-                continue
-            shape.append(1)
+                value = self.get_value(shape_node)
+                owner = value.owner if value is not None else None
+                if isinstance(owner, ir.OpView) and owner.name == "arith.constant":
+                    shape.append(ir.IntegerAttr(owner.attributes["value"]).value)
+                    continue
+            raise DynamicShapeError(
+                shape_nodes, symbol_name=f"{shape_node} in {operation_name}"
+            )
         return shape
 
     def symbol_info(self, value: object) -> tuple[int, str] | None:
@@ -212,31 +165,6 @@ class BuildContext:
         if not isinstance(value, torch.SymInt):
             return None
         return self.symbol_info(value)
-
-    def is_scalar_index_node(self, node: object) -> bool:
-        """Return whether an index node denotes a scalar position, not a tile."""
-        from .support import SCALAR_SYMBOL_KINDS
-
-        info = self.node_symbol_info(node)
-        return info is not None and info[1] in SCALAR_SYMBOL_KINDS
-
-    def has_symbolic_operand(self, node: object) -> bool:
-        """Return whether any operand is a symbolic int or float scalar.
-
-        torch-mlir cannot import symbolic scalar operands, so these nodes are
-        lowered directly instead of through a generated helper.
-        """
-        import torch
-        import torch.fx
-
-        if not isinstance(node, torch.fx.Node):
-            return False
-        arguments = list(node.args) + list(node.kwargs.values())
-        return any(
-            isinstance(argument, torch.fx.Node)
-            and isinstance(argument.meta.get("val"), (torch.SymInt, torch.SymFloat))
-            for argument in arguments
-        )
 
     def infer_block_id_from_index(self, index_node: object) -> int | None:
         """Infer the block id represented by an index expression."""

@@ -44,8 +44,10 @@ def lower_call_method(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if method in ("t", "permute", "transpose"):
         return lower_transpose(ctx, node)
     if method in ("view", "reshape"):
-        result_shape = ctx.shape_from_node_meta(node)
-        reshaped = static_reshape(base, result_shape) if result_shape else None
+        from ..aten_bridge import infer_results
+
+        (result,) = infer_results(ctx, node)
+        reshaped = static_reshape(base, [int(dim) for dim in result.shape])
         if reshaped is None:
             raise UnsupportedOperationError(
                 f"Tensor.{method}",

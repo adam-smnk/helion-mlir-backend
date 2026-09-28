@@ -104,38 +104,3 @@ class NodeLoweringError(MLIRBackendError):
         self.node = node
         self.reason = reason
         self.recovery_hint = recovery_hint
-
-
-def safe_int_conversion(val: object, param_name: str = "value") -> int:
-    """Safely convert a value to int with helpful error messages.
-
-    Parameters
-    ----------
-    val : Any
-        Value to convert
-    param_name : str
-        Name of the parameter (for error messages)
-
-    Returns
-    -------
-    int
-        The converted integer value
-
-    Raises
-    ------
-    TypeError
-        If conversion fails
-    """
-    try:
-        if isinstance(val, int):
-            return val
-        if isinstance(val, float):
-            if val != int(val):
-                raise ValueError(f"{param_name}={val} is not an integer")
-            return int(val)
-        # Try torch.SymInt resolution
-        if hasattr(val, "__index__"):
-            return val.__index__()
-        raise TypeError(f"Cannot convert {type(val).__name__} to int")
-    except (TypeError, ValueError) as e:
-        raise TypeError(f"Failed to convert {param_name} to int: {e}") from e

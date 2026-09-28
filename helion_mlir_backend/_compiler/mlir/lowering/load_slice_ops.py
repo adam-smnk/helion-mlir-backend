@@ -9,8 +9,10 @@ from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
 from ..analysis.tensor_effects import host_tensor_name
+from ..support import UnsupportedOperationError
 from ..support import ValueNotFoundError
 from .registry import lowers
+from .subscript_ops import gather
 
 if TYPE_CHECKING:
     import torch.fx
@@ -34,29 +36,6 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if tensor_value is None:
         raise ValueNotFoundError(tensor_node, context="loaded tensor")
     tensor_type = ir.RankedTensorType(tensor_value.type)
-    ndim = len(tensor_type.shape)
-
-    # Fast path: 1-D gather via lower_flat_gather.
-    if ndim == 1 and len(index_nodes) == 1:
-        gather_index_value = ctx.get_value(index_nodes[0])
-        if gather_index_value is not None:
-            gather_index_type = gather_index_value.type
-            if (
-                isinstance(gather_index_type, ir.RankedTensorType)
-                and gather_index_type.rank >= 1
-            ):
-                from .load_ops import lower_flat_gather
-
-                gathered = lower_flat_gather(
-                    ctx,
-                    tensor_node,
-                    tensor_value,
-                    gather_index_value,
-                    gather_index_type,
-                    tensor_type,
-                )
-                if gathered is not None:
-                    return gathered
 
     # Build authoritative slice plan from index metadata.
     from .slice_plan import plan_slice
@@ -72,7 +51,7 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     # unambiguous because it names dims by position, not by size.
     full_shape = plan.static_sizes()
     full_type = ir.RankedTensorType.get(full_shape, tensor_type.element_type)
-    extracted = tensor_d.ExtractSliceOp(
+    loaded = tensor_d.ExtractSliceOp(
         full_type,
         tensor_value,
         plan.offsets(),
@@ -84,15 +63,26 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     ).result
 
     reduced_dims = set(plan.reduced_dims())
-    if not reduced_dims:
-        return extracted
+    if reduced_dims:
+        result_shape = plan.value_shape()
+        if not result_shape:
+            result_shape = [1]
+        result_type = ir.RankedTensorType.get(result_shape, tensor_type.element_type)
+        reassociation = _collapse_reassociation(len(full_shape), reduced_dims)
+        loaded = tensor_d.CollapseShapeOp(result_type, loaded, reassociation).result
 
-    result_shape = plan.value_shape()
-    if not result_shape:
-        result_shape = [1]
-    result_type = ir.RankedTensorType.get(result_shape, tensor_type.element_type)
-    reassociation = _collapse_reassociation(len(full_shape), reduced_dims)
-    return tensor_d.CollapseShapeOp(result_type, extracted, reassociation).result
+    gathers = plan.gathers()
+    if not gathers:
+        return loaded
+    # Helion and torch agree on the result shape for one index tensor that is
+    # 1-D or indexes a 1-D tensor; they differ beyond that.
+    (dimension, index), *others = gathers
+    if others or (len(plan.dims) > 1 and ir.RankedTensorType(index.type).rank != 1):
+        raise UnsupportedOperationError(
+            "load", reason="only one 1-D index tensor per load is supported"
+        )
+    position = dimension - sum(1 for reduced in reduced_dims if reduced < dimension)
+    return gather(ctx, node, loaded, [slice(None)] * position + [index])
 
 
 def _collapse_reassociation(rank: int, reduced_dims: set[int]) -> list[list[int]]:

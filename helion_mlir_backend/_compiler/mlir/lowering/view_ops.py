@@ -20,12 +20,11 @@ aten = torch.ops.aten
 
 @lowers(aten.view.default, aten.reshape.default)
 def lower_static_reshape(ctx: BuildContext, node: torch.fx.Node) -> object:
-    source = node.args[0] if node.args else None
-    value = ctx.get_value(source) if isinstance(source, torch.fx.Node) else None
-    result_shape = ctx.shape_from_node_meta(node)
-    if value is None or not result_shape:
-        return NOT_APPLICABLE
-    reshaped = static_reshape(value, result_shape)
+    from ..aten_bridge import infer_results
+
+    value = ctx.get_value(node.args[0])
+    (result,) = infer_results(ctx, node)
+    reshaped = static_reshape(value, [int(dim) for dim in result.shape])
     return NOT_APPLICABLE if reshaped is None else reshaped
 
 

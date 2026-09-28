@@ -23,11 +23,13 @@ if TYPE_CHECKING:
 class DimSlice:
     """Descriptor of a single source/destination dimension slice."""
 
-    kind: Literal["scalar", "tile", "full"]
+    kind: Literal["scalar", "tile", "full", "gather"]
     offset: ir.Value
     size: int
     block_id: int | None = None
     reduces: bool = False
+    index: ir.Value | None = None
+    """For ``gather``: the index tensor (the slice spans the whole dimension)."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,12 @@ class SlicePlan:
         """Dimension indices that are scalar-indexed and dropped from the result."""
         return [i for i, dim in enumerate(self.dims) if dim.reduces]
 
+    def gathers(self) -> list[tuple[int, ir.Value]]:
+        """``(dimension, index tensor)`` of each tensor-indexed dimension."""
+        return [
+            (i, dim.index) for i, dim in enumerate(self.dims) if dim.kind == "gather"
+        ]
+
 
 def plan_slice(
     ctx: BuildContext,
@@ -66,6 +74,7 @@ def plan_slice(
     - Scalar index (grid/tile.begin) → scalar: block_id from symbol, size 1, reduces.
     - Tile index (block_id) → tile: block_id from symbol, size = block size.
     - Literal int → scalar constant offset, size 1, reduces.
+    - Index tensor → gather: the whole dimension, gathered after slicing.
 
     ``owned`` marks dims where ``base_type`` is only the current iteration's region
     of a larger tensor (see ``tensor_state``); those are indexed from its origin.
@@ -126,6 +135,10 @@ def plan_slice(
             continue
 
         block_id, bias = descriptor.block_id, descriptor.bias
+        index = ctx.get_value(index_node) if block_id is None else None
+        if index is not None and isinstance(index.type, ir.RankedTensorType):
+            dims.append(DimSlice("gather", ctx.index_const(0), extent, index=index))
+            continue
         if block_id is None:
             raise NodeLoweringError(
                 index_node,

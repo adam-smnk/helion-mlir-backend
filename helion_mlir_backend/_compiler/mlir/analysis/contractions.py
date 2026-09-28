@@ -26,6 +26,7 @@ import helion.language.matmul_ops as matmul_ops
 import torch
 import torch.fx
 
+from ..aten_bridge import original_args
 from ..einsum_capture import is_einsum_node
 
 aten = torch.ops.aten
@@ -77,19 +78,13 @@ class ContractionPlan:
             self.absorbed.add(node)
         self.roots[contraction.root] = contraction
 
-    def needs_helper(self, node: torch.fx.Node) -> bool:
-        """Whether the generic ATen helper path may still be needed for ``node``."""
-        if node in self.absorbed:
-            return False
-        root = self.roots.get(node)
-        return root is None or root.unfused is not None
-
 
 def match_contraction(node: torch.fx.Node) -> Contraction | None:
     """The contraction ``node`` computes on its own (without add fusion)."""
     if node.op != "call_function":
         return None
-    args = list(node.args)
+    args, kwargs = original_args(node)
+    args = list(args)
     if is_einsum_node(node):
         if (
             len(args) != 2
@@ -108,7 +103,7 @@ def match_contraction(node: torch.fx.Node) -> Contraction | None:
             return None
         return _ranked(node, args[1], args[2], acc=args[0])
     if target is matmul_ops.dot:
-        acc = args[2] if len(args) > 2 else node.kwargs.get("acc")
+        acc = args[2] if len(args) > 2 else kwargs.get("acc")
         return _ranked(node, args[0], args[1], acc=acc)
     return None
 
@@ -116,7 +111,7 @@ def match_contraction(node: torch.fx.Node) -> Contraction | None:
 def _match_accumulate(node: torch.fx.Node, plan: ContractionPlan) -> Contraction | None:
     if node.target is not aten.add.Tensor or _scalar_arg(node, 2, "alpha") != 1:
         return None
-    first, second = node.args[:2]
+    first, second = original_args(node)[0][:2]
     for acc, operand in ((first, second), (second, first)):
         inner = plan.roots.get(operand) if isinstance(operand, torch.fx.Node) else None
         if (

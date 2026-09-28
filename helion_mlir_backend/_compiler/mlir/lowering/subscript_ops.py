@@ -1,4 +1,4 @@
-"""Tensor subscript and gather lowering."""
+"""Subscripts of device tensors: slices, new axes, scalar indices and gathers."""
 
 from __future__ import annotations
 
@@ -7,142 +7,64 @@ from typing import TYPE_CHECKING
 import helion.language.view_ops as view_ops
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
+import torch
 import torch.fx
 
 from ..support import UnsupportedOperationError
+from ..support import ValueNotFoundError
+from . import emit
 from .registry import lowers
+from .view_ops import static_reshape
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
 
 
 @lowers(view_ops.subscript)
-def lower_subscript_node(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
-    value = lower_subscript(ctx, node)
-    if value is None:
-        raise UnsupportedOperationError(
-            "subscript", reason=f"unsupported subscript form with args={node.args!r}"
-        )
-    return value
+def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
+    """``tensor[index]``: an extract slice and reshape, or a gather for tensor indices.
 
+    ``index`` holds full slices, ``None`` (new axes), scalar positions and index
+    tensors; a gather goes through the ``aten.index.Tensor`` helper.
+    """
+    source_node, index = node.args[:2]
+    source = ctx.get_value(source_node)
+    if source is None:
+        raise ValueNotFoundError(source_node, context="subscripted tensor")
+    items = [_index_item(ctx, item) for item in index]
+    if any(_is_index_tensor(item) for item in items):
+        return gather(ctx, node, source, items)
 
-def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
-    """Lower tensor-valued indexing and full-slice subscripts."""
+    source_type = ir.RankedTensorType(source.type)
+    dims = iter(source_type.shape)
+    offsets: list[ir.Value] = []
+    sizes: list[int] = []
+    result_shape: list[int] = []
+    for item in items:
+        if item is None:
+            result_shape.append(1)
+            continue
+        size = next(dims, None)
+        if size is None:
+            raise UnsupportedOperationError("subscript", reason="too many indices")
+        if _is_full_slice(item):
+            offsets.append(ctx.index_const(0))
+            sizes.append(size)
+            result_shape.append(size)
+        elif isinstance(item, ir.Value) or (isinstance(item, int) and 0 <= item < size):
+            offsets.append(ctx.as_index(item))
+            sizes.append(1)
+        else:
+            raise UnsupportedOperationError("subscript", reason=f"index {item!r}")
+    for size in dims:
+        offsets.append(ctx.index_const(0))
+        sizes.append(size)
+        result_shape.append(size)
 
-    if len(node.args) < 2:
-        return None
-    source_value = ctx.get_value(node.args[0])
-    if source_value is None:
-        return None
-
-    index_candidates: list[object] = []
-    for arg in node.args[1:]:
-        index_candidates.extend(arg if isinstance(arg, (list, tuple)) else [arg])
-    index_value = next(
-        (
-            ctx.get_value(candidate)
-            for candidate in index_candidates
-            if ctx.get_value(candidate) is not None
-        ),
-        None,
-    )
-    source_type = source_value.type
-    if not isinstance(source_type, ir.RankedTensorType):
-        return None
-    element_type = source_type.element_type
-
-    def is_full_slice(spec: object) -> bool:
-        return (
-            isinstance(spec, slice)
-            and spec.start is None
-            and spec.stop is None
-            and spec.step is None
-        )
-
-    if (
-        index_value is not None
-        and source_type.rank == 1
-        and any(
-            not isinstance(spec, (None.__class__, slice)) for spec in index_candidates
-        )
-    ):
-        index_type = ir.RankedTensorType(index_value.type)
-        result_shape = [int(dim) for dim in index_type.shape]
-        if not result_shape:
-            index = index_value
-            if not isinstance(index.type, ir.IndexType):
-                index = tensor_d.ExtractOp(
-                    index, [], results=[ir.IndexType.get()]
-                ).result
-            return tensor_d.ExtractOp(
-                source_value, [index], results=[element_type]
-            ).result
-
-        result_type = ir.RankedTensorType.get(result_shape, element_type)
-        generate = tensor_d.GenerateOp(result_type, [])
-        body = generate.operation.regions[0].blocks.append(
-            *([ir.IndexType.get()] * len(result_shape))
-        )
-        with ir.InsertionPoint(body):
-            indices = list(body.arguments)
-            extracted_index = tensor_d.ExtractOp(
-                index_value, indices, results=[ir.IndexType.get()]
-            ).result
-            if not isinstance(extracted_index.type, ir.IndexType):
-                extracted_index = ctx.cast_to_index(extracted_index)
-            gathered = tensor_d.ExtractOp(
-                source_value, [extracted_index], results=[element_type]
-            ).result
-            tensor_d.YieldOp(gathered)
-        return generate.result
-
-    scalar_index_dims: list[int] = []
-    for dimension, spec in enumerate(index_candidates[: source_type.rank]):
-        if isinstance(spec, torch.fx.Node) and ctx.is_scalar_index_node(spec):
-            scalar_index_dims.append(dimension)
-
-    if scalar_index_dims:
-        offsets: list[ir.Value] = []
-        sizes: list[int] = []
-        for dimension in range(source_type.rank):
-            spec = (
-                index_candidates[dimension]
-                if dimension < len(index_candidates)
-                else slice(None)
-            )
-            if spec is None:
-                offsets.append(ctx.index_const(0))
-                sizes.append(int(source_type.shape[dimension]))
-                continue
-            if (
-                isinstance(spec, slice)
-                and spec.start is None
-                and spec.stop is None
-                and spec.step is None
-            ):
-                offsets.append(ctx.index_const(0))
-                sizes.append(int(source_type.shape[dimension]))
-                continue
-            if isinstance(spec, torch.fx.Node) and ctx.is_scalar_index_node(spec):
-                scalar_offset = ctx.get_value(spec)
-                offsets.append(
-                    ctx.cast_to_index(scalar_offset)
-                    if scalar_offset is not None
-                    else ctx.index_const(0)
-                )
-                sizes.append(1)
-                continue
-            return None
-
-        result_shape = [
-            extent
-            for dimension, extent in enumerate(sizes)
-            if dimension not in scalar_index_dims
-        ]
-        result_type = ir.RankedTensorType.get(result_shape, element_type)
-        return tensor_d.ExtractSliceOp(
-            result_type,
-            source_value,
+    if sizes != list(source_type.shape):
+        source = tensor_d.ExtractSliceOp(
+            ir.RankedTensorType.get(sizes, source_type.element_type),
+            source,
             offsets,
             [],
             [],
@@ -150,40 +72,50 @@ def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
             static_sizes=sizes,
             static_strides=[1] * len(offsets),
         ).result
+    reshaped = static_reshape(source, result_shape)
+    assert reshaped is not None
+    return reshaped
 
-    if any(isinstance(spec, (int, float)) for spec in index_candidates):
-        return None
-    result_shape = ctx.shape_from_node_meta(node)
-    if result_shape is None:
-        result_shape = [int(dim) for dim in source_type.shape]
-        result_shape.extend(1 for spec in index_candidates if spec is None)
-    if not result_shape:
-        return None
 
-    result_type = ir.RankedTensorType.get(result_shape, element_type)
-    generate = tensor_d.GenerateOp(result_type, [])
-    body = generate.operation.regions[0].blocks.append(
-        *([ir.IndexType.get()] * len(result_shape))
+def gather(
+    ctx: BuildContext, node: torch.fx.Node, source: ir.Value, items: list[object]
+) -> ir.Value:
+    """``source[items]`` with index tensors and full slices, via ``aten.index.Tensor``.
+
+    Index tensors are widened to ``i64``: torch-mlir fails on narrower ones.
+    """
+    from ..aten_bridge import call_helper
+
+    i64 = ir.IntegerType.get_signless(64)
+    indices: list[ir.Value | None] = []
+    for item in items:
+        if _is_full_slice(item):
+            indices.append(None)
+        elif _is_index_tensor(item):
+            indices.append(emit.cast_tensor(item, i64))
+        else:
+            raise UnsupportedOperationError(
+                "gather", reason=f"index {item!r} next to an index tensor"
+            )
+    while indices and indices[-1] is None:
+        indices.pop()
+    return call_helper(ctx, node, torch.ops.aten.index.Tensor, (source, indices), {})
+
+
+def _index_item(ctx: BuildContext, item: object) -> object:
+    if not isinstance(item, torch.fx.Node):
+        return item
+    value = ctx.get_value(item)
+    if value is None:
+        raise ValueNotFoundError(item, context="subscript index")
+    return value
+
+
+def _is_index_tensor(item: object) -> bool:
+    return isinstance(item, ir.Value) and (
+        isinstance(item.type, ir.RankedTensorType) and item.type.rank > 0
     )
-    source_indices: list[ir.Value] = []
-    output_dim = 0
-    source_dim = 0
-    with ir.InsertionPoint(body):
-        indices = list(body.arguments)
-        for spec in index_candidates:
-            if spec is None:
-                continue
-            if not is_full_slice(spec):
-                return None
-            if source_dim >= source_type.rank or output_dim >= len(indices):
-                return None
-            source_indices.append(indices[output_dim])
-            source_dim += 1
-            output_dim += 1
-        if source_dim != source_type.rank:
-            return None
-        gathered = tensor_d.ExtractOp(
-            source_value, source_indices, results=[element_type]
-        ).result
-        tensor_d.YieldOp(gathered)
-    return generate.result
+
+
+def _is_full_slice(item: object) -> bool:
+    return isinstance(item, slice) and item == slice(None)

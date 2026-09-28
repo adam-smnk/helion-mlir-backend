@@ -116,17 +116,13 @@ class TestBackendStructure:
             getattr(MLIRBackend(), property_name)
 
     def test_extracted_helpers_are_available_from_facades(self):
-        from helion_mlir_backend._compiler.mlir.aten_bridge import (
-            rebuild_aten_helper_for_call,
-        )
+        from helion_mlir_backend._compiler.mlir.aten_bridge import call_helper
+        from helion_mlir_backend._compiler.mlir.aten_bridge import lower_via_aten_helper
         from helion_mlir_backend._compiler.mlir.lowering import lower_tile_index
-        from helion_mlir_backend._compiler.mlir.support import (
-            restore_symbolic_shapes_in_bodies,
-        )
 
-        assert callable(rebuild_aten_helper_for_call)
+        assert callable(call_helper)
+        assert callable(lower_via_aten_helper)
         assert callable(lower_tile_index)
-        assert callable(restore_symbolic_shapes_in_bodies)
 
 
 class TestExtractedHelpers:
@@ -147,29 +143,19 @@ class TestExtractedHelpers:
 
         assert block_id_from_key(value) == expected
 
-    @pytest.mark.parametrize(
-        ("value", "block_id", "upper_bounds", "expected"),
-        ((64, 0, {0: 32}, 32), (64, 0, {0: 0}, 64), (64, 0, None, 64)),
-    )
-    def test_upper_bound_clamp(self, value, block_id, upper_bounds, expected):
-        from helion_mlir_backend._compiler.mlir.aten_lowering import (
-            _clamp_by_upper_bound,
-        )
-
-        assert _clamp_by_upper_bound(value, block_id, upper_bounds) == expected
-
-    def test_normalize_aten_args_repairs_missing_mul_operand(self):
-        from helion_mlir_backend._compiler.mlir.aten_lowering import (
-            normalized_aten_args,
-        )
+    def test_original_args_restores_stripped_inputs_only(self):
+        from helion_mlir_backend._compiler.mlir.aten_bridge import ORIGINAL_ARGS
+        from helion_mlir_backend._compiler.mlir.aten_bridge import original_args
 
         graph = torch.fx.Graph()
-        tensor_node = graph.placeholder("tensor")
-        tensor_node.meta["val"] = torch.ones(2)
-        mul_node = graph.call_function(torch.ops.aten.mul.Tensor, (tensor_node, None))
+        x = graph.placeholder("x")
+        masked = graph.placeholder("masked")
+        mul = graph.call_function(torch.ops.aten.mul.Tensor, (x, x))
+        mul.meta[ORIGINAL_ARGS] = (mul.args, mul.kwargs)
+        # Helion masks the repeated input, then rewrites another one (_mask_to).
+        mul.args = (masked, None)
 
-        args = normalized_aten_args(mul_node)
-        assert args == (tensor_node, tensor_node)
+        assert original_args(mul) == ((masked, x), {})
 
 
 class TestBasicOpLowerings:
@@ -475,16 +461,6 @@ class TestExtendedOperations:
         module.operation.verify()
         assert module is not None
 
-    def test_error_diagnostics_available(self):
-        """Test that error diagnostics module is available."""
-        from helion_mlir_backend._compiler.mlir.support.errors import (
-            safe_int_conversion,
-        )
-
-        # Test safe int conversion
-        val = safe_int_conversion(64, "test_param")
-        assert val == 64
-
 
 class TestDynamicShapes:
     """Test dynamic shape (SymInt) handling."""
@@ -603,8 +579,8 @@ class TestAdvancedOperations:
             assert alias_ir.count(op_name) == direct_ir.count(op_name)
 
         # Alias ops should not create extra ATen helper functions.
-        alias_helpers = re.findall(r'sym_name\s*=\s*"_aten_\d+"', alias_ir)
-        direct_helpers = re.findall(r'sym_name\s*=\s*"_aten_\d+"', direct_ir)
+        alias_helpers = re.findall(r"func\.func private @_aten_\w+", alias_ir)
+        direct_helpers = re.findall(r"func\.func private @_aten_\w+", direct_ir)
         assert len(alias_helpers) == len(direct_helpers)
 
     def test_division_operation(self):

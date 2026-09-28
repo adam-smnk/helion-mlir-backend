@@ -44,6 +44,14 @@ def lower_mask_to(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     return ctx.get_value(node.args[0])
 
 
+@lowers(tracing_ops._inductor_lowering_extra)
+def lower_inductor_extra(ctx: BuildContext, node: torch.fx.Node) -> None:
+    """No value: an Inductor intermediate buffer of an ATen op (e.g. the sum of
+    ``mean``) that only feeds that op's ``_extra_args``; the op's helper
+    recomputes it."""
+    return None
+
+
 @lowers(memory_ops.store)
 def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     """``insert_slice`` of the value into the destination's current SSA state."""
@@ -54,6 +62,10 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     state = ctx.tensors.value(name)
     state_type = ir.RankedTensorType(state.type)
     plan = plan_slice(ctx, index_nodes, state_type, ctx.tensors.owned(name))
+    if plan.gathers():
+        raise UnsupportedOperationError(
+            "store", reason="stores indexed by a tensor (scatter) are not supported"
+        )
     value = _store_value(ctx, node, value_node, state_type.element_type, plan)
     rank = len(plan.dims)
     updated = tensor_d.InsertSliceOp(

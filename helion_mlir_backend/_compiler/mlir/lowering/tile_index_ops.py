@@ -15,7 +15,6 @@ from ..support import DynamicShapeError
 from ..support import NodeLoweringError
 from ..support import ValueNotFoundError
 from ..support import block_id_from_key
-from ..support import safe_int_conversion
 from ..support import torch_dtype_to_mlir
 from .registry import lowers
 
@@ -53,16 +52,15 @@ def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
 
 @lowers(torch.ops.aten.sym_size.int)
 def lower_sym_size(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
-    """``sym_size.int(tensor, dim)``: a constant for the tensor dimension."""
-    value = node.meta.get("val")
-    try:
-        size = (
-            int(value)
-            if isinstance(value, torch.SymInt)
-            else safe_int_conversion(value, "shape_dimension")
-        )
-    except (TypeError, ValueError) as exc:
-        raise DynamicShapeError(value, symbol_name=node.name) from exc
+    """``sym_size.int(tensor, dim)``: a constant for the operand's static dimension."""
+    tensor, dim = node.args[:2]
+    value = ctx.get_value(tensor)
+    if value is None:
+        raise ValueNotFoundError(tensor, context="sym_size operand")
+    shape = ir.RankedTensorType(value.type).shape
+    size = shape[dim]
+    if ir.ShapedType.is_dynamic_size(size):
+        raise DynamicShapeError(node.meta.get("val"), symbol_name=node.name)
     return ctx.index_const(size)
 
 

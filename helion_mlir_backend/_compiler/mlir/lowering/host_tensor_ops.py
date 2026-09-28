@@ -69,11 +69,10 @@ def materialize_host_tensor_alias_shape(
     base_shape = [int(dim) for dim in base_type.shape]
     element_type = base_type.element_type
 
-    alias_shape = ctx.shape_from_node_meta(alias_node)
-    if alias_shape is None or base_shape == alias_shape:
+    alias_shape = [int(dim) for dim in alias_node.meta["val"].shape]
+    if base_shape == alias_shape:
         return base_value
 
-    alias_shape = [int(dimension) for dimension in alias_shape]
     if any(dimension < 0 for dimension in base_shape + alias_shape):
         # Dynamic extents have no static reassociation; bail out.
         return None

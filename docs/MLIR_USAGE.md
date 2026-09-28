@@ -217,10 +217,9 @@ helion_mlir_backend/_compiler/mlir/
 ├── build_context.py                  # typed mutable lowering state
 ├── codegen.py                        # phase functions and memref entry
 ├── analysis/                         # geometry, tensor effects, signature, contractions
-├── aten_lowering.py                  # ATen helper preprocessing
 ├── lowering/                         # operation-family MLIR emitters
-├── aten_bridge/                      # custom ATen and torch-mlir bridge
-└── support/                          # shape, type, dispatch, and diagnostics
+├── aten_bridge/                      # torch-mlir helpers for generic ATen ops
+└── support/                          # index resolution, types, diagnostics
 ```
 
 `MLIRBackend` inherits from Helion's backend-neutral `Backend`; it does not use

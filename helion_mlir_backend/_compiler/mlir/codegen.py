@@ -26,12 +26,13 @@ ATen lowering architecture
 --------------------------
 Every node is dispatched by target identity through ``lowering/registry.py``.
 Helion-specific device-IR nodes determine the tile/control-flow structure and
-lower directly to ``scf``/``tensor``/``linalg`` operations. Generic ATen nodes
-are extracted into pure FX subgraphs by ``aten_lowering.py``, imported through
-``torch_mlir.extras.fx_importer.FxImporter``, lowered through torch-mlir's
-Torch-to-Linalg pipeline, and cloned back into this module as private helper
-``func.func`` operations. A small set of direct ATen lowerings remains for
-Helion-specific operand conventions and contractions.
+lower directly to ``scf``/``tensor``/``linalg`` operations. Any other ATen node
+becomes a ``func.call`` to a private helper typed by its operands' MLIR types at
+the call site (``aten_bridge/helpers.py``); after all functions are built, the
+helpers are lowered through torch-mlir's FX importer and Torch-to-Linalg
+pipeline in one batch and cloned into this module. Helion's node metadata is
+read, never modified. A small set of direct ATen lowerings remains for
+contractions, views, casts and index-scalar arithmetic.
 
 This split is necessary because ``FxImporter`` cannot import Helion's
 non-ATen FX targets, while torch-mlir provides broad, reusable coverage for
@@ -141,10 +142,9 @@ class MLIRModuleBuilder:
                 module = ir.Module.create()
                 self.context.mlir_module = module
                 self.context.mlir_context = ctx
-                self.context.aten_helpers = AtenHelperTable(module)
+                self.context.aten_helpers = AtenHelperTable()
                 with ir.InsertionPoint(module.body), self.hf:
                     self._resolve_geometry()
-                    self._prebuild_aten_helpers(module)
                     phases = list(
                         starmap(
                             self._build_phase_function,
@@ -152,6 +152,7 @@ class MLIRModuleBuilder:
                         )
                     )
                     self._build_entry_function(phases)
+                    self.context.aten_helpers.materialize(module)
             return module
         except MLIRBackendError:
             raise
@@ -251,45 +252,6 @@ class MLIRModuleBuilder:
         self.context.contractions = ContractionPlan.from_graphs(
             [graph_info.graph for graph_info in self.hf.device_ir.graphs]
         )
-
-    def _prebuild_aten_helpers(self, module: ir.Module) -> None:
-        """Lower every ATen node without a direct lowering via one torch-mlir pass.
-
-        Helper ``func.func`` operations are inserted at the module's top level and
-        recorded in ``self.context.aten_helpers``.
-        """
-        from .aten_lowering import is_aten_op
-        from .aten_lowering import preprocess_aten_nodes
-        from .einsum_capture import is_einsum_node
-        from .support import refresh_aten_tensor_meta
-        from .support import restore_symbolic_shapes_in_bodies
-
-        # Nested loop-body placeholders must carry their outer symbolic shapes
-        # before ATen nodes are scanned (see symbolic_shape_restoration).
-        restore_symbolic_shapes_in_bodies(self.hf, self.context)
-        refresh_aten_tensor_meta(self.hf)
-
-        plan = self.context.contractions
-        aten_nodes = [
-            node
-            for graph_info in self.hf.device_ir.graphs
-            for node in graph_info.graph.nodes
-            if is_aten_op(node)
-            and not is_einsum_node(node)
-            and plan.needs_helper(node)
-            and not self.context.has_symbolic_operand(node)
-        ]
-        if not aten_nodes:
-            return
-
-        entries = preprocess_aten_nodes(
-            aten_nodes,
-            module,
-            self.context.geometry.block_sizes(),
-            self.env,
-            self.context.geometry.spans(),
-        )
-        self.context.aten_helpers.replace(entries)
 
 
 def _scalar_tensor_type(scalar: ScalarArg) -> ir.RankedTensorType:

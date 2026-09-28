@@ -69,7 +69,8 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
   - `build()`: Entry point, creates the MLIR module
   - `_build_phase_function()`: one private tensor `func.func` per `hl.barrier()` phase
   - `_build_entry_function()`: the public memref-ABI entry that calls the phases
-  - `_prebuild_aten_helpers()`: Batch-lowers ATen nodes without a direct lowering
+  - `AtenHelperTable.materialize()`: after all functions are built, lowers the
+    requested ATen helpers (one torch-mlir run) and clones them into the module
   - Per-node lowering is `lowering/registry.py::lower_node`
 
 #### 4. **Lowering Modules**
@@ -80,15 +81,17 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
   functions, ATen `OpOverload`s, or an `OpOverloadPacket` with an overload filter);
   each node is lowered inside its `meta["location"]` so errors name the kernel line
 - `control_flow.py`: outer `scf.forall` and nested `scf.for`
-- `load_slice_ops.py`, `load_ops.py`: tile loads and gathers
-- `memory_ops.py`: getitem and stores
+- `load_slice_ops.py`: tile loads; a 1-D index tensor in one dimension gathers
+  through the `aten.index.Tensor` helper
+- `memory_ops.py`: getitem and stores (tensor-indexed stores are rejected)
 - `contraction_ops.py`: the single lowering for `mm`/`bmm`/`matmul`/`addmm`/
   `baddbmm`, `hl.dot`, captured einsum and `acc + contraction`, matched by
   `analysis/contractions.py`
-- `elementwise_ops.py`: index-scalar binary ops and aliases
+- `elementwise_ops.py`: index-scalar binary ops, aliases, Helion's GELU ops
 - `view_ops.py`, `method_ops.py`, `transpose_ops.py`: views and `Tensor` methods
 - `emit.py`: shared builders (constants, fills, casts as `linalg.generic`)
-- `subscript_ops.py`: tensor subscripts
+- `subscript_ops.py`: subscripts of device values (slices, new axes, scalar
+  positions, gathers)
 - `host_tensor_ops.py`: host arguments and alias materialization
 - `tensor_creation_ops.py`: `full` (also `hl.zeros`)
 - `tile_index_ops.py`: tile positions, `tile.index`, shape queries
@@ -101,18 +104,35 @@ that expansion.
 
 #### 5. **ATen Bridge and Support**
 
-The ATen-specific path is organized under [aten_bridge/](../helion_mlir_backend/_compiler/mlir/aten_bridge/):
+[aten_bridge/helpers.py](../helion_mlir_backend/_compiler/mlir/aten_bridge/helpers.py)
+lowers every ATen node without a direct lowering as a `func.call` to a private
+helper function typed at the call site:
 
-- `helper_call.py`: call-site `func.call` to a helper
-- `aten_helper_table.py`: helper signature and identity tracking
-- `helper_rebuild.py`: call-site-specific helper variants
-- `torch_mlir_pipeline.py`: batched torch-mlir import and lowering
+- The operands are the node's inputs as they were lowered: tensors with their
+  MLIR types, and runtime scalars (kernel `float`/`int` parameters, tile
+  positions) as `f64`/`i64`/`i1`. Constant scalars and non-tensor arguments are
+  literals. Result types come from running the op on meta tensors of the
+  operand types, so nothing is derived from Helion's symbolic metadata.
+- The helper's name hashes the target, literals and operand types; one helper
+  serves every call site with the same signature.
+- Inputs that Helion's `strip_unused_inputs` masked as `None` (`x * x` becomes
+  `mul(x, None)`) are restored from the arguments recorded just before it runs
+  (`install_original_args_capture`, installed by `inject.py`).
+- After the module is built, the helpers missing from a process-wide cache are
+  imported with torch-mlir's `FxImporter` and lowered to Linalg in one run. If
+  that run fails, each helper is lowered alone and the first failing one raises
+  an `UnsupportedOperationError` at its node's kernel source line.
+- `infer_results` gives the same meta results to direct lowerings that need a
+  result shape (`view`/`reshape`); `call_helper` builds a helper call for an op
+  that is not the node's own target (gathers use `aten.index.Tensor`, Helion's
+  `_gelu_erf` uses `aten.gelu`).
+
+Helion's node metadata is read, never modified.
 
 Shared utilities live under [support/](../helion_mlir_backend/_compiler/mlir/support/):
 
 - `block_ids.py`: canonical block-key and symbolic-name parsing
-- `symbolic_shape_restoration.py`: nested loop metadata repair
-- `aten_prepass.py`: ATen metadata refresh
+- `index_meta.py`: index expressions to block ids
 - `einsum_spec.py`: einsum equation analysis against `linalg.contract` semantics
 - `type_utils.py` and `errors.py` (errors are `helion.exc.BaseError`s)
 
@@ -284,15 +304,14 @@ linalg.generic with custom compute block:
 | Extract | `tensor.extract_slice` | `a[idx]` |
 | Store | `tensor.parallel_insert_slice` | `out[idx] = val` |
 | Constants | `arith.constant` | Tile sizes, indices |
+| Other ATen ops | torch-mlir helper (`linalg.*`) | reductions, softmax, norms, activations |
 
 ### Not Yet Implemented
 
-- Layer normalization
-- Softmax
-- Attention operations
-- Dynamic reshaping
-- Complex reductions (reduce_sum, etc.)
-- Custom operations
+- Ragged tiles (masking, `extra_mask`)
+- Scatter stores
+- Host-side `hl.specialize`
+- Dynamic shapes
 
 ## Compilation Flow Example
 

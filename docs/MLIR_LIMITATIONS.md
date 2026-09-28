@@ -48,17 +48,20 @@ Consequence:
 
 Current reality:
 - Operation support is not a fixed whitelist/blacklist in docs.
-- Practical support depends on combinations that survive:
-  - Helion tracing,
-  - backend shape propagation,
-  - ATen helper lowering via torch-mlir,
-  - downstream lighthouse validation.
+- Any ATen op without a direct lowering becomes a torch-mlir helper typed by
+  its operands at the call site, so support follows torch-mlir's Torch-to-Linalg
+  coverage. An op torch-mlir cannot lower fails with an
+  `UnsupportedOperationError` at its kernel source line.
+- Downstream, lighthouse must still validate and lower the result.
 
 Examples validated in current tests include:
-- Elementwise add/mul style kernels.
-- Fused scale-add style patterns.
+- Elementwise and activation kernels (including runtime `float` parameters,
+  e.g. `torch.clamp_max(x, alpha)`), reductions, softmax, layer/RMS norm.
 - Nested tiled matmul accumulation patterns.
 - Two-operand `torch.einsum` contractions (see below).
+- Gathers: one 1-D index tensor per load (`weight[idx[tile_b], tile_e]`), or any
+  index tensor into a 1-D tensor. Stores indexed by a tensor (scatter) are
+  rejected.
 
 ### `torch.einsum`
 
@@ -100,16 +103,17 @@ Current backend behavior:
 Consequence:
 - Equivalent high-level math can succeed or fail depending on the lowered intermediate form.
 
-## 6) Shape Propagation Can Still Be Fragile for New Patterns
+## 6) Result Shapes Come From the Lowered Operands
 
-Known risk:
-- Some new operator compositions can expose metadata inconsistencies in helper preprocessing.
-
-Mitigation already in place:
-- Additional fake-tensor evaluation and symbolic mapping logic improves nested-loop shape propagation.
+Current behavior:
+- ATen helpers, `view`/`reshape` and `sym_size` take their shapes from the MLIR
+  types of the lowered operands; Helion's symbolic node metadata is never
+  modified and is used only for dtypes, ranks and symbol origins.
 
 Consequence:
-- New complex patterns may still require targeted fixes.
+- A tile shape is `min(block size, dimension)`. Where Helion expects a full
+  block for a ragged last tile, shapes differ until ragged tiles are padded and
+  masked (plan Phase 6).
 
 ## 7) Source Availability Requirement
 
@@ -189,8 +193,8 @@ Limits:
 - A host tensor whose shape depends on a block size
   (`torch.zeros((m, n // block_n))` with `block_n = hl.register_block_size(n)`)
   gets a dynamic MLIR type and fails to lower.
-- Runtime scalars take part in `add`/`sub`/`mul`/`div` with a tensor; other ops
-  with a scalar operand go through ATen helpers, which do not accept them yet.
+- Host-side Helion API calls other than `hl.register_block_size` (e.g.
+  `hl.specialize`) are not evaluated in host code yet and raise `NotInsideKernel`.
 - No statement other than `hl.barrier()` may appear between two top-level device
   loops (a Helion frontend rule, not backend-specific).
 
@@ -206,8 +210,9 @@ and Triton cache-management path. The implementation is split into:
 
 
 - `lowering/` for operation and control-flow emission.
-- `aten_bridge/` for custom ATen handling and torch-mlir helper management.
-- `support/` for shape repair, type conversion, dispatch, and diagnostics.
+- `aten_bridge/` for the torch-mlir helpers of generic ATen ops.
+- `analysis/` for read-only analyses of Helion's device IR.
+- `support/` for index resolution, type conversion and diagnostics.
 
 This means Triton-specific code-generation behavior is not a fallback for MLIR;
 unsupported MLIR operations must be added to the appropriate MLIR lowering or
