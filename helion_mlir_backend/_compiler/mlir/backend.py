@@ -15,14 +15,36 @@ own tiling, vectorization, and memory-placement passes.
 
 from __future__ import annotations
 
+import random
 from typing import TYPE_CHECKING
 
 from helion import exc
 from helion._compiler.backend import Backend
 
+from .support.debug import PIPELINE_CONFIG_KEY
+from .support.debug import use_optimizing_pipeline
+from .support.errors import MLIRBackendError
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Sequence
+
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
+    from helion.autotuner.config_fragment import ConfigSpecFragment
+    from helion.autotuner.config_spec import ConfigSpec
+    from helion.runtime.config import Config
+    from helion.runtime.kernel import BoundKernel
+
+_CONFIG_KEYS = frozenset({"block_sizes", PIPELINE_CONFIG_KEY})
+_OPT_MIN_TILE = 32
+"""Lighthouse's tile-and-fuse aborts on ops whose tiled dims are all smaller (I23)."""
+
+
+def raise_block_minimums(config_spec: ConfigSpec) -> None:
+    """Search (and default) tiles of at least 32 where the dimension allows."""
+    for spec in config_spec.block_sizes:
+        spec.update_min(min(_OPT_MIN_TILE, spec.max_size))
 
 
 class MLIRBackend(Backend):
@@ -30,6 +52,7 @@ class MLIRBackend(Backend):
 
     Compilation (parsing, type propagation, device IR construction) uses
     Helion's backend-neutral pipeline. Only the final codegen step is replaced.
+    Autotuning is Helion's (one given config is used as is), timed on the CPU.
     """
 
     @property
@@ -40,16 +63,73 @@ class MLIRBackend(Backend):
     def experimental(self) -> bool:
         return True
 
+    def supports_config_key(self, key: str) -> bool:
+        """Only block sizes shape the generated IR; ``mlir_pipeline`` picks the
+        lighthouse pipeline (default: ``HELION_MLIR_PIPELINE``)."""
+        return key in _CONFIG_KEYS
+
+    def supports_precompile(self) -> bool:
+        return False
+
     def autotune(
         self,
-        bound_kernel: object,
-        args: object,
+        bound_kernel: BoundKernel,
+        args: Sequence[object],
         *,
-        force: bool = False,
+        force: bool = True,
         **kwargs: object,
-    ) -> object:
-        # CPU has no hardware cache key; skip autotuning and use default config.
-        return bound_kernel.env.config_spec.default_config()
+    ) -> Config:
+        """Helion's autotuning; its default local cache becomes the CPU one. A
+        search under the optimizing pipeline only tries tiles of at least 32."""
+        from .autotune import CPU_AUTOTUNE_CACHE
+
+        settings = bound_kernel.settings
+        if settings.autotune_cache == "LocalAutotuneCache":
+            settings.autotune_cache = CPU_AUTOTUNE_CACHE
+        if use_optimizing_pipeline() and (
+            force or settings.force_autotune or not bound_kernel.kernel.configs
+        ):
+            raise_block_minimums(bound_kernel.config_spec)
+        return super().autotune(bound_kernel, args, force=force, **kwargs)
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        from helion.autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        from helion.autotuner.benchmarking import interleaved_bench_generic
+
+        return interleaved_bench_generic
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        """A config the backend or lighthouse cannot compile is skipped."""
+        if isinstance(err, MLIRBackendError) or any(
+            note.startswith("Helion MLIR backend:")
+            for note in getattr(err, "__notes__", ())
+        ):
+            return "warn"
+        return None
+
+    def config_value_priors(
+        self, config_spec: ConfigSpec
+    ) -> dict[str, Callable[[ConfigSpecFragment, int], object]]:
+        """Bias random block sizes toward divisors of the dimension (no pad/mask)."""
+        hints = [spec.size_hint for spec in config_spec.block_sizes]
+
+        def divisors_first(fragment: ConfigSpecFragment, position: int) -> object:
+            low, high = getattr(fragment, "low", None), getattr(fragment, "high", None)
+            if (
+                not isinstance(low, int)
+                or not isinstance(high, int)
+                or position >= len(hints)
+            ):
+                return None
+            sizes = [1 << bit for bit in range(low.bit_length() - 1, high.bit_length())]
+            weights = [4.0 if hints[position] % size == 0 else 1.0 for size in sizes]
+            return random.choices(sizes, weights=weights)[0]
+
+        return {"block_sizes": divisors_first}
 
     def dtype_str(self, dtype: object) -> str:
         import torch

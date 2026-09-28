@@ -435,6 +435,10 @@ The backend manages this context internally in `build()`.
    function boundary (`to_tensor` / `materialize_in_destination` in the entry)
    and makes loop-carried updates destination-passing (`mlir/in_place.py`)
 4. **Vectorization**: Implicit in tensor operations, realized downstream
+5. **Compilation and tuning**: `execution.compile_entry` caches compiled entries
+   by module text and pipeline. `MLIRBackend` keeps Helion's autotune semantics
+   (block sizes only, CPU wall-clock timing, `mlir/autotune.py`'s CPU-keyed
+   best-config cache); the `mlir_pipeline` config key picks the pipeline
 
 ## Testing Strategy
 

@@ -269,7 +269,9 @@ are all smaller than 32 then aborts the process inside upstream MLIR
 `linalg.elementwise` on `tensor<Nxf32>` (N < 32 aborts, N >= 32 completes).
 
 Workaround until lighthouse is fixed: use block sizes of at least 32 for kernels lowered
-through the optimizing pipeline. The scalar pipeline is unaffected.
+through the optimizing pipeline. The scalar pipeline is unaffected. The autotuner does this
+itself: a search under the optimizing pipeline only tries tiles of at least 32 (where the
+dimension allows); given configs are not changed.
 
 ## 15) Lighthouse Pipeline Deviations
 
@@ -279,6 +281,21 @@ The local lighthouse checkout carries these pipeline changes (to be upstreamed):
   failed with "Yield operand #0 is not equivalent to the corresponding iter bbArg").
 - `scalar-lowering.yaml` includes `bufferization-cleanup.yaml` to deallocate the buffers that
   option allows inside loops.
+
+## 16) Autotuning
+
+- Only `block_sizes` are tuned (the backend accepts `block_sizes` and `mlir_pipeline`
+  config keys; others raise `InvalidConfig`). The pipeline is not searched: a search uses
+  `HELION_MLIR_PIPELINE`'s pipeline.
+- Candidates run in the tuning process (no precompile subprocess), timed by wall clock.
+  A candidate the backend or lighthouse rejects with an error is skipped, but a native
+  abort inside MLIR (e.g. the small-tile assertion above) ends the process.
+- Compiling on the optimizing pipeline is much slower than on the scalar one for wide
+  tiles (a 32x1024 softmax: about 2.5 s of lighthouse passes and 7 s of LLVM JIT), which
+  bounds how many configs a search can afford.
+- Compiled entries are cached in-process only; lighthouse's `Runner` cannot load a dumped
+  object file, so there is no on-disk cache of compiled code (best configs are cached on
+  disk by Helion's autotune cache).
 
 ## Out of Scope for This Backend Today
 

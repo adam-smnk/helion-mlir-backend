@@ -36,6 +36,7 @@ import helion_mlir_backend  # noqa: F401  (registers the "mlir" backend)
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
+    config=helion.Config(block_sizes=[32, 32, 32, 32]),
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def normalize_then_scale(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -1,14 +1,17 @@
 """Lower a generated module with lighthouse and JIT its memref-ABI entry function.
 
-Stateless: :func:`compile_entry` returns a :class:`CompiledEntry` that takes the
-entry's buffers in argument order. Failures keep their exception type and get a
-note naming the stage.
+:func:`compile_entry` returns a :class:`CompiledEntry` that takes the entry's
+buffers in argument order. Failures keep their exception type and get a note
+naming the stage. Compiled entries are cached in-process by module text and
+pipeline, so equal modules (e.g. configs that clamp to the same tiles) JIT once.
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -33,6 +36,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 PIPELINES = ("scalar", "opt")
+_JIT_CACHE: OrderedDict[tuple[str, str], CompiledEntry] = OrderedDict()
+_JIT_CACHE_SIZE = 128
 
 
 def _dump_if(enabled: bool, label: str, module: ir.Module) -> None:
@@ -130,15 +135,32 @@ def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:
 def compile_entry(
     module: ir.Module, entry: str, *, pipeline: str | None = None
 ) -> CompiledEntry:
-    """Inline, lower and JIT-compile ``entry`` (consumes ``module``)."""
-    args = entry_args(module, entry)
+    """Inline, lower and JIT-compile ``entry`` (consumes ``module``), or reuse the
+    entry compiled from an identical module with the same pipeline."""
+    if pipeline is None:
+        pipeline = "opt" if use_optimizing_pipeline() else "scalar"
     debug = DebugOptions.from_env()
+    if debug.dump_ir or debug.dump_pre_lowering or debug.dump_lowered:
+        return _compile_entry(module, entry, pipeline, debug)
+    key = (hashlib.sha256(str(module).encode()).hexdigest(), pipeline)
+    if (compiled := _JIT_CACHE.get(key)) is not None:
+        _JIT_CACHE.move_to_end(key)
+        return compiled
+    compiled = _compile_entry(module, entry, pipeline, debug)
+    _JIT_CACHE[key] = compiled
+    if len(_JIT_CACHE) > _JIT_CACHE_SIZE:
+        _JIT_CACHE.popitem(last=False)
+    return compiled
+
+
+def _compile_entry(
+    module: ir.Module, entry: str, pipeline: str, debug: DebugOptions
+) -> CompiledEntry:
+    args = entry_args(module, entry)
     _dump_if(debug.dump_ir, "MLIR before inlining", module)
     with _stage("inlining"):
         inline_module(module)
     _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
-    if pipeline is None:
-        pipeline = "opt" if use_optimizing_pipeline() else "scalar"
     if pipeline == "opt" and (op := _dynamic_linalg_op(module)) is not None:
         # The opt pipeline vectorizes without vector sizes (plan I32).
         log.debug(

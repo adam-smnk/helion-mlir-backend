@@ -185,6 +185,35 @@ with (
 print(buf.getvalue())
 ```
 
+## Configs, Pipelines and Autotuning
+
+A config has two keys on this backend: `block_sizes`, and `mlir_pipeline`
+(`"scalar"` or `"opt"`) to pick the lighthouse pipeline for that config. Without
+`mlir_pipeline`, `HELION_MLIR_PIPELINE=1` selects `opt`, otherwise `scalar`. Other
+Helion config keys (`num_warps`, `reduction_loops`, ...) are rejected.
+
+```python
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[32, 32, 32], mlir_pipeline="opt"))
+```
+
+Config selection follows Helion:
+- One config (`config=` or `configs=[c]`) is used as is; nothing is tuned.
+- Several configs (`configs=[a, b]`) are benchmarked and the fastest is used.
+- Without a config, Helion's autotuner searches block sizes (`autotune_effort`
+  selects the effort; `"none"` uses the default config). Candidates are timed by
+  wall clock on the CPU. The best config is cached on disk (`HELION_CACHE_DIR`),
+  keyed by the kernel, its inputs, the CPU model and the default pipeline;
+  `HELION_FORCE_AUTOTUNE=1` re-tunes.
+- A search under the optimizing pipeline only tries tiles of at least 32 (where
+  the dimension allows), since smaller ones abort in lighthouse.
+
+Compiled modules are cached in-process by their text and pipeline, so compiling
+the same module again (another shape bucket with equal static sizes, a repeated
+config) skips lighthouse and the JIT.
+
+Tests and the conformance sweep set `HELION_DISALLOW_AUTOTUNING=1` and give every
+kernel a fixed config.
+
 ## Debugging Aids
 
 ### Print generated module

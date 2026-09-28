@@ -16,6 +16,7 @@ from ..execution import compile_entry
 from .codegen import MLIRModuleBuilder
 from .host_code import build_host_function
 from .support import UnsupportedOperationError
+from .support.debug import PIPELINE_CONFIG_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -53,7 +54,12 @@ def compile_kernel(
     *,
     pipeline: str | None = None,
 ) -> Callable[..., object]:
-    """A callable with the kernel's own signature and Helion call semantics."""
+    """A callable with the kernel's own signature and Helion call semantics.
+
+    ``pipeline`` defaults to the config's ``mlir_pipeline``, then ``HELION_MLIR_PIPELINE``.
+    """
+    if pipeline is None:
+        pipeline = config.get(PIPELINE_CONFIG_KEY)
     with env:
         builder = MLIRModuleBuilder(hf, config, env)
         module = builder.build()

@@ -31,9 +31,29 @@ def install() -> bool:
 
     register_compiler_backend(MLIRBackend)
     _patch_bound_kernel(BoundKernel, MLIRBackend, mlir_compile_config)
+    _allow_pipeline_config_key()
+    _register_cpu_autotune_cache()
     install_einsum_capture()
     install_original_args_capture()
     return True
+
+
+def _register_cpu_autotune_cache() -> None:
+    from helion import autotuner
+
+    from helion_mlir_backend._compiler.mlir.autotune import CPU_AUTOTUNE_CACHE
+    from helion_mlir_backend._compiler.mlir.autotune import CpuAutotuneCache
+
+    autotuner.cache_classes[CPU_AUTOTUNE_CACHE] = CpuAutotuneCache
+
+
+def _allow_pipeline_config_key() -> None:
+    """Let configs carry ``mlir_pipeline``: Helion accepts only keys in ``VALID_KEYS``."""
+    import helion.autotuner.config_spec as config_spec
+
+    from helion_mlir_backend._compiler.mlir.support.debug import PIPELINE_CONFIG_KEY
+
+    config_spec.VALID_KEYS = config_spec.VALID_KEYS | {PIPELINE_CONFIG_KEY}
 
 
 def _patch_bound_kernel(

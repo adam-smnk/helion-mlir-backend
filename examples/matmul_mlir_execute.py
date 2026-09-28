@@ -21,7 +21,9 @@ import torch
 from helion_mlir_backend import generate_mlir
 
 
-@helion.kernel(static_shapes=True, backend="mlir")
+@helion.kernel(
+    static_shapes=True, backend="mlir", config=helion.Config(block_sizes=[32])
+)
 def matmul_kernel(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Compute C = A @ B for 128x128x128 matmul.
 

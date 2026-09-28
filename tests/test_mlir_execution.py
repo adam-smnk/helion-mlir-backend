@@ -1003,7 +1003,11 @@ class TestDirectCall:
         """Direct add kernel call matches torch reference."""
         A, B = ab_32x32
 
-        @helion.kernel(static_shapes=True, backend="mlir")
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[32, 32]),
+        )
         def add_direct(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
             out = torch.empty((m, n), dtype=x.dtype, device=x.device)
@@ -1017,7 +1021,11 @@ class TestDirectCall:
         """Direct multiply kernel call matches torch reference."""
         A, B = ab_32x32
 
-        @helion.kernel(static_shapes=True, backend="mlir")
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[32, 32]),
+        )
         def mul_direct(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
             out = torch.empty((m, n), dtype=x.dtype, device=x.device)
@@ -1031,7 +1039,9 @@ class TestDirectCall:
         """Direct call with three tensor inputs."""
         X, Y, Z = abc_16x64
 
-        @helion.kernel(static_shapes=True, backend="mlir")
+        @helion.kernel(
+            static_shapes=True, backend="mlir", config=helion.Config(block_sizes=[16])
+        )
         def add3_direct(
             x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
         ) -> torch.Tensor:
@@ -1048,7 +1058,11 @@ class TestDirectCall:
         """Second call reuses the compiled JIT function (no recompilation)."""
         A, B = ab_32x32
 
-        @helion.kernel(static_shapes=True, backend="mlir")
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[32, 32]),
+        )
         def add_cached(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
             out = torch.empty((m, n), dtype=x.dtype, device=x.device)
@@ -1064,7 +1078,11 @@ class TestDirectCall:
         """Direct call and execute_mlir produce identical results."""
         A, B = ab_32x32
 
-        @helion.kernel(static_shapes=True, backend="mlir")
+        @helion.kernel(
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=[32, 32]),
+        )
         def add_both(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
             out = torch.empty((m, n), dtype=x.dtype, device=x.device)
@@ -1080,7 +1098,9 @@ class TestDirectCall:
     def test_matmul_full_rhs_slice_direct_regression(self):
         """Regression: direct MLIR backend call handles full RHS slice matmul."""
 
-        @helion.kernel(static_shapes=True, backend="mlir")
+        @helion.kernel(
+            static_shapes=True, backend="mlir", config=helion.Config(block_sizes=[32])
+        )
         def matmul_full_rhs_slice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.shape
             k2, n = y.shape

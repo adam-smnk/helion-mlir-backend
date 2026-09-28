@@ -20,8 +20,12 @@ def _use_scalar_pipeline(monkeypatch):
     monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
 
 
+def _tiles_of_8(count: int) -> helion.Config:
+    return helion.Config(block_sizes=[8] * count)
+
+
 def test_two_phase_barrier_kernel_direct_call():
-    @helion.kernel(static_shapes=True, backend="mlir")
+    @helion.kernel(static_shapes=True, backend="mlir", config=_tiles_of_8(4))
     def two_phase_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         m, n = x.shape
         mid = torch.zeros((m, n), dtype=torch.float32, device=x.device)
@@ -40,7 +44,7 @@ def test_two_phase_barrier_kernel_direct_call():
 
 
 def test_three_phase_chained_dependency_direct_call():
-    @helion.kernel(static_shapes=True, backend="mlir")
+    @helion.kernel(static_shapes=True, backend="mlir", config=_tiles_of_8(6))
     def three_phase_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         m, n = x.shape
         a = torch.zeros((m, n), dtype=torch.float32, device=x.device)
@@ -63,7 +67,7 @@ def test_three_phase_chained_dependency_direct_call():
 
 
 def test_host_tensor_interop_direct_call():
-    @helion.kernel(static_shapes=True, backend="mlir")
+    @helion.kernel(static_shapes=True, backend="mlir", config=_tiles_of_8(2))
     def host_side_scale(x: torch.Tensor) -> torch.Tensor:
         m, n = x.shape
         scale = x.mean() * 100.0
@@ -88,6 +92,7 @@ def test_host_tensor_computed_before_phases_and_used_in_later_phase():
     @helion.kernel(
         static_shapes=True,
         backend="mlir",
+        config=_tiles_of_8(4),
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
     )
     def later_phase_uses_host_scale(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -231,7 +236,7 @@ def test_two_phase_kernel_with_multi_output_final_phase():
     two tensors (return out1, out2), exercising the N-output-per-phase
     machinery together with cross-phase threading in the same kernel."""
 
-    @helion.kernel(static_shapes=True, backend="mlir")
+    @helion.kernel(static_shapes=True, backend="mlir", config=_tiles_of_8(4))
     def two_phase_multi_output(x: torch.Tensor, y: torch.Tensor):
         m, n = x.shape
         mid = torch.zeros((m, n), dtype=torch.float32, device=x.device)
@@ -259,7 +264,7 @@ def test_three_output_kernel_direct_call():
     direct call path (which takes the unchanged single-phase fast path
     since there's no hl.barrier()/extra host tensor here)."""
 
-    @helion.kernel(static_shapes=True, backend="mlir")
+    @helion.kernel(static_shapes=True, backend="mlir", config=_tiles_of_8(2))
     def three_outputs(x: torch.Tensor, y: torch.Tensor):
         m, n = x.shape
         out1 = torch.zeros((m, n), dtype=torch.float32, device=x.device)
@@ -283,7 +288,7 @@ def test_three_output_kernel_direct_call():
 def test_four_phase_chained_dependency_direct_call():
     """Stress test beyond 2-3 phases: 4 phases, each depending on the last."""
 
-    @helion.kernel(static_shapes=True, backend="mlir")
+    @helion.kernel(static_shapes=True, backend="mlir", config=_tiles_of_8(8))
     def four_phase_kernel(x: torch.Tensor) -> torch.Tensor:
         m, n = x.shape
         a = torch.zeros((m, n), dtype=torch.float32, device=x.device)
@@ -310,7 +315,7 @@ def test_four_phase_chained_dependency_direct_call():
 
 
 def test_return_expression_is_evaluated_on_host():
-    @helion.kernel(static_shapes=True, backend="mlir")
+    @helion.kernel(static_shapes=True, backend="mlir", config=_tiles_of_8(4))
     def two_phase_expression_return(x: torch.Tensor, y: torch.Tensor):
         m, n = x.shape
         mid = torch.zeros((m, n), dtype=torch.float32, device=x.device)

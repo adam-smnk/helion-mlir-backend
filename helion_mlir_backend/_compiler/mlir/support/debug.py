@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import os
 
 _FALSE_VALUES = ("", "0", "false", "no")
+PIPELINE_CONFIG_KEY = "mlir_pipeline"
+"""Config key naming the lighthouse pipeline (``scalar``/``opt``) of one config."""
 
 
 def _flag(name: str) -> bool:

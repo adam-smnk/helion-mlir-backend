@@ -34,6 +34,8 @@ if (_workers := os.environ.get("PYTEST_XDIST_WORKER_COUNT")) is not None:
     os.environ.setdefault(
         "OMP_NUM_THREADS", str(max(2, (os.cpu_count() or 2) // int(_workers)))
     )
+# Test kernels run fixed configs; autotuning tests re-enable the search explicitly.
+os.environ["HELION_DISALLOW_AUTOTUNING"] = "1"
 
 
 def _isolated_context() -> multiprocessing.context.ForkServerContext:
