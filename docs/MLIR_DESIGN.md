@@ -80,20 +80,29 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 - `registry.py`: `@lowers(target)` dispatch keyed by target identity (Helion API
   functions, ATen `OpOverload`s, or an `OpOverloadPacket` with an overload filter);
   each node is lowered inside its `meta["location"]` so errors name the kernel line
-- `control_flow.py`: outer `scf.forall` and nested `scf.for`
+- `control_flow.py`: outer `scf.forall`, nested `scf.for`, `scf.if` for `_if`
+  and `scf.while` for `_while_loop`, each carrying the tensors its body writes
+- `scalar_ops.py`: arithmetic, comparisons and `_and`/`_or`/`_not` of scalar
+  (`SymInt`) values, e.g. `if` conditions
+- `combine_ops.py`: `hl.reduce` and `hl.associative_scan`/`torch.cumsum` with a
+  combine function, as a sequential `scf.for`
+- `unsupported_ops.py`: Helion operations rejected with their reason (atomics,
+  random numbers, inline code, `device_print`)
 - `load_slice_ops.py`: tile loads; a 1-D index tensor in one dimension gathers
   through the `aten.index.Tensor` helper
-- `memory_ops.py`: getitem and stores (tensor-indexed stores are rejected)
+- `memory_ops.py`: getitem, `_mask_to` and stores (tensor-indexed stores are
+  rejected; a size-1 dim of the value is broadcast into the destination)
 - `contraction_ops.py`: the single lowering for `mm`/`bmm`/`matmul`/`addmm`/
   `baddbmm`, `hl.dot`, captured einsum and `acc + contraction`, matched by
   `analysis/contractions.py`
 - `elementwise_ops.py`: index-scalar binary ops, aliases, Helion's GELU ops
-- `view_ops.py`, `method_ops.py`, `transpose_ops.py`: views and `Tensor` methods
+- `view_ops.py`, `method_ops.py`, `transpose_ops.py`: views, `hl.split`/`hl.join`
+  and `Tensor` methods
 - `emit.py`: shared builders (constants, fills, casts as `linalg.generic`)
 - `subscript_ops.py`: subscripts of device values (slices, new axes, scalar
   positions, gathers)
 - `host_tensor_ops.py`: host arguments and alias materialization
-- `tensor_creation_ops.py`: `full` (also `hl.zeros`)
+- `tensor_creation_ops.py`: `full` (also `hl.zeros`) and `torch.tensor` constants
 - `tile_index_ops.py`: tile positions, `tile.index`, shape queries
 
 `einsum_capture.py` (at the package root) is the one piece that runs *before*
@@ -314,8 +323,10 @@ linalg.generic with custom compute block:
 
 ### Not Yet Implemented
 
-- Scatter stores
-- Host-side `hl.specialize`
+- Scatter stores and tuple inputs of `hl.reduce`/`hl.associative_scan`
+- `if` on a tensor of more than one element
+- Atomics, `hl.rand`, inline assembly/Triton and `device_print` (rejected with
+  the reason)
 - Dynamic shapes
 
 ## Compilation Flow Example

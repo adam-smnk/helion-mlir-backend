@@ -188,11 +188,12 @@ Limits:
   one storage (a host-side view of a written tensor) are separate arguments and
   are rejected by the overlap check. Read-only views of a declared parameter are
   fine (they lower to a reshape of it).
-- A host tensor whose shape depends on a block size
+- A host tensor whose shape is computed from block sizes
   (`torch.zeros((m, n // block_n))` with `block_n = hl.register_block_size(n)`)
-  gets a dynamic MLIR type and fails to lower.
-- Host-side Helion API calls other than `hl.register_block_size` (e.g.
-  `hl.specialize`) are not evaluated in host code yet and raise `NotInsideKernel`.
+  takes the config's block sizes, as the host code does; a shape depending on
+  any other runtime value raises a `DynamicShapeError`.
+- In host code, `hl.specialize` and `hl.register_tunable` become their
+  compile-time values; other Helion API calls there are rejected.
 - No statement other than `hl.barrier()` may appear between two top-level device
   loops (a Helion frontend rule, not backend-specific).
 
@@ -237,6 +238,10 @@ Reorder explicitly instead:
 ```python
 out[tile_p, tile_k, tile_n] = source[tile_k, tile_p, tile_n].permute(1, 0, 2)
 ```
+
+A value of the same rank with size 1 where the slice is wider
+(`out[tm, tn] = x[tm, None]`) is broadcast into the destination, as `tl.store`
+does.
 
 The equivalent `hl.grid()`/`hl.tile()` spellings that index the destination in
 load order (for example `grid(panel) + tile([k, n])`) are supported directly.

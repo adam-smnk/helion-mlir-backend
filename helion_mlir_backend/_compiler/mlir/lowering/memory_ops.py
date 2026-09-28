@@ -29,7 +29,8 @@ if TYPE_CHECKING:
 
 @lowers(operator.getitem)
 def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
-    """Extract one result from an ``scf.for`` result container."""
+    """One result of an ``scf.for``/``scf.while``, a multi-result helper call or
+    another node with :class:`emit.Results`."""
     container_value = ctx.get_value(node.args[0])
     if container_value is None:
         return None
@@ -81,7 +82,19 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
             "store", reason="stores indexed by a tensor (scatter) are not supported"
         )
     element_type = ir.RankedTensorType(state.type).element_type
-    value = _store_value(ctx, node, value_node, element_type, plan)
+    value = ctx.get_value(value_node)
+    if value is None:
+        raise ValueNotFoundError(value_node, context="stored value")
+    if extra_mask is None and _broadcasts(value, plan):
+        # Broadcast straight into the destination slice, never as its own tile.
+        kept = [i for i, dim in enumerate(plan.dims) if not dim.reduces]
+        dest = emit.extract_slice(state, plan.offsets(), plan.sizes())
+        stored = _broadcast(value, dest, kept)
+        ctx.tensors.rebind(
+            name, emit.insert_slice(stored, state, plan.offsets(), plan.sizes())
+        )
+        return
+    value = _store_value(value, element_type, plan)
     if extra_mask is not None or plan.is_partial():
         value = static_reshape(value, plan.value_shape())
     if extra_mask is not None:
@@ -97,30 +110,24 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     )
 
 
-def _store_value(
-    ctx: BuildContext,
-    node: torch.fx.Node,
-    value_node: object,
-    element_type: ir.Type,
-    plan: SlicePlan,
-) -> ir.Value:
+def _store_value(value: ir.Value, element_type: ir.Type, plan: SlicePlan) -> ir.Value:
     """The stored value as a tile of the plan's shape (with or without the reduced
     dims) and the destination dtype."""
-    value = ctx.get_value(value_node)
-    if value is None:
-        raise ValueNotFoundError(value_node, context="stored value")
+    shape = plan.value_shape()
     if not isinstance(value.type, ir.RankedTensorType):
         scalar = emit.cast_scalar(value, element_type)
-        return linalg_d.fill(
-            scalar, outs=[emit.empty(plan.value_shape(), element_type)]
+        return linalg_d.fill(scalar, outs=[emit.empty(shape, element_type)])
+    if _broadcasts(value, plan):
+        return _broadcast(
+            value, emit.empty(shape, element_type), list(range(len(shape)))
         )
-    shape = list(value.type.shape)
-    if shape not in (plan.value_shape(), plan.tile_shape()):
+    value_shape = list(value.type.shape)
+    if value_shape not in (shape, plan.tile_shape()):
         raise UnsupportedOperationError(
             "store with transposed or mismatched tile layout",
             reason=(
-                f"storing a tile of shape {shape} into a slice of shape "
-                f"{plan.value_shape()}; the stored value's tile order does not "
+                f"storing a tile of shape {value_shape} into a slice of shape "
+                f"{shape}; the stored value's tile order does not "
                 "match the order the destination is indexed"
             ),
             alternatives=[
@@ -129,3 +136,53 @@ def _store_value(
             ],
         )
     return emit.cast_tensor(value, element_type)
+
+
+def _broadcasts(value: ir.Value, plan: SlicePlan) -> bool:
+    """A tile of the stored rank with size 1 where the slice is wider (Helion
+    broadcasts it, like ``tl.store``)."""
+    if not isinstance(value.type, ir.RankedTensorType):
+        return False
+    shape, target = list(value.type.shape), plan.value_shape()
+    return (
+        len(shape) == len(target)
+        and shape != target
+        and all(size in (1, extent) for size, extent in zip(shape, target, strict=True))
+    )
+
+
+def _broadcast(value: ir.Value, dest: ir.Value, dest_dims: list[int]) -> ir.Value:
+    """``dest`` overwritten by ``value`` broadcast along its size-1 dims and cast to
+    ``dest``'s dtype; value dim ``j`` is ``dest`` dim ``dest_dims[j]``."""
+    dest_type = ir.RankedTensorType(dest.type)
+    rank = dest_type.rank
+    value_map = ir.AffineMap.get(
+        rank,
+        0,
+        [
+            ir.AffineConstantExpr.get(0) if size == 1 else ir.AffineDimExpr.get(dim)
+            for size, dim in zip(
+                ir.RankedTensorType(value.type).shape, dest_dims, strict=True
+            )
+        ],
+    )
+    parallel = ir.Attribute.parse("#linalg.iterator_type<parallel>")
+    generic = linalg_d.GenericOp(
+        [dest_type],
+        [value],
+        [dest],
+        ir.ArrayAttr.get(
+            [
+                ir.AffineMapAttr.get(value_map),
+                ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank)),
+            ]
+        ),
+        ir.ArrayAttr.get([parallel] * rank),
+    )
+    element_type = dest_type.element_type
+    body = generic.regions[0].blocks.append(
+        ir.RankedTensorType(value.type).element_type, element_type
+    )
+    with ir.InsertionPoint(body):
+        linalg_d.YieldOp([emit.cast_scalar(body.arguments[0], element_type)])
+    return generic.result

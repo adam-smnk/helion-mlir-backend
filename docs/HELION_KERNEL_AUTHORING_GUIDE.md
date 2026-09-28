@@ -474,7 +474,6 @@ pre-lowering dump around a direct kernel call.
 | `output tile larger than the destination dimension` | Wrong loop/block ID resolution or mismatched tile geometry | Compare loop extent and output slice sizes |
 | `store with transposed or mismatched tile layout` | Value axes and destination axes are in different orders | Add an explicit `.permute(...)` or align indexing |
 | Segmentation fault during insert/store | Invalid slice geometry reached low-level code | Reproduce with current guards and inspect insert sizes |
-| Failure only on a partial combined tile | Combined tile does not evenly divide an iterated extent | Choose a divisor block size or split the loops |
 | Phase dependency error | Missing `hl.barrier()` between dependent top-level loops | Add the barrier immediately between loops |
 | Source inspection error | Kernel was defined dynamically or in an unavailable source context | Move it to a real `.py` file |
 | Correct shape assertion but wrong values | Test data is symmetric or the axis order is wrong | Use random nonsymmetric tensors and `torch.testing.assert_close` |

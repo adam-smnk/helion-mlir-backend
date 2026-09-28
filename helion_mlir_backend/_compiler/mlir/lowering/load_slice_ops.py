@@ -16,6 +16,7 @@ from ..support import ValueNotFoundError
 from . import emit
 from .registry import lowers
 from .subscript_ops import gather
+from .view_ops import static_reshape
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
@@ -42,7 +43,9 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if tensor_value is None:
         raise ValueNotFoundError(tensor_node, context="loaded tensor")
 
-    plan = plan_slice(ctx, index_nodes, tensor_value, owned)
+    plan = plan_slice(
+        ctx, [item for item in index_nodes if item is not None], tensor_value, owned
+    )
     loaded = load_tile(tensor_value, plan)
     gathers = plan.gathers()
     if gathers:
@@ -56,11 +59,28 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         reduced = plan.reduced_dims()
         position = dimension - sum(1 for dim in reduced if dim < dimension)
         loaded = gather(ctx, node, loaded, [slice(None)] * position + [index])
+    if None in index_nodes:
+        loaded = static_reshape(loaded, _with_new_axes(loaded, index_nodes, plan))
     if extra_mask is None:
         return loaded
     return call_helper(
         ctx, node, torch.ops.aten.where.ScalarOther, (extra_mask, loaded, 0), {}
     )
+
+
+def _with_new_axes(
+    loaded: ir.Value, index_nodes: list[object], plan: SlicePlan
+) -> list[int]:
+    """The shape of ``loaded`` with a unit dim at each ``None`` of the index."""
+    sizes = iter(ir.RankedTensorType(loaded.type).shape)
+    dims = iter(plan.dims)
+    shape = []
+    for item in index_nodes:
+        if item is None:
+            shape.append(1)
+        elif not next(dims).reduces:
+            shape.append(next(sizes))
+    return shape + list(sizes)
 
 
 def load_tile(tensor: ir.Value, plan: SlicePlan) -> ir.Value:

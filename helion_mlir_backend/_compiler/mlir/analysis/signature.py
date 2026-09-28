@@ -22,9 +22,9 @@ import torch.fx
 
 from ..support.block_ids import block_id_from_key
 from ..support.block_ids import symbol_origin_info
-from .geometry import is_loop_node
 from .tensor_effects import accessed_tensor
 from .tensor_effects import host_tensor_name
+from .tensor_effects import subgraph_ids
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -149,11 +149,11 @@ class KernelSignature:
 
 
 def _program_order(hf: HostFunction, graph_id: int) -> Iterator[torch.fx.Node]:
-    """The graph's nodes, with each loop body's nodes at its loop node."""
+    """The graph's nodes, with each subgraph's nodes at its loop, if or while node."""
     for node in hf.device_ir.graphs[graph_id].graph.nodes:
         yield node
-        if node.op == "call_function" and is_loop_node(node):
-            yield from _program_order(hf, node.args[0])
+        for subgraph_id in subgraph_ids(node):
+            yield from _program_order(hf, subgraph_id)
 
 
 def _stored(nodes: list[torch.fx.Node]) -> set[str]:

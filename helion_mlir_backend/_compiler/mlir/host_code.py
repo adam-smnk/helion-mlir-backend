@@ -6,8 +6,9 @@ runs on every call around the device kernel launch (see
 function is a copy of the kernel's AST body in which the top-level device loops
 (``ast.For`` tagged ``LoopType.GRID``; Helion requires them at top level, with
 only ``hl.barrier()`` between them) become one ``yield locals()``, and every
-host-side block size (``hl.register_block_size``) becomes the config's value,
-as in Helion's host codegen. The driver runs it to the ``yield``, calls the
+host-side block size (``hl.register_block_size``), ``hl.specialize`` and
+``hl.register_tunable`` becomes its compile-time value, as in Helion's host
+codegen. The driver runs it to the ``yield``, calls the
 compiled kernel with tensors taken from the yielded locals, then resumes it; the
 generator's return value is the kernel's return value.
 """
@@ -19,16 +20,22 @@ import copy
 from typing import TYPE_CHECKING
 from typing import Callable
 
+from .support import UnsupportedOperationError
+
 if TYPE_CHECKING:
     from collections.abc import Generator
 
     from helion._compiler.host_function import HostFunction
+    from helion.runtime.config import Config
 
 
 def build_host_function(
-    hf: HostFunction, block_size: Callable[[int], int]
+    hf: HostFunction, block_size: Callable[[int], int], config: Config | None = None
 ) -> Callable[..., Generator[dict[str, object], None, object]]:
-    """Compile *hf*'s host code; ``hf.body`` is not modified."""
+    """Compile *hf*'s host code; ``hf.body`` is not modified.
+
+    ``config`` gives the values of ``hl.register_tunable`` calls.
+    """
     body: list[ast.stmt] = []
     yielded = False
     for stmt in hf.body:
@@ -37,7 +44,7 @@ def build_host_function(
                 body.append(ast.copy_location(_yield_locals(), stmt))
                 yielded = True
             continue
-        body.append(_HostCode(block_size).visit(stmt))
+        body.append(_HostCode(block_size, config).visit(stmt))
     if not yielded:
         body.append(_yield_locals())
 
@@ -82,14 +89,15 @@ def _yield_locals() -> ast.stmt:
 
 
 class _HostCode(ast.NodeTransformer):
-    """Copy a host statement, replacing block-size expressions by config values.
+    """Copy a host statement, replacing compile-time Helion values by constants.
 
     Every visited node is shallow-copied (with its list fields) before its
     children are transformed, so Helion's own AST stays intact.
     """
 
-    def __init__(self, block_size: Callable[[int], int]) -> None:
+    def __init__(self, block_size: Callable[[int], int], config: Config | None) -> None:
         self.block_size = block_size
+        self.config = config
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
         from helion._compiler.ast_extension import ExtendedAST
@@ -119,4 +127,32 @@ class _HostCode(ast.NodeTransformer):
                 for item in type_info.unpack()
             ]
             return ast.copy_location(ast.List(elts=sizes, ctx=ast.Load()), node)
+        api = _api_function(node)
+        if api is not None:
+            return ast.copy_location(self._api_value(api, node), node)
         return self.generic_visit(node)
+
+    def _api_value(self, api: object, node: ast.Call) -> ast.expr:
+        from helion.language.constexpr import _convert_specializable
+        from helion.language.constexpr import specialize
+        from helion.language.tunable_ops import register_tunable
+
+        if api is specialize:
+            value = _convert_specializable(node.args[0]._type_info.proxy())
+        elif api is register_tunable and self.config is not None:
+            value = self.config[node.args[0]._type_info.proxy()]
+        else:
+            raise UnsupportedOperationError(
+                f"hl.{api.__name__}", reason="not supported in host code"
+            )
+        return ast.parse(repr(value), mode="eval").body
+
+
+def _api_function(node: ast.Call) -> object | None:
+    from helion._compiler.type_info import CallableType
+    from helion.language._decorators import is_api_func
+
+    func_type = getattr(node.func, "_type_info", None)
+    if isinstance(func_type, CallableType) and is_api_func(func_type.value):
+        return func_type.value
+    return None

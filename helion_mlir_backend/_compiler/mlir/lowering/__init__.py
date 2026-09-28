@@ -5,8 +5,11 @@ Importing this package registers every handler with :mod:`.registry`.
 
 from __future__ import annotations
 
+from . import combine_ops as combine_ops
 from . import contraction_ops as contraction_ops
 from . import elementwise_ops as elementwise_ops
+from . import scalar_ops as scalar_ops
+from . import unsupported_ops as unsupported_ops
 from . import view_ops as view_ops
 from .control_flow import build_phase_body
 from .control_flow import lower_nested_for_loop

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 
 import helion
+from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 import torch
 
@@ -117,6 +118,24 @@ def test_host_block_size_resolves_to_config_value():
 
     assert next(host)["block_n"] == 8
     assert _finish(host).shape == (4, 2)
+
+
+def test_host_specialize_and_tunable_become_constants():
+    @helion.kernel(static_shapes=True)
+    def specialized(x: torch.Tensor) -> torch.Tensor:
+        n = hl.specialize(x.size(1))
+        chunks = hl.register_tunable("chunks", PowerOfTwoFragment(1, 8, 2))
+        out = torch.zeros((x.size(0), n * chunks), dtype=x.dtype, device=x.device)
+        for tm in hl.tile(x.size(0)):
+            out[tm, :n] = x[tm, :]
+        return out
+
+    x = torch.randn(4, 6)
+    hf = _compile_host_function(specialized.fn, [x])
+    config = helion.Config(chunks=4)
+    local_vars = next(build_host_function(hf, _no_block_sizes, config)(x))
+
+    assert (local_vars["n"], local_vars["chunks"]) == (6, 4)
 
 
 def test_kernel_without_return_returns_none():

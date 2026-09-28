@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from mlir.dialects import affine as affine_d
 from mlir.dialects import arith as arith_d
 from mlir.dialects import linalg as linalg_d
@@ -116,6 +118,13 @@ def cast_tensor(value: ir.Value, element_type: ir.Type) -> ir.Value:
 
 Size = int | ir.Value
 """A static size, or an ``index`` value for a dynamic one."""
+
+
+@dataclass
+class Results:
+    """Several values of one node, read by ``getitem``."""
+
+    results: list[ir.Value]
 
 
 def affine_min(results: list[ir.AffineExpr], operands: list[ir.Value]) -> ir.Value:

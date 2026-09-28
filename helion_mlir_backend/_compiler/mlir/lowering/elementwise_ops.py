@@ -71,7 +71,12 @@ def lower_scalar_binary(ctx: BuildContext, node: torch.fx.Node) -> object:
     )
 
 
-@lowers(aten.alias.default, aten.detach.default, aten.clone.default)
+@lowers(
+    aten.alias.default,
+    aten.detach.default,
+    aten.clone.default,
+    aten.lift_fresh_copy.default,
+)
 def lower_passthrough(ctx: BuildContext, node: torch.fx.Node) -> object:
     """Value-semantics aliases: tensors are immutable SSA values."""
     source = node.args[0] if node.args else None

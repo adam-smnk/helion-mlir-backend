@@ -56,7 +56,9 @@ def compile_kernel(
     with env:
         builder = MLIRModuleBuilder(hf, config, env)
         module = builder.build()
-        host_function = build_host_function(hf, builder.context.geometry.block_size)
+        host_function = build_host_function(
+            hf, builder.context.geometry.block_size, config
+        )
     entry = compile_entry(module, hf.name, pipeline=pipeline)
     host_globals = host_function.__globals__
     arg_exprs = [

@@ -1,8 +1,9 @@
 """Regression probes from the backend review (docs/MLIR_BACKEND_REVIEW_PLAN.md, section 2).
 
-Each test documents a known gap as a strict xfail tagged with its issue id. The phase
-that fixes an issue removes its marker; a probe that starts passing without that change
-fails the suite (strict), so fixes cannot land unnoticed.
+Each probe was a known gap, a strict xfail tagged with its issue id, until the phase
+that fixed it; all pass now. A new gap gets a probe marked
+``[pytest.mark.xfail(strict=True, reason="I<n>: ..."), pytest.mark.isolated]``
+(isolated because gaps can crash natively).
 """
 
 from __future__ import annotations
@@ -23,11 +24,6 @@ if TYPE_CHECKING:
 
 def _cfg(*block_sizes: int) -> helion.Config:
     return helion.Config(block_sizes=list(block_sizes))
-
-
-def _known_gap(issue: str) -> list[pytest.MarkDecorator]:
-    # Known gaps can crash natively (e.g. out-of-bounds ragged tiles), so they run isolated.
-    return [pytest.mark.xfail(strict=True, reason=issue), pytest.mark.isolated]
 
 
 @helion.kernel(backend="mlir", static_shapes=True, config=_cfg(16))
@@ -177,6 +173,25 @@ def dot_matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="mlir", static_shapes=True, config=_cfg(16, 16))
+def broadcast_store_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), y.size(0)], dtype=y.dtype, device=x.device)
+    for tm, tn in hl.tile(out.size()):
+        out[tm, tn] = x[tm, None]
+    return out
+
+
+@helion.kernel(backend="mlir", static_shapes=True, config=_cfg(8, 4))
+def block_sums_kernel(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.zeros((m, n // block_n), dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        for tn in hl.tile(n, block_size=block_n):
+            out[tm, tn.id] = x[tm, tn].sum(-1)
+    return out
+
+
 def _nested_and_outer_store_reference(x: torch.Tensor) -> torch.Tensor:
     out = x + 1.0
     out[:, 0] = 0.0
@@ -251,6 +266,16 @@ _CASES: dict[
         torch.matmul,
         lambda: [torch.randn(32, 16), torch.randn(16, 32)],
     ),
+    "broadcast_store": (
+        broadcast_store_kernel,
+        lambda x, y: x[:, None].expand(x.size(0), y.size(0)).to(y.dtype),
+        lambda: [torch.randn(32), torch.randn(40, dtype=torch.bfloat16)],
+    ),
+    "block_size_host_shape": (
+        block_sums_kernel,
+        lambda x: x.view(x.size(0), -1, 8).sum(-1),
+        lambda: [torch.randn(8, 32)],
+    ),
 }
 
 
@@ -265,10 +290,12 @@ _CASES: dict[
         "acc_plus_addmm",
         "store_then_load",
         "nested_and_outer_store",
-        pytest.param("tile_if", marks=_known_gap("I19: _if unsupported")),
+        "tile_if",
         "partial_write",
         "non_contiguous_input",
         "hl_dot",
+        "broadcast_store",
+        "block_size_host_shape",
     ],
 )
 def test_review_probe(case: str) -> None:

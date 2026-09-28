@@ -1,7 +1,7 @@
 """Host tensors loaded and stored by each device graph (read-only analysis).
 
 A host tensor is identified by its ``_host_tensor(name)`` name. Effects are
-transitive through nested ``_for_loop``/``_for_loop_step`` bodies.
+transitive through nested loop, ``if`` and ``while`` bodies.
 """
 
 from __future__ import annotations
@@ -43,6 +43,24 @@ def accessed_tensor(node: torch.fx.Node) -> str | None:
     return None
 
 
+def subgraph_ids(node: torch.fx.Node) -> list[int]:
+    """The device graphs a loop, ``_if`` or ``_while_loop`` node runs."""
+    if node.op != "call_function":
+        return []
+    if is_loop_node(node):
+        return [node.args[0]]
+    if node.target is tracing_ops._if:
+        return [node.args[1], node.args[2]]
+    if node.target is tracing_ops._while_loop:
+        cond_id, body_id, _, *orelse = node.args
+        return [
+            cond_id,
+            body_id,
+            *(graph_id for graph_id in orelse if graph_id is not None),
+        ]
+    return []
+
+
 @dataclass
 class TensorEffects:
     hf: HostFunction
@@ -62,14 +80,14 @@ class TensorEffects:
         return effects
 
     def accesses(self, graph_id: int) -> list[torch.fx.Node]:
-        """Every ``load``/``store`` of a host tensor in the graph and its loop bodies."""
+        """Every ``load``/``store`` of a host tensor in the graph and its subgraphs."""
         if graph_id not in self._accesses:
             found: list[torch.fx.Node] = []
             for node in self.hf.device_ir.graphs[graph_id].graph.nodes:
                 if accessed_tensor(node) is not None:
                     found.append(node)
-                elif node.op == "call_function" and is_loop_node(node):
-                    found.extend(self.accesses(node.args[0]))
+                for subgraph_id in subgraph_ids(node):
+                    found.extend(self.accesses(subgraph_id))
             self._accesses[graph_id] = found
         return self._accesses[graph_id]
 
