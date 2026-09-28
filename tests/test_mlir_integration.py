@@ -406,9 +406,9 @@ class TestScalarBlockIndices:
         exact_ir = str(generate_mlir(exact, [torch.randn(64, 32)], config=bs))
 
         assert "arith.addi" in ragged_ir
-        assert "arith.minsi" in ragged_ir, "ragged extent must clamp the last tile"
+        assert "affine.min" in ragged_ir, "ragged extent must clamp the last tile"
         assert "arith.addi" in exact_ir
-        assert "arith.minsi" not in exact_ir, "evenly divided extent needs no clamp"
+        assert "affine.min" not in exact_ir, "evenly divided extent needs no clamp"
 
     def test_tile_id_divides_by_block_size(self):
         """`tile.id` of an outer tile is the normalized forall IV (offset / block_size)."""

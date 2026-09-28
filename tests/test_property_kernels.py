@@ -9,12 +9,8 @@ of hand-picked shapes.
 A combined-2D-tile + nested-reduction-accumulator fuzz test (varying m/n/k
 and block sizes for a tiled matmul) found and fixed two real bugs (block-id
 collision in codegen.py's upper-bound pre-pass; a missing upper-bound clamp
-in build_context.shape_from_nodes) and then root-caused a third, deeper
-architectural gap: the outer combined-tile ``scf.forall`` has no dynamic
-per-iteration clamp for a ragged (non-evenly-divisible) boundary tile, and
-previously crashed with heap corruption instead of failing cleanly.
-``build_kernel_body`` now raises a clear ``UnsupportedOperationError`` for
-that case instead -- see repo/session memory for the full investigation.
+in build_context.shape_from_nodes) and exposed ragged (non-evenly-divisible)
+boundary tiles, which are now padded on load and partially stored.
 """
 
 from __future__ import annotations
@@ -31,7 +27,6 @@ import torch
 
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
-from helion_mlir_backend._compiler.mlir.support.errors import UnsupportedOperationError
 
 # Derandomized + bounded: deterministic across CI runs, small enough to keep
 # per-run compile cost (each example does a full MLIR compile) reasonable.
@@ -61,10 +56,11 @@ def _use_scalar_pipeline(monkeypatch):
     monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
 
 
+@pytest.mark.isolated
 @given(
-    m=st.sampled_from([8, 16, 32, 48]),
-    n=st.sampled_from([8, 16, 32, 48]),
-    k=st.sampled_from([8, 16, 32]),
+    m=st.sampled_from([8, 20, 32, 48]),
+    n=st.sampled_from([8, 16, 36, 48]),
+    k=st.sampled_from([8, 20, 32]),
     bm=st.sampled_from(_BLOCK_SIZES),
     bn=st.sampled_from(_BLOCK_SIZES),
     bk=st.sampled_from(_BLOCK_SIZES),
@@ -73,13 +69,8 @@ def _use_scalar_pipeline(monkeypatch):
 def test_combined_tile_matmul_random_shapes(
     m: int, n: int, k: int, bm: int, bn: int, bk: int
 ) -> None:
-    """Combined 2D tile + nested reduction across randomized shapes/blocks.
-
-    No constraint on block sizes vs dimensions: a ragged (non-evenly-
-    divisible, multi-iteration) combined-tile dimension is an accepted,
-    cleanly-diagnosed limitation (asserted below), not a crash; everything
-    else must compile and execute to numerical parity with eager torch.
-    """
+    """Combined 2D tile + nested reduction across randomized shapes/blocks,
+    including ragged ones."""
 
     @helion.kernel(static_shapes=True)
     def mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -97,13 +88,7 @@ def test_combined_tile_matmul_random_shapes(
     x = torch.randn(m, k)
     y = torch.randn(k, n)
     config = helion.Config(block_sizes=[bm, bn, bk])
-    ragged = (bm < m and m % bm != 0) or (bn < n and n % bn != 0)
-    try:
-        module = generate_mlir(mm, [x, y], config=config)
-    except UnsupportedOperationError as exc:
-        assert ragged, f"unexpected compile failure for a non-ragged case: {exc}"
-        assert "ragged" in str(exc).lower()
-        return
+    module = generate_mlir(mm, [x, y], config=config)
     actual = MLIRBackend().execute_mlir(module, x, y, kernel_name="mm")
     torch.testing.assert_close(actual, x @ y, atol=1e-3, rtol=1e-3)
 

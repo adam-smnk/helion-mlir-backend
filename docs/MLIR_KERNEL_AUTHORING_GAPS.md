@@ -385,10 +385,8 @@ synthetic accumulator store context; previously the A slice used the outer
 panel IV for both dimensions, effectively loading `A[panel, panel]` instead of
 `A[tile_k, tile_m]`.
 
-Ragged K tails in a tiled contraction remain open: with `K=96` and `TK=64`,
-the final iteration currently still emits a fixed 64-wide contraction instead
-of a 32-wide tail. The packed-RHS regression therefore covers exact K-tile
-sizes, while existing copy tests cover ragged slice metadata separately.
+Ragged K tails in a tiled contraction are zero-padded on load, so the final
+64-wide iteration of `K=96`, `TK=64` contributes only the 32 real columns.
 
 A standalone f32 reproducer is available in `helion_block_packed_f32_repro.py`.
 With `SIZE=128`, `BLOCK_M=32`, `BLOCK_N=32`, `BLOCK_K=64`,
@@ -605,4 +603,5 @@ eager `permute().contiguous()` (~2.3 ms at 4K, 4 threads).
   - `grid(mb) → tile([bm, np])` (grid + a single combined 2D tile) — covered by `test_grid_combined_2d_tile_execute_mlir`.
 - **Dimension-reordering transpose in a combined tile — resolved, not a gap**: an *implicit* reorder via differing load/store index order (e.g. `out[m,tm,tp,:] = src[m,tp,tm,:]`, swapping `tm`/`tp`) is genuinely invalid Helion syntax when the swapped dims differ in size — Helion's own frontend type-checks the assigned value's shape against the store's expected shape and would reject a real mismatch (an earlier test of this only "passed" the frontend by degenerate luck, using a block size of 1 for one dim). The *correct*, already-fully-supported way to write this is an **explicit** `.permute()`/`.transpose()`/`.t()` call — Helion's device IR already represents these as standard `aten.permute`/`aten.transpose` ops, and the backend already has a dedicated `linalg.transpose` lowering (`transpose_ops.py`) for them. Investigating this surfaced a real, narrower, pre-existing bug: `aten_lowering.py::_fake_tensor_from_load_node` (used only when building torch-mlir "ATen helper" subgraphs) reconstructed a load's shape by counting index positions **without dropping scalar-indexed (grid/`tile.begin`/literal-int) dimensions**, disagreeing with the load's real (correctly rank-reduced) `meta['val']` — this broke any ATen op consuming a scalar-indexed load's result directly, not just permute in a combined tile. Fixed to drop scalar-indexed dims the same way `plan_slice`/`ctx.is_scalar_index_node` already do elsewhere. Covered by `test_scalar_grid_index_transpose_execute_mlir` (minimal case) and `test_grid_combined_2d_tile_explicit_transpose_execute_mlir` (the original motivating case).
 - **Combined multi-dim tile with an external loop-carried accumulator — resolved, not a gap**: verified empirically (device-IR dumps + an executing numerical test) that Helion's device IR *never* attaches a carried accumulator directly to a combined `hl.tile([a, b])`'s own `_for_loop` node — every dimension in a combined tile is parallel by construction, a genuine reduction always gets its own separate single-block `_for_loop` nested inside (already fully supported), and host tensors read inside a combined tile are re-materialized via `_host_tensor`, never lifted as iter-args. The realistic pattern (`grid → tile([m, n]) → tile(k)` batched matmul) already executes correctly and is covered by `test_grid_combined_tile_separate_reduction_execute_mlir`. The `NodeLoweringError` guard for the non-empty-iter-args case is kept as a defensive assertion (documented as unreachable on current Helion IR) rather than removed outright.
-- Ragged K-dimension handling (K not exact multiple of TK) remains open as a separate issue.
+- Ragged K-dimension handling (K not exact multiple of TK): resolved, the tail
+  tile is zero-padded (`tests/test_ragged_tiles.py`).

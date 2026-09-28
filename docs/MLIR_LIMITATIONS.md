@@ -111,9 +111,10 @@ Current behavior:
   modified and is used only for dtypes, ranks and symbol origins.
 
 Consequence:
-- A tile shape is `min(block size, dimension)`. Where Helion expects a full
-  block for a ragged last tile, shapes differ until ragged tiles are padded and
-  masked (plan Phase 6).
+- A tile's static extent is its block size, or the loop's length when that is
+  smaller (one tile then covers the loop exactly, unlike Helion's padded block).
+  The block-size symbol (`tile_m` in `hl.zeros([tile_m])` or `x.view(tile_m, -1)`)
+  has that same value.
 
 ## 7) Source Availability Requirement
 
@@ -133,24 +134,21 @@ Recommended workflow:
 - Use `HELION_MLIR_DUMP_PRE_LOWERING=1`.
 - Reproduce with targeted tests in `tests/test_mlir_execution.py`.
 
-## 9) Ragged Combined-Tile Boundary Is Not Dynamically Clamped
+## 9) Ragged (Boundary) Tiles
 
-Current requirement:
-- For a combined multi-dimensional tile (e.g. `for tm, tn in hl.tile([m, n])`),
-  every dimension whose block size needs more than one iteration must evenly
-  divide that dimension's extent.
+Current behavior:
+- A tile whose loop or tensor ends inside it is partial: loads read its real
+  part and zero-pad the rest (`tensor.pad`), `_mask_to` sets the padding to the
+  reduction identity, and stores write only the real part. This matches
+  Helion's masked loads and stores. `extra_mask` zeroes loaded elements and
+  skips stored ones.
+- A load past the end of a tensor smaller than the iteration domain reads zeros.
+- When every block size divides its loop and the loops stay inside the tensors,
+  the IR has only static sizes.
 
-Why:
-- The outer `scf.forall` emits one statically-sized extract/insert per
-  iteration with no per-iteration dynamic clamp for a ragged (partial) last
-  tile. A single-dimension `hl.tile()` does not have this restriction; its own
-  `tile.end`-based dynamic clamp already handles raggedness correctly.
-
-Consequence:
-- Compiling such a kernel raises a clear `UnsupportedOperationError` ("ragged
-  combined-tile block size") instead of miscompiling.
-- Workaround: choose a block size that evenly divides the dimension, or
-  restructure the loop so that dimension needs only one iteration.
+Limits:
+- A tile offset that may point before the start of a tensor (`x[tile.index - 1]`
+  style negative offsets from the first tile) is rejected.
 
 ## 10) Multi-Output Kernels
 

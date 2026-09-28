@@ -263,6 +263,12 @@ tensor.extract_slice(out, offsets=[tile_m, tile_n], sizes=[...], strides=[1, 1])
 tensor.parallel_insert_slice(value, out, offsets=[...], sizes=[...])
 ```
 
+When a loop or tensor ends inside a tile, the slice size is its real part,
+`affine.min(tile, end - offset)`: a load extracts that part and `tensor.pad`s it
+with zeros to the static tile, `_mask_to` selects the reduction identity past
+it, and a store extracts it from the value before inserting. Divisible extents
+keep static sizes.
+
 #### 3. **Accumulation Pattern**
 ```python
 acc = hl.zeros([m, n])
@@ -308,7 +314,6 @@ linalg.generic with custom compute block:
 
 ### Not Yet Implemented
 
-- Ragged tiles (masking, `extra_mask`)
 - Scatter stores
 - Host-side `hl.specialize`
 - Dynamic shapes

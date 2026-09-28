@@ -257,11 +257,9 @@ _CASES: dict[
 @pytest.mark.parametrize(
     "case",
     [
-        pytest.param(
-            "ragged_elementwise", marks=_known_gap("I18: ragged tile out of bounds")
-        ),
-        pytest.param("ragged_k_matmul", marks=_known_gap("I18: ragged K reads OOB")),
-        pytest.param("ragged_row_max", marks=_known_gap("I18: ragged reduction")),
+        "ragged_elementwise",
+        "ragged_k_matmul",
+        "ragged_row_max",
         "row_softmax",
         "where_relu",
         "acc_plus_addmm",

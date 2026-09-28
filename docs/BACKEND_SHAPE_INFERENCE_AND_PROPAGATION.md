@@ -18,17 +18,21 @@ as the shape of emitted IR.
 1. **Host tensors**: the kernel's arguments have static shapes
    (`static_shapes=True`), which become the function argument types.
 2. **Tiles**: `KernelGeometry` takes each block id's block size from the config
-   and its loop span from the loop bounds. A tile's extent is
-   `min(block size, span)` (`tile_extent`).
+   and its loop span from the loop bounds. A tile's static extent is
+   `min(block size, span)` (`tile_extent`), and so is the value of its block-size
+   symbol.
 3. **Loads and stores**: `plan_slice` maps each index to a dimension slice
-   (tile, scalar position, static slice, or gather) and gives static slice sizes.
+   (tile, scalar position, static slice, or gather) with the tile's static
+   extent and the size of its real part: smaller, possibly dynamic, when the
+   loop or the tensor ends inside the tile (`tile_window`; the loop's part is
+   `BuildContext.block_id_to_valid`). Loads zero-pad to the static extent.
    Block ids come from `resolve_index_descriptor`, which reads Helion's
    `meta['tile_with_offset']`, symbol origins (`HostFunction.expr_to_origin`),
    `_get_symnode('block_size_N')` keys and the symbol of a `sym_size.int`
    operand's dimension.
 4. **Creation ops** (`hl.zeros`, `hl.full`): `shape_from_nodes` accepts ints,
-   block sizes (as tile extents) and values that lowered to constants. Anything
-   else raises a `DynamicShapeError`.
+   tile extents and values that lowered to constants. Anything else raises a
+   `DynamicShapeError`.
 5. **Everything else** follows from the operands' MLIR types:
    - ATen helpers: running the op on meta tensors of the operand types gives the
      result types (`infer_results`); the helper signature is the call site's.
@@ -41,8 +45,8 @@ as the shape of emitted IR.
 
 - A torch-mlir helper whose lowered signature differs from the call site's
   raises an `UnsupportedOperationError` at the node's source line.
-- Ragged tiles have extent `min(block size, span)`, where Helion expects a full
-  masked block (see `docs/MLIR_LIMITATIONS.md`, sections 6 and 9).
+- A tile shorter than its block (one tile covering a short loop) has the loop's
+  length, where Helion pads to the block (see `docs/MLIR_LIMITATIONS.md`, 6).
 - A shape expression without a static value raises a `DynamicShapeError`.
 
 ## Debugging

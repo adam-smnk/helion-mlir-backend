@@ -284,27 +284,11 @@ transformation occurs in a supported device-side operation.
 
 ## 6. Combined Tiles and Ragged Boundaries
 
-A combined multi-dimensional tile such as:
-
-```python
-for tile_m, tile_n in hl.tile([m, n]):
-    out[tile_m, tile_n] = ...
-```
-
-uses a statically shaped slice for each outer iteration in the MLIR backend.
-For dimensions that require multiple iterations, choose block sizes that evenly
-divide the corresponding extents. Otherwise the final partial tile may not be
-representable by the current `scf.forall` slice geometry.
-
-A single-dimensional `hl.tile()` has more flexible ragged-tile handling. If a
-combined tile does not divide cleanly, consider:
-
-- choosing a divisor block size;
-- moving one dimension to a separate loop; or
-- restructuring the operation so only one dimension is tiled together.
-
-The backend reports unsupported ragged combined tiles instead of silently
-clamping an invalid static slice.
+Block sizes need not divide the extents. A partial last tile, in combined
+(`hl.tile([m, n])`) and single-dimension tiles alike, is loaded zero-padded,
+masked before reductions and stored only where it is real, as in Helion's
+masked loads and stores. Block sizes that divide the extents keep the IR free of
+dynamic sizes, which is cheaper.
 
 ## 7. Static Shapes and Kernel Structure
 

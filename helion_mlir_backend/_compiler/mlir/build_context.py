@@ -55,6 +55,9 @@ class BuildContext:
     block_id_to_bounds: dict[int, tuple[int | ir.Value, int | ir.Value]] = field(
         default_factory=dict
     )
+    # Elements of the current tile inside its loop, for loops whose last tile is
+    # partial (Helion's tile mask); absent when every tile is full.
+    block_id_to_valid: dict[int, int | ir.Value] = field(default_factory=dict)
     # Normalized (unit-step) trip index of an outer forall dimension, when known.
     block_id_to_trip_iv: dict[int, ir.Value] = field(default_factory=dict)
     tensors: TensorState = field(default_factory=TensorState)
@@ -124,7 +127,7 @@ class BuildContext:
     def shape_from_nodes(
         self, shape_nodes: list, operation_name: str = "op"
     ) -> list[int]:
-        """Static dims of a shape list: ints, block sizes (as tile extents) or constants."""
+        """Static dims of a shape list: ints, tile extents or constants."""
         import torch.fx
 
         shape: list[int] = []
@@ -193,9 +196,52 @@ class BuildContext:
         self.param_to_value.clear()
         self.block_id_to_iv.clear()
         self.block_id_to_bounds.clear()
+        self.block_id_to_valid.clear()
         self.block_id_to_trip_iv.clear()
         self.tensors.clear()
         self.scalars.clear()
+
+    def bind_loop(
+        self,
+        block_id: int,
+        offset: ir.Value,
+        bounds: tuple[int | ir.Value, int | ir.Value],
+    ) -> None:
+        """Make ``offset`` the current tile of ``block_id`` in a loop over ``bounds``."""
+        self.block_id_to_iv[block_id] = offset
+        self.block_id_to_bounds[block_id] = bounds
+        valid = self._valid_size(block_id, offset, *bounds)
+        if valid is None:
+            self.block_id_to_valid.pop(block_id, None)
+        else:
+            self.block_id_to_valid[block_id] = valid
+
+    def _valid_size(
+        self,
+        block_id: int,
+        offset: ir.Value,
+        begin: int | ir.Value,
+        end: int | ir.Value,
+    ) -> int | ir.Value | None:
+        """``min(tile, end - offset)``, or ``None`` if every tile is full."""
+        from .lowering import emit
+
+        if self.geometry.is_grid(block_id):
+            return None
+        size = self.geometry.tile_extent(block_id)
+        d0, d1 = ir.AffineDimExpr.get(0), ir.AffineDimExpr.get(1)
+        if isinstance(begin, int) and isinstance(end, int):
+            if (end - begin) % size == 0:
+                return None
+            if end - begin < size:
+                return end - begin
+            return emit.affine_min(
+                [ir.AffineConstantExpr.get(size), ir.AffineConstantExpr.get(end) - d0],
+                [offset],
+            )
+        return emit.affine_min(
+            [ir.AffineConstantExpr.get(size), d1 - d0], [offset, self.as_index(end)]
+        )
 
     @contextmanager
     def enter_for_loop(
@@ -205,18 +251,20 @@ class BuildContext:
         bounds: tuple[int | ir.Value, int | ir.Value],
     ) -> Generator[None]:
         """Bind a loop induction variable and bounds, restoring the previous ones."""
-        previous = self.block_id_to_iv.get(block_id)
-        previous_bounds = self.block_id_to_bounds.get(block_id)
-        self.block_id_to_iv[block_id] = induction_variable
-        self.block_id_to_bounds[block_id] = bounds
+        saved = [
+            (table, table.get(block_id))
+            for table in (
+                self.block_id_to_iv,
+                self.block_id_to_bounds,
+                self.block_id_to_valid,
+            )
+        ]
+        self.bind_loop(block_id, induction_variable, bounds)
         try:
             yield
         finally:
-            if previous is None:
-                self.block_id_to_iv.pop(block_id, None)
-            else:
-                self.block_id_to_iv[block_id] = previous
-            if previous_bounds is None:
-                self.block_id_to_bounds.pop(block_id, None)
-            else:
-                self.block_id_to_bounds[block_id] = previous_bounds
+            for table, previous in saved:
+                if previous is None:
+                    table.pop(block_id, None)
+                else:
+                    table[block_id] = previous

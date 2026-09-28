@@ -42,7 +42,8 @@ class BlockGeometry:
 
     @property
     def tile_extent(self) -> int:
-        """Static size of one iteration's slice (``hl.grid`` dims are indexed as scalars)."""
+        """Static size of a tile: the block size, or the span if that is smaller
+        (a single tile then covers the loop exactly)."""
         if self.span is None:
             return self.block_size
         return min(self.block_size, self.span)
@@ -110,14 +111,6 @@ class KernelGeometry:
                 block_id, symbol_name=f"span of block_id {block_id}"
             )
         return -(-block.span // block.block_size)
-
-    def is_ragged(self, block_id: int) -> bool:
-        block = self.blocks[block_id]
-        return (
-            block.kind == "tile"
-            and block.span is not None
-            and block.span % block.block_size != 0
-        )
 
     def loop_bounds(
         self, node: torch.fx.Node, block_ids: list[int]

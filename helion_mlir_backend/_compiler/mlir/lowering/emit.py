@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from mlir.dialects import affine as affine_d
 from mlir.dialects import arith as arith_d
 from mlir.dialects import linalg as linalg_d
 from mlir.dialects import tensor as tensor_d
@@ -110,4 +111,129 @@ def cast_tensor(value: ir.Value, element_type: ir.Type) -> ir.Value:
                 reason=f"no cast from {source_type.element_type} to {element_type}",
             )
         linalg_d.YieldOp([converted])
+    return generic.result
+
+
+Size = int | ir.Value
+"""A static size, or an ``index`` value for a dynamic one."""
+
+
+def affine_min(results: list[ir.AffineExpr], operands: list[ir.Value]) -> ir.Value:
+    """``affine.min`` of ``results`` over dims ``d0..`` bound to ``operands``."""
+    return affine_d.AffineMinOp(
+        ir.AffineMap.get(len(operands), 0, results), operands
+    ).result
+
+
+def _mixed(sizes: list[Size]) -> tuple[list[ir.Value], list[int]]:
+    dynamic = ir.ShapedType.get_dynamic_size()
+    return (
+        [size for size in sizes if isinstance(size, ir.Value)],
+        [dynamic if isinstance(size, ir.Value) else size for size in sizes],
+    )
+
+
+def extract_slice(
+    tensor: ir.Value, offsets: list[ir.Value], sizes: list[Size]
+) -> ir.Value:
+    """Unit-stride ``extract_slice`` without rank reduction."""
+    dynamic_sizes, static_sizes = _mixed(sizes)
+    element_type = ir.RankedTensorType(tensor.type).element_type
+    return tensor_d.ExtractSliceOp(
+        ir.RankedTensorType.get(static_sizes, element_type),
+        tensor,
+        offsets,
+        dynamic_sizes,
+        [],
+        static_offsets=[ir.ShapedType.get_dynamic_size()] * len(offsets),
+        static_sizes=static_sizes,
+        static_strides=[1] * len(offsets),
+    ).result
+
+
+def insert_slice(
+    value: ir.Value, dest: ir.Value, offsets: list[ir.Value], sizes: list[Size]
+) -> ir.Value:
+    """Unit-stride ``insert_slice`` (``value`` may drop unit dims of the slice)."""
+    dynamic_sizes, static_sizes = _mixed(sizes)
+    return tensor_d.InsertSliceOp(
+        value,
+        dest,
+        offsets,
+        dynamic_sizes,
+        [],
+        static_offsets=[ir.ShapedType.get_dynamic_size()] * len(offsets),
+        static_sizes=static_sizes,
+        static_strides=[1] * len(offsets),
+    ).result
+
+
+def parallel_insert_slice(
+    value: ir.Value, dest: ir.Value, offsets: list[ir.Value], sizes: list[Size]
+) -> None:
+    dynamic_sizes, static_sizes = _mixed(sizes)
+    tensor_d.ParallelInsertSliceOp(
+        value,
+        dest,
+        offsets,
+        dynamic_sizes,
+        [],
+        static_offsets=[ir.ShapedType.get_dynamic_size()] * len(offsets),
+        static_sizes=static_sizes,
+        static_strides=[1] * len(offsets),
+    )
+
+
+def pad_high(value: ir.Value, sizes: list[Size], shape: list[int]) -> ir.Value:
+    """Zero-pad ``value`` (of ``sizes``) at the end of each dimension to ``shape``."""
+    d0 = ir.AffineDimExpr.get(0)
+    highs: list[Size] = [
+        target - size
+        if isinstance(size, int)
+        else affine_d.AffineApplyOp(
+            ir.AffineMap.get(1, 0, [ir.AffineConstantExpr.get(target) - d0]),
+            [size],
+        ).result
+        for size, target in zip(sizes, shape, strict=True)
+    ]
+    dynamic_highs, static_highs = _mixed(highs)
+    element_type = ir.RankedTensorType(value.type).element_type
+    pad = tensor_d.PadOp(
+        ir.RankedTensorType.get(shape, element_type),
+        value,
+        [],
+        dynamic_highs,
+        [0] * len(shape),
+        static_highs,
+    )
+    body = pad.regions[0].blocks.append(*[ir.IndexType.get()] * len(shape))
+    with ir.InsertionPoint(body):
+        tensor_d.YieldOp(constant(element_type, 0))
+    return pad.result
+
+
+def mask(value: ir.Value, bounds: dict[int, ir.Value], other: float) -> ir.Value:
+    """``value`` where every ``index(dim) < bounds[dim]``, else ``other``."""
+    value_type = ir.RankedTensorType(value.type)
+    shape, element_type = list(value_type.shape), value_type.element_type
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(shape)))
+    parallel = ir.Attribute.parse("#linalg.iterator_type<parallel>")
+    generic = linalg_d.GenericOp(
+        [value_type],
+        [value],
+        [empty(shape, element_type)],
+        ir.ArrayAttr.get([identity, identity]),
+        ir.ArrayAttr.get([parallel] * len(shape)),
+    )
+    body = generic.regions[0].blocks.append(element_type, element_type)
+    with ir.InsertionPoint(body):
+        inside = None
+        for dim, bound in bounds.items():
+            below = arith_d.CmpIOp(
+                arith_d.CmpIPredicate.ult, linalg_d.IndexOp(dim).result, bound
+            ).result
+            inside = below if inside is None else arith_d.AndIOp(inside, below).result
+        linalg_d.YieldOp(
+            [arith_d.SelectOp(inside, body.arguments[0], constant(element_type, other))]
+        )
     return generic.result

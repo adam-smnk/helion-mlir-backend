@@ -13,15 +13,15 @@ from typing import TYPE_CHECKING
 import helion.language._tracing_ops as tracing_ops
 from mlir.dialects import affine as affine_d
 from mlir.dialects import scf as scf_d
-from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 import torch
 
 from ..analysis.geometry import loop_block_ids
 from ..analysis.tensor_effects import accessed_tensor
 from ..support import NodeLoweringError
-from ..support import UnsupportedOperationError
+from . import emit
 from .registry import lowers
+from .slice_plan import tile_window
 from .tensor_state import OwnedDim
 from .tensor_state import owned_dims
 
@@ -65,7 +65,6 @@ def _lower_root(ctx: BuildContext, graph_id: int, grid_ids: list[int]) -> None:
     geometry = ctx.geometry
     bounds = [geometry.root_bounds[block_id] for block_id in grid_ids]
     trips = [-(-(b.end - b.begin) // b.step) for b in bounds]
-    _reject_ragged_combined_tile(ctx, grid_ids, bounds, trips)
 
     names = list(ctx.effects.writes(graph_id))
     accesses = ctx.effects.accesses(graph_id)
@@ -120,21 +119,15 @@ def _emit_forall(
         regions = {}
         for name, shared in zip(names, forall.inner_iter_args, strict=True):
             regions[name] = _owned_region(ctx, shared, owned[name])
-            ctx.tensors.bind(name, _extract(shared, *regions[name]), owned[name])
+            ctx.tensors.bind(
+                name, emit.extract_slice(shared, *regions[name]), owned[name]
+            )
         ctx.lower_graph(graph)
         in_parallel = scf_d.InParallelOp()
         with ir.InsertionPoint(in_parallel.block):
             for name, shared in zip(names, forall.inner_iter_args, strict=True):
-                offsets, sizes = regions[name]
-                tensor_d.ParallelInsertSliceOp(
-                    ctx.tensors.value(name),
-                    shared,
-                    offsets,
-                    [],
-                    [],
-                    static_offsets=[ir.ShapedType.get_dynamic_size()] * len(sizes),
-                    static_sizes=sizes,
-                    static_strides=[1] * len(sizes),
+                emit.parallel_insert_slice(
+                    ctx.tensors.value(name), shared, *regions[name]
                 )
     for name, result in zip(names, forall.results, strict=True):
         ctx.tensors.bind(name, result)
@@ -173,8 +166,11 @@ def _bind_grid_iv(
     ctx: BuildContext, block_id: int, bound: LoopBounds, trip_iv: ir.Value
 ) -> None:
     ctx.block_id_to_trip_iv[block_id] = trip_iv
-    ctx.block_id_to_iv[block_id] = _tile_offset(trip_iv, bound.begin, bound.step)
-    ctx.block_id_to_bounds[block_id] = (bound.begin, bound.end)
+    ctx.bind_loop(
+        block_id,
+        _tile_offset(trip_iv, bound.begin, bound.step),
+        (bound.begin, bound.end),
+    )
 
 
 def _tile_offset(trip_iv: ir.Value, begin: int, step: int) -> ir.Value:
@@ -190,60 +186,24 @@ def _tile_offset(trip_iv: ir.Value, begin: int, step: int) -> ir.Value:
 
 def _owned_region(
     ctx: BuildContext, tensor: ir.Value, owned: dict[int, OwnedDim]
-) -> tuple[list[ir.Value], list[int]]:
-    """Offsets and sizes of one iteration's region of ``tensor``."""
+) -> tuple[list[ir.Value], list[emit.Size]]:
+    """Offsets and sizes of one iteration's region of ``tensor``: the real part of
+    its tile along owned dims, everything elsewhere."""
     offsets: list[ir.Value] = []
-    sizes: list[int] = []
+    sizes: list[emit.Size] = []
     for dim, extent in enumerate(ir.RankedTensorType(tensor.type).shape):
         owner = owned.get(dim)
         if owner is None:
             offsets.append(ctx.index_const(0))
-            sizes.append(int(extent))
-            continue
-        offsets.append(ctx.block_id_to_iv[owner.block_id])
-        sizes.append(
-            1
-            if owner.point
-            else min(ctx.geometry.tile_extent(owner.block_id), int(extent))
-        )
+            sizes.append(extent)
+        elif owner.point:
+            offsets.append(ctx.block_id_to_iv[owner.block_id])
+            sizes.append(1)
+        else:
+            offset, size, _ = tile_window(ctx, owner.block_id, 0, extent)
+            offsets.append(offset)
+            sizes.append(size)
     return offsets, sizes
-
-
-def _extract(tensor: ir.Value, offsets: list[ir.Value], sizes: list[int]) -> ir.Value:
-    element_type = ir.RankedTensorType(tensor.type).element_type
-    return tensor_d.ExtractSliceOp(
-        ir.RankedTensorType.get(sizes, element_type),
-        tensor,
-        offsets,
-        [],
-        [],
-        static_offsets=[ir.ShapedType.get_dynamic_size()] * len(sizes),
-        static_sizes=sizes,
-        static_strides=[1] * len(sizes),
-    ).result
-
-
-def _reject_ragged_combined_tile(
-    ctx: BuildContext, grid_ids: list[int], bounds: list[LoopBounds], trips: list[int]
-) -> None:
-    """A combined tile's ragged last iteration would need a dynamic slice (Phase 6)."""
-    if len(grid_ids) < 2:
-        return
-    for block_id, bound, trip in zip(grid_ids, bounds, trips, strict=True):
-        if trip > 1 and ctx.geometry.is_ragged(block_id):
-            raise UnsupportedOperationError(
-                "ragged combined-tile block size",
-                reason=(
-                    f"block_id {block_id}: dimension of size {bound.end - bound.begin} "
-                    f"is not evenly divisible by block size {bound.step}, and needs "
-                    "more than one iteration; this backend does not yet support a "
-                    "dynamically-sized boundary tile in this position"
-                ),
-                alternatives=[
-                    "choose a block size that evenly divides this dimension",
-                    "restructure the kernel so this dimension needs only one iteration",
-                ],
-            )
 
 
 @lowers(tracing_ops._for_loop, tracing_ops._for_loop_step)

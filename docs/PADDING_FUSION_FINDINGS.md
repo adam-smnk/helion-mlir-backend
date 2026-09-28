@@ -98,21 +98,11 @@ this document originally conflated them.
 
 ## 2) Single-Phase Kernel: Boundary-Tile Masking Clamps Instead of Zero-Filling
 
-**Status:** blocked by how this backend lowers out-of-bounds/masked tile
-reads; a more fundamental limitation than (1), and would block a single-phase
-fused kernel even if (1) were fixed.
-**Probes:** `temp/test_auto_masked_read.py` (2D combined tile, direct OOB
-read), `temp/test_auto_masked_read_1d.py` (1D single-dim tile, direct OOB
-read), `temp/test_local_partial_write.py` (functional
-`torch.nn.functional.pad` composition).
-
-### Summary
-
-Three single-phase (no `hl.barrier()`, no multi-kernel) designs were tried, to
-
-**Status:** blocked by how this backend lowers out-of-bounds/masked tile
-reads; a more fundamental limitation than (1), and would block a single-phase
-fused kernel even if (1) were fixed.
+**Status:** resolved (review plan, Phase 6). Loads now read only the part of a
+tile inside the loop and the tensor and zero-pad the rest, and the ragged
+combined-tile rejection is gone. The reproducer below returns zeros past the
+input (`tests/test_ragged_tiles.py::test_read_past_tensor_end_is_zero`), so
+design 1 works. The analysis below is kept for history.
 **Probes:** `temp/test_auto_masked_read.py` (2D combined tile, direct OOB
 read), `temp/test_auto_masked_read_1d.py` (1D single-dim tile, direct OOB
 read), `temp/test_local_partial_write.py` (functional
@@ -363,7 +353,7 @@ in `applyTilingToAll` (upstream MLIR, not lighthouse or this backend).
 
 Given both findings are backend-level (not kernel-authoring) issues -- one in
 lighthouse's register-tiling schedule for multi-phase kernels, one in this
-backend's tile-boundary masking semantics -- padding-fusion into the packing
+backend's tile-boundary masking semantics (since resolved) -- padding-fusion into the packing
 kernels is **not** attempted in the shipped `matmul.py`. The current
 host-side `torch.zeros(...)` + slice-assign approach for the padding-needed
 case is kept as-is; it is correct and only adds overhead for the relatively
