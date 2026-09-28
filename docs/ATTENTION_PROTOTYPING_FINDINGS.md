@@ -134,6 +134,9 @@ Representative logs:
 
 ### Finding 1: `hl.dot` Is Not Lowered by the MLIR Backend
 
+**RESOLVED** (backend review plan, Phase 2): `hl.dot` with or without `acc=` lowers
+through the same contraction path as `addmm`/einsum; `tests/test_contractions.py`.
+
 The GPU example uses `hl.dot` for both contractions. The MLIR backend reports:
 
 ```text

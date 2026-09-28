@@ -902,22 +902,27 @@ def _infer_node_dtype(node: torch.fx.Node) -> torch.dtype | None:
 
 
 def _normalize_aten_args(node: torch.fx.Node) -> tuple[object, ...]:
-    """Return sanitized ATen args for known FX tracing quirks.
+    """Restore operands that Helion's ``strip_unused_inputs`` replaced with ``None``.
 
-    In some cast-heavy patterns, FX can encode ``aten.mul.Tensor`` as
-    ``(tensor_node, None)`` when the intended operation is self-multiplication.
-    Normalize that to ``(tensor_node, tensor_node)`` so torch-mlir import
-    receives a valid Tensor/Tensor operand pair.
+    Helion keeps only the first occurrence of each input node, so ``x * x`` reaches
+    the backend as ``mul(x, None)``. Pointwise ops read every tensor operand, so a
+    ``None`` in a required ``Tensor`` position is that repeated input when the node
+    has exactly one distinct input; otherwise it is ambiguous and left as is.
     """
+    from torch._ops import OpOverload
+
     args = list(node.args)
-    target_name = str(node.target)
     if (
-        "aten.mul.Tensor" in target_name
-        and len(args) == 2
-        and args[1] is None
-        and isinstance(args[0], torch.fx.Node)
+        not isinstance(node.target, OpOverload)
+        or torch.Tag.pointwise not in node.target.tags
     ):
-        args[1] = args[0]
+        return tuple(args)
+    inputs = list(dict.fromkeys(arg for arg in args if isinstance(arg, torch.fx.Node)))
+    if len(inputs) != 1:
+        return tuple(args)
+    for position, schema_arg in enumerate(node.target._schema.arguments[: len(args)]):
+        if args[position] is None and isinstance(schema_arg.type, torch._C.TensorType):
+            args[position] = inputs[0]
     return tuple(args)
 
 

@@ -60,25 +60,29 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
 - **Key Methods:**
   - `build()`: Entry point, creates MLIR module
   - `_build_function()`: Generates func.func with tensor signature
-  - `_build_kernel_body()`: Creates scf.forall with grid-level parallelism
-  - `_process_graph()`: Walks FX graph recursively
-  - `_lower_node()`: Dispatches to operation-specific lowering
-  - `_lower_node()`: Routes Helion and ATen nodes
-  - Thin delegates: preserve the FX dispatch contract while calling modules under `lowering/`
+  - `_prebuild_aten_helpers()`: Batch-lowers ATen nodes without a direct lowering
+  - Per-node lowering is `lowering/registry.py::lower_node`
 
 #### 4. **Lowering Modules**
 
 Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 
+- `registry.py`: `@lowers(target)` dispatch keyed by target identity (Helion API
+  functions, ATen `OpOverload`s, or an `OpOverloadPacket` with an overload filter);
+  each node is lowered inside its `meta["location"]` so errors name the kernel line
 - `control_flow.py`: outer `scf.forall` and nested `scf.for`
 - `load_slice_ops.py`, `load_ops.py`: tile loads and gathers
 - `memory_ops.py`: getitem and stores
-- `matmul_ops.py`: matmul-family lowering
-- `einsum_ops.py`: captured `torch.einsum` -> `linalg.contract`
+- `contraction_ops.py`: the single lowering for `mm`/`bmm`/`matmul`/`addmm`/
+  `baddbmm`, `hl.dot`, captured einsum and `acc + contraction`, matched by
+  `analysis/contractions.py`
+- `elementwise_ops.py`: index-scalar binary ops and aliases
+- `view_ops.py`, `method_ops.py`, `transpose_ops.py`: views and `Tensor` methods
+- `emit.py`: shared builders (constants, fills, casts as `linalg.generic`)
 - `subscript_ops.py`: tensor subscripts
 - `host_tensor_ops.py`: host arguments and alias materialization
-- `tensor_creation_ops.py`: `full` and `zeros`
-- `tile_index_ops.py`: tile-index tensor generation
+- `tensor_creation_ops.py`: `full` (also `hl.zeros`)
+- `tile_index_ops.py`: tile positions, `tile.index`, shape queries
 
 `einsum_capture.py` (at the package root) is the one piece that runs *before*
 codegen: it installs a `TorchFunctionMode` around Helion's device-IR lowering
@@ -90,7 +94,7 @@ that expansion.
 
 The ATen-specific path is organized under [aten_bridge/](../helion_mlir_backend/_compiler/mlir/aten_bridge/):
 
-- `aten_ops.py`: custom ATen registry and direct MLIR lowerings
+- `helper_call.py`: call-site `func.call` to a helper
 - `aten_helper_table.py`: helper signature and identity tracking
 - `helper_rebuild.py`: call-site-specific helper variants
 - `torch_mlir_pipeline.py`: batched torch-mlir import and lowering
@@ -101,7 +105,7 @@ Shared utilities live under [support/](../helion_mlir_backend/_compiler/mlir/sup
 - `symbolic_shape_restoration.py`: nested loop metadata repair
 - `aten_prepass.py`: ATen metadata refresh
 - `einsum_spec.py`: einsum equation analysis against `linalg.contract` semantics
-- `node_dispatch.py`, `type_utils.py`, and `errors.py`
+- `type_utils.py` and `errors.py` (errors are `helion.exc.BaseError`s)
 
 #### 6. **Type System: torch_dtype_to_mlir()**
 - Location: [type_utils.py](../helion_mlir_backend/_compiler/mlir/support/type_utils.py)
@@ -112,8 +116,7 @@ Shared utilities live under [support/](../helion_mlir_backend/_compiler/mlir/sup
 **Supported Types:**
 - float16, bfloat16, float32, float64
 - int8, int16, int32, int64
-- uint8
-- bool
+- bool (uint8 is rejected: integers are lowered with signed semantics)
 
 ## MLIR Dialect Stack
 

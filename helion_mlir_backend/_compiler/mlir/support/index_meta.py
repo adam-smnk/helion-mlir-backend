@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
+
 from .block_ids import SCALAR_SYMBOL_KINDS
 from .block_ids import block_id_from_key
 
@@ -65,13 +67,13 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
             block_id=block_id, bias=0, is_scalar=kind in SCALAR_SYMBOL_KINDS
         )
 
-    target_name = getattr(index_node.target, "__name__", "")
-    if target_name == "_get_symnode" and index_node.args:
+    target = index_node.target
+    if target is tracing_ops._get_symnode and index_node.args:
         block_id = block_id_from_key(index_node.args[0])
         if block_id is not None:
             return IndexDescriptor(block_id=block_id, bias=0, is_scalar=False)
 
-    if target_name in ("sym_size.int", "sym_size_int") and len(index_node.args) >= 2:
+    if target is torch.ops.aten.sym_size.int and len(index_node.args) >= 2:
         tensor_node, dimension_index = index_node.args[0], index_node.args[1]
         if isinstance(tensor_node, torch.fx.Node) and isinstance(dimension_index, int):
             tensor_value = tensor_node.meta.get("val")

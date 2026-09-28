@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
+import helion.language.memory_ops as memory_ops
 import torch
 
 from .block_ids import block_id_from_key
@@ -71,7 +73,7 @@ def _propagate_new_var(
     for body_node in body_graph.nodes:
         if (
             body_node.op == "call_function"
-            and getattr(body_node.target, "__name__", "") == "_new_var"
+            and body_node.target is tracing_ops._new_var
             and body_node.args
             and body_node.args[0] is placeholder
         ):
@@ -89,20 +91,20 @@ def _propagate_body_metadata(
     for body_node in body_graph.nodes:
         if body_node.op != "call_function":
             continue
-        target_name = getattr(body_node.target, "__name__", "")
+        target = body_node.target
         if (
-            target_name == "_new_var"
+            target is tracing_ops._new_var
             and body_node.args
             and body_node.args[0] is placeholder
         ):
             body_node.meta["val"] = concrete_value
             continue
-        if target_name in ("sym_size.int", "sym_size_int"):
+        if target is torch.ops.aten.sym_size.int:
             _propagate_sym_size(
                 body_node, placeholder, concrete_shape, shape_arg, context
             )
             continue
-        if target_name == "load":
+        if target is memory_ops.load:
             _propagate_load_shape(body_node, context)
 
 
@@ -132,7 +134,7 @@ def _propagate_sym_size(
         shape_node = shape_arg[dimension]
         if (
             isinstance(shape_node, torch.fx.Node)
-            and getattr(shape_node.target, "__name__", "") == "_get_symnode"
+            and shape_node.target is tracing_ops._get_symnode
             and shape_node.args
         ):
             block_id = block_id_from_key(shape_node.args[0])

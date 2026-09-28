@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
+from mlir.dialects import arith as arith_d
+from mlir.dialects import tensor as tensor_d
+import mlir.ir as ir
+
 from .support import block_id_from_key
 from .support.index_meta import resolve_index_descriptor
 
@@ -17,10 +22,11 @@ if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
     from helion.runtime.config import Config
-    import mlir.ir as ir
     import torch.fx
 
+    from .analysis.contractions import ContractionPlan
     from .analysis.geometry import KernelGeometry
+    from .aten_bridge import AtenHelperTable
     from .lowering.for_store_context import ForStoreContext
 
 
@@ -54,13 +60,12 @@ class BuildContext:
 
     mlir_module: ir.Module | None = None
     mlir_context: ir.Context | None = None
-    node_to_aten_func: dict[int, tuple[str, list]] = field(default_factory=dict)
+    aten_helpers: AtenHelperTable | None = None
+    contractions: ContractionPlan | None = None
     lower_node_callback: Callable[[torch.fx.Node], ir.Value | None] | None = None
 
     def get_value(self, node_or_value: object) -> ir.Value | None:
         """Look up an MLIR value for an FX node or scalar literal."""
-        from mlir.dialects import arith as arith_d
-        import mlir.ir as ir
         import torch.fx
 
         if isinstance(node_or_value, torch.fx.Node):
@@ -85,8 +90,6 @@ class BuildContext:
 
     def index_const(self, value: int) -> ir.Value:
         """Create an MLIR index constant."""
-        from mlir.dialects import arith as arith_d
-        import mlir.ir as ir
 
         index_type = ir.IndexType.get()
         return arith_d.ConstantOp(
@@ -102,9 +105,6 @@ class BuildContext:
 
     def cast_to_index(self, value: ir.Value) -> ir.Value:
         """Cast an integer or rank-zero tensor value to MLIR index type."""
-        from mlir.dialects import arith as arith_d
-        from mlir.dialects import tensor as tensor_d
-        import mlir.ir as ir
 
         if isinstance(value.type, ir.IndexType):
             return value
@@ -115,43 +115,6 @@ class BuildContext:
                 if isinstance(value.type, ir.IndexType):
                     return value
         return arith_d.IndexCastOp(ir.IndexType.get(), value).result
-
-    def cast_scalar_to(self, value: ir.Value, target: ir.Type) -> ir.Value | None:
-        """Convert a scalar MLIR value to the requested element type."""
-        from mlir.dialects import arith as arith_d
-        import mlir.ir as ir
-
-        source = value.type
-        if str(source) == str(target):
-            return value
-        if isinstance(source, ir.IndexType):
-            if isinstance(target, ir.IntegerType):
-                return arith_d.IndexCastOp(target, value).result
-            if isinstance(target, ir.FloatType):
-                integer = arith_d.IndexCastOp(ir.IntegerType.get_signless(64), value)
-                return arith_d.SIToFPOp(target, integer.result).result
-            return None
-        if isinstance(source, ir.IntegerType) and isinstance(target, ir.IndexType):
-            return arith_d.IndexCastOp(target, value).result
-        if isinstance(source, ir.IntegerType) and isinstance(target, ir.IntegerType):
-            if source.width == target.width:
-                return value
-            operation = (
-                arith_d.ExtSIOp if source.width < target.width else arith_d.TruncIOp
-            )
-            return operation(target, value).result
-        if isinstance(source, ir.IntegerType) and isinstance(target, ir.FloatType):
-            return arith_d.SIToFPOp(target, value).result
-        if isinstance(source, ir.FloatType) and isinstance(target, ir.FloatType):
-            if source.width == target.width:
-                return value
-            operation = (
-                arith_d.ExtFOp if source.width < target.width else arith_d.TruncFOp
-            )
-            return operation(target, value).result
-        if isinstance(source, ir.FloatType) and isinstance(target, ir.IntegerType):
-            return arith_d.FPToSIOp(target, value).result
-        return None
 
     def shape_from_node_meta(self, node: object) -> list[int] | None:
         """Extract a concrete tensor shape from FX metadata."""
@@ -183,16 +146,13 @@ class BuildContext:
         shape: list[int] = []
         for shape_node in shape_nodes:
             if isinstance(shape_node, torch.fx.Node):
-                target_name = getattr(shape_node.target, "__name__", "")
-                if target_name == "_get_symnode" and shape_node.args:
+                target = shape_node.target
+                if target is tracing_ops._get_symnode and shape_node.args:
                     block_id = block_id_from_key(shape_node.args[0])
                     if block_id is not None and block_id in self.geometry.blocks:
                         shape.append(self.geometry.tile_extent(block_id))
                         continue
-                if (
-                    target_name in ("sym_size.int", "sym_size_int")
-                    and len(shape_node.args) >= 2
-                ):
+                if target is torch.ops.aten.sym_size.int and len(shape_node.args) >= 2:
                     tensor_node, dim = shape_node.args[:2]
                     value = (
                         tensor_node.meta.get("val")
@@ -277,11 +237,6 @@ class BuildContext:
     def infer_block_id_from_index(self, index_node: object) -> int | None:
         """Infer the block id represented by an index expression."""
         return resolve_index_descriptor(self, index_node).block_id
-
-    def infer_index_block_and_bias(self, index_node: object) -> tuple[int | None, int]:
-        """Infer a block id and additive bias from a tile-index expression."""
-        descriptor = resolve_index_descriptor(self, index_node)
-        return descriptor.block_id, descriptor.bias
 
     def lower_graph(self, graph: torch.fx.Graph) -> ir.Value | None:
         """Lower an FX graph through the builder callback."""

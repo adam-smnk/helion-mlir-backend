@@ -73,12 +73,17 @@ class TestTypeConversions:
 
     def test_unsupported_dtype_raises(self, mlir_context):
         """Test that unsupported dtypes raise error."""
+        from helion_mlir_backend._compiler.mlir.support.errors import (
+            UnsupportedOperationError,
+        )
         from helion_mlir_backend._compiler.mlir.support.type_utils import (
             torch_dtype_to_mlir,
         )
 
-        with mlir_context, pytest.raises((ValueError, NotImplementedError)):
+        with mlir_context, pytest.raises(UnsupportedOperationError):
             torch_dtype_to_mlir(torch.complex64)
+        with mlir_context, pytest.raises(UnsupportedOperationError, match="signless"):
+            torch_dtype_to_mlir(torch.uint8)
 
 
 class TestBackendStructure:

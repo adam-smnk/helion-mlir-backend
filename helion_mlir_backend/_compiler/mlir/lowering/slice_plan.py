@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Literal
 
-if TYPE_CHECKING:
-    import mlir.ir as ir
+import mlir.ir as ir
 
+if TYPE_CHECKING:
     from ..build_context import BuildContext
 
 
@@ -67,7 +67,6 @@ def plan_slice(
 
     Raises NodeLoweringError if a tile index cannot be resolved to a block id.
     """
-    import mlir.ir as ir
 
     from ..support.errors import NodeLoweringError
     from ..support.index_meta import resolve_index_descriptor

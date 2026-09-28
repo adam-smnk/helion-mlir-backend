@@ -4,17 +4,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.language.memory_ops as memory_ops
+from mlir.dialects import tensor as tensor_d
+import mlir.ir as ir
+
+from .registry import lowers
+
 if TYPE_CHECKING:
-    import mlir.ir as ir
     import torch.fx
 
     from ..build_context import BuildContext
 
 
+@lowers(memory_ops.load)
 def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     """Lower a Helion load to a static tensor extract slice."""
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
 
     tensor_node = node.args[0]
     index_nodes = node.args[1]
@@ -27,13 +31,11 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if ndim == 1 and len(index_nodes) == 1:
         gather_index_value = ctx.get_value(index_nodes[0])
         if gather_index_value is not None:
-            try:
-                gather_index_type = ir.RankedTensorType(gather_index_value.type)
-            except Exception:
-                # Native MLIR binding raises for a non-ranked-tensor type; this
-                # probes "is it a tensor" rather than catching a specific error.
-                gather_index_type = None
-            if gather_index_type is not None and gather_index_type.rank >= 1:
+            gather_index_type = gather_index_value.type
+            if (
+                isinstance(gather_index_type, ir.RankedTensorType)
+                and gather_index_type.rank >= 1
+            ):
                 from .load_ops import lower_flat_gather
 
                 gathered = lower_flat_gather(

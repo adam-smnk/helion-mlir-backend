@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
 import torch
 import torch.fx
 
@@ -52,7 +53,7 @@ def find_extra_host_tensor_names(
         for node in graph_info.graph.nodes:
             if node.op != "call_function":
                 continue
-            if getattr(node.target, "__name__", "") != "_host_tensor":
+            if node.target is not tracing_ops._host_tensor:
                 continue
             name = node.args[0]
             if (
@@ -110,7 +111,7 @@ def find_host_tensor_fake_value(hf: HostFunction, name: str) -> torch.Tensor | N
         for node in graph_info.graph.nodes:
             if (
                 node.op == "call_function"
-                and getattr(node.target, "__name__", "") == "_host_tensor"
+                and node.target is tracing_ops._host_tensor
                 and node.args[0] == name
             ):
                 value = node.meta.get("val")
@@ -175,7 +176,7 @@ def _phase_host_tensor_names(hf: HostFunction, root_ids: list[int]) -> list[str]
         for node in graph.nodes:
             if node.op != "call_function":
                 continue
-            if getattr(node.target, "__name__", "") != "_host_tensor":
+            if node.target is not tracing_ops._host_tensor:
                 continue
             name = node.args[0]
             if isinstance(name, str) and name not in seen:

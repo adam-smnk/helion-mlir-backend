@@ -22,7 +22,7 @@ def install() -> bool:
         from helion_mlir_backend._compiler.mlir.einsum_capture import (
             install_einsum_capture,
         )
-    except Exception as exc:
+    except ImportError as exc:
         log.debug("External MLIR backend registration unavailable: %s", exc)
         return False
 

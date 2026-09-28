@@ -1,19 +1,24 @@
-"""Error handling and diagnostics for MLIR backend.
+"""Error types for the MLIR backend.
 
-Provides custom exceptions and diagnostic utilities for better error messages
-and debugging support.
+Every error is a :class:`helion.exc.BaseError`: raised while a node's
+``meta["location"]`` is active (see ``lowering/registry.py``), Helion appends the
+kernel source line to the message.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.exc
+
 if TYPE_CHECKING:
     import torch.fx
 
 
-class MLIRBackendError(Exception):
+class MLIRBackendError(helion.exc.BaseError):
     """Base exception for all MLIR backend errors."""
+
+    message = "{0}"
 
 
 class UnsupportedOperationError(MLIRBackendError):
@@ -97,26 +102,6 @@ class NodeLoweringError(MLIRBackendError):
             msg += f"\nHint: {recovery_hint}"
         super().__init__(msg)
         self.node = node
-        self.reason = reason
-        self.recovery_hint = recovery_hint
-
-
-class ModuleBuilderError(MLIRBackendError):
-    """Raised when module building fails."""
-
-    def __init__(
-        self,
-        stage: str,
-        reason: str | None = None,
-        recovery_hint: str | None = None,
-    ) -> None:
-        msg = f"Module building failed at stage: {stage}"
-        if reason:
-            msg += f"\nReason: {reason}"
-        if recovery_hint:
-            msg += f"\nHint: {recovery_hint}"
-        super().__init__(msg)
-        self.stage = stage
         self.reason = reason
         self.recovery_hint = recovery_hint
 

@@ -4,18 +4,30 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.language.view_ops as view_ops
+from mlir.dialects import tensor as tensor_d
+import mlir.ir as ir
 import torch.fx
 
-if TYPE_CHECKING:
-    import mlir.ir as ir
+from ..support import UnsupportedOperationError
+from .registry import lowers
 
+if TYPE_CHECKING:
     from ..build_context import BuildContext
+
+
+@lowers(view_ops.subscript)
+def lower_subscript_node(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
+    value = lower_subscript(ctx, node)
+    if value is None:
+        raise UnsupportedOperationError(
+            "subscript", reason=f"unsupported subscript form with args={node.args!r}"
+        )
+    return value
 
 
 def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower tensor-valued indexing and full-slice subscripts."""
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
 
     if len(node.args) < 2:
         return None
@@ -34,11 +46,8 @@ def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
         ),
         None,
     )
-    try:
-        source_type = ir.RankedTensorType(source_value.type)
-    except Exception:
-        # Native MLIR binding raises for a non-ranked-tensor type; this
-        # probes "is it a tensor" rather than catching a specific error.
+    source_type = source_value.type
+    if not isinstance(source_type, ir.RankedTensorType):
         return None
     element_type = source_type.element_type
 

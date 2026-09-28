@@ -27,14 +27,7 @@ def _symbol_expr(value: object) -> object | None:
     if not isinstance(value, torch.SymInt):
         return None
     expr = getattr(getattr(value, "node", None), "expr", None)
-    if isinstance(expr, sympy.Basic):
-        return expr
-    try:
-        return value._sympy_()
-    except Exception:
-        # torch.SymInt._sympy_() has no documented narrow failure mode; best
-        # effort only.
-        return None
+    return expr if isinstance(expr, sympy.Basic) else None
 
 
 def symbol_origin_info(host_function: object, value: object) -> tuple[int, str] | None:

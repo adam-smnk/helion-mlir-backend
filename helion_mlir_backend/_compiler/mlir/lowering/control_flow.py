@@ -4,15 +4,34 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
+import helion.language.memory_ops as memory_ops
+from mlir.dialects import affine as affine_d
+from mlir.dialects import scf as scf_d
+from mlir.dialects import tensor as tensor_d
+import mlir.ir as ir
+
 from ..analysis.geometry import is_loop_node
+from . import emit
+from .registry import lowers
 
 if TYPE_CHECKING:
-    import mlir.ir as ir
     import torch
 
     from ..analysis.geometry import LoopBounds
     from ..build_context import BuildContext
     from .for_store_context import ForStoreContext
+
+
+@lowers(tracing_ops._new_var)
+def lower_new_var(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    return ctx.get_value(node.args[0])
+
+
+@lowers(tracing_ops._phi)
+def lower_phi(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """``_phi(before, after)``: the loop result (``after``) replaces the value."""
+    return ctx.get_value(node.args[1])
 
 
 def _block_id_to_out_dim_from_terminal_store(
@@ -50,7 +69,7 @@ def _block_id_to_out_dim_from_terminal_store(
         for node in graph.nodes:
             if node.op != "call_function":
                 continue
-            if getattr(node.target, "__name__", "") != "store":
+            if node.target is not memory_ops.store:
                 continue
             index_nodes = node.args[1]
             if not isinstance(index_nodes, (list, tuple)):
@@ -72,8 +91,6 @@ def _tile_offset(
     ctx: BuildContext, trip_iv: ir.Value, begin: int, step: int
 ) -> ir.Value:
     """Absolute tile offset ``begin + trip_iv * step`` for a normalized forall IV."""
-    from mlir.dialects import affine as affine_d
-    import mlir.ir as ir
 
     if begin == 0 and step == 1:
         return trip_iv
@@ -105,9 +122,6 @@ def build_kernel_body(
 
     Maps each grid block_id to its actual destination dimension (not just positional).
     """
-    from mlir.dialects import scf as scf_d
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
 
     from ..support import torch_dtype_to_mlir
 
@@ -443,7 +457,7 @@ def _find_descendant_store(
         for graph_node in current_graph.nodes:
             if (
                 graph_node.op == "call_function"
-                and getattr(graph_node.target, "__name__", "") == "store"
+                and graph_node.target is memory_ops.store
             ):
                 return graph_node
         for graph_node in current_graph.nodes:
@@ -452,6 +466,7 @@ def _find_descendant_store(
     return None
 
 
+@lowers(tracing_ops._for_loop, tracing_ops._for_loop_step)
 def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     """Lower a (possibly multi-dimensional) nested ``_for_loop``/``_for_loop_step``
     to one ``scf.for`` per block id, with an optional synthetic store.
@@ -566,7 +581,6 @@ def _resolve_loop_bound(
     source: object,
 ) -> int | ir.Value:
     """Resolve a ``_for_loop`` begin/end to a static int or an index value."""
-    import mlir.ir as ir
     import torch
     import torch.fx
 
@@ -620,10 +634,6 @@ def _prepare_synthetic_accumulator(
     ``ForStoreContext`` plus its index within ``iter_init_vals``; returns
     ``(None, None)`` if no such store/geometry was found.
     """
-    from mlir.dialects import arith as arith_d
-    from mlir.dialects import linalg as linalg_d
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
     import torch
 
     from ..support import torch_dtype_to_mlir
@@ -727,13 +737,7 @@ def _prepare_synthetic_accumulator(
     flush_window = None
     if owns_inner_dim and begin_static and end_static is not None:
         flush_window = (inner_dim, begin_static, end_static - begin_static)
-    tile_empty = tensor_d.EmptyOp(tile_shape, elem_ty).result
-    if isinstance(elem_ty, ir.FloatType):
-        zero_attr = ir.FloatAttr.get(elem_ty, 0.0)
-    else:
-        zero_attr = ir.IntegerAttr.get(elem_ty, 0)
-    zero = arith_d.ConstantOp(elem_ty, zero_attr).result
-    tile_init = linalg_d.fill(zero, outs=[tile_empty])
+    tile_init = emit.filled(tile_shape, elem_ty, 0)
     synthetic_iter_index = len(iter_init_vals)
     iter_init_vals.append(tile_init)
 
@@ -850,8 +854,6 @@ def _emit_for_loop_level(
     multi-dimensional ``_for_loop`` node (e.g. combined ``hl.tile([m, n])``)
     lower to nested ``scf.for`` loops, one per dimension.
     """
-    from mlir.dialects import scf as scf_d
-    import mlir.ir as ir
 
     from ..support import NodeLoweringError
 
@@ -973,8 +975,6 @@ def _flush_synthetic_accumulator_to_parent(
     at ``flush_offsets``; otherwise this is the outermost accumulator, so
     record it for the top-level ``scf.forall``'s parallel-insert terminator.
     """
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
 
     final_tile = for_op.results[synthetic_iter_index]
     if synthetic_store_ctx.flush_window is not None:

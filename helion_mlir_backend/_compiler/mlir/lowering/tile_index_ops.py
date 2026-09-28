@@ -1,25 +1,74 @@
-"""Lower Helion tile-index operations."""
+"""Lower Helion tile-index operations and scalar shape queries."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
+import helion.language.tile_ops as tile_ops
+from mlir.dialects import arith as arith_d
+from mlir.dialects import linalg as linalg_d
+import mlir.ir as ir
 import torch
 
+from ..support import DynamicShapeError
 from ..support import NodeLoweringError
+from ..support import ValueNotFoundError
+from ..support import block_id_from_key
+from ..support import safe_int_conversion
 from ..support import torch_dtype_to_mlir
+from .registry import lowers
 
 if TYPE_CHECKING:
-    import mlir.ir as ir
-
     from ..build_context import BuildContext
 
+_SCALAR_KINDS = {
+    tile_ops.tile_begin: "tile_begin",
+    tile_ops.tile_end: "tile_end",
+    tile_ops.tile_id: "tile_id",
+    tile_ops.tile_count: "tile_count",
+    tile_ops.tile_block_size: "block_size",
+}
 
+
+@lowers(tracing_ops._get_symnode)
+def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
+    """``_get_symnode(key)``: a block-size constant or a scalar grid/tile position."""
+    key = node.args[0]
+    block_id = block_id_from_key(key)
+    if block_id is not None:
+        if block_id not in ctx.geometry.blocks:
+            raise ValueNotFoundError(node, context=f"unknown block key: {key!r}")
+        return ctx.index_const(ctx.geometry.block_size(block_id))
+    # ``hl.grid`` and tile position symbols have no ``block_size_`` key; they resolve
+    # to a scalar index through their Helion symbol origin.
+    info = ctx.node_symbol_info(node)
+    resolved = scalar_tile_value(ctx, *info) if info is not None else None
+    if resolved is None:
+        raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
+    return resolved
+
+
+@lowers(torch.ops.aten.sym_size.int)
+def lower_sym_size(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
+    """``sym_size.int(tensor, dim)``: a constant for the tensor dimension."""
+    value = node.meta.get("val")
+    try:
+        size = (
+            int(value)
+            if isinstance(value, torch.SymInt)
+            else safe_int_conversion(value, "shape_dimension")
+        )
+    except (TypeError, ValueError) as exc:
+        raise DynamicShapeError(value, symbol_name=node.name) from exc
+    return ctx.index_const(size)
+
+
+@lowers(tile_ops.tile_index)
 def lower_tile_index(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
-    """Lower ``tile.index`` to a one-dimensional tensor of offsets."""
-    from mlir.dialects import arith as arith_d
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
+    """``tile.index``: ``offset + i`` for each tile position, as a ``linalg.generic``."""
+
+    from . import emit
 
     if not node.args:
         return None
@@ -37,30 +86,22 @@ def lower_tile_index(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     element_type: ir.Type = ir.IndexType.get()
     metadata_value = node.meta.get("val")
     if isinstance(metadata_value, torch.Tensor):
-        try:
-            metadata_type = torch_dtype_to_mlir(metadata_value.dtype)
-            if isinstance(metadata_type, (ir.IntegerType, ir.IndexType)):
-                element_type = metadata_type
-        except Exception:
-            # Best-effort element-type refinement; fall back to index type.
-            pass
+        metadata_type = torch_dtype_to_mlir(metadata_value.dtype)
+        if isinstance(metadata_type, (ir.IntegerType, ir.IndexType)):
+            element_type = metadata_type
 
-    index_type = ir.IndexType.get()
-    result_type = ir.RankedTensorType.get(shape, element_type)
-    operation = tensor_d.GenerateOp(result_type, [])
-    body = operation.operation.regions[0].blocks.append(index_type)
-
+    generic = linalg_d.GenericOp(
+        [ir.RankedTensorType.get(shape, element_type)],
+        [],
+        [emit.empty(shape, element_type)],
+        ir.ArrayAttr.get([ir.AffineMapAttr.get(ir.AffineMap.get_identity(1))]),
+        ir.ArrayAttr.get([ir.Attribute.parse("#linalg.iterator_type<parallel>")]),
+    )
+    body = generic.regions[0].blocks.append(element_type)
     with ir.InsertionPoint(body):
-        induction_variable = body.arguments[0]
-        if isinstance(element_type, ir.IndexType):
-            value = arith_d.AddIOp(base, induction_variable).result
-        else:
-            base_int = arith_d.IndexCastOp(element_type, base).result
-            induction_int = arith_d.IndexCastOp(element_type, induction_variable).result
-            value = arith_d.AddIOp(base_int, induction_int).result
-        tensor_d.YieldOp(value)
-
-    return operation.result
+        position = arith_d.AddIOp(base, linalg_d.IndexOp(0).result).result
+        linalg_d.YieldOp([emit.cast_scalar(position, element_type)])
+    return generic.result
 
 
 def scalar_tile_value(ctx: BuildContext, block_id: int, kind: str) -> ir.Value | None:
@@ -70,7 +111,6 @@ def scalar_tile_value(ctx: BuildContext, block_id: int, kind: str) -> ir.Value |
     to the loop end, ``id`` is ``begin // block_size`` and ``count`` is
     ``cdiv(end - begin, block_size)``.
     """
-    from mlir.dialects import arith as arith_d
 
     geometry = ctx.geometry
     if block_id not in geometry.blocks:
@@ -121,13 +161,10 @@ def scalar_tile_value(ctx: BuildContext, block_id: int, kind: str) -> ir.Value |
     return None
 
 
+@lowers(*_SCALAR_KINDS)
 def lower_tile_scalar_op(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     """Lower ``tile.begin`` / ``tile.end`` / ``tile.id`` / ``tile.count``."""
-    from ..support import block_id_from_key
-
-    kind = getattr(node.target, "__name__", "")
-    if kind == "tile_block_size":
-        kind = "block_size"
+    kind = _SCALAR_KINDS[node.target]
     info = ctx.node_symbol_info(node)
     block_id = info[0] if info is not None else None
 

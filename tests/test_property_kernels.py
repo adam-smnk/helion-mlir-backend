@@ -31,7 +31,6 @@ import torch
 
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
-from helion_mlir_backend._compiler.mlir.support.errors import ModuleBuilderError
 from helion_mlir_backend._compiler.mlir.support.errors import UnsupportedOperationError
 
 # Derandomized + bounded: deterministic across CI runs, small enough to keep
@@ -101,7 +100,7 @@ def test_combined_tile_matmul_random_shapes(
     ragged = (bm < m and m % bm != 0) or (bn < n and n % bn != 0)
     try:
         module = generate_mlir(mm, [x, y], config=config)
-    except (UnsupportedOperationError, ModuleBuilderError) as exc:
+    except UnsupportedOperationError as exc:
         assert ragged, f"unexpected compile failure for a non-ragged case: {exc}"
         assert "ragged" in str(exc).lower()
         return

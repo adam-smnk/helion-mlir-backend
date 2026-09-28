@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import operator
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
+import helion.language.memory_ops as memory_ops
+from mlir.dialects import tensor as tensor_d
+import mlir.ir as ir
+
+from .registry import lowers
+
 if TYPE_CHECKING:
-    import mlir.ir as ir
     import torch.fx
 
     from ..build_context import BuildContext
 
 
+@lowers(operator.getitem)
 def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Extract one result from an ``scf.for`` result container."""
     container_value = ctx.get_value(node.args[0])
@@ -24,21 +32,23 @@ def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
 
 def _cast_store_value(ctx: BuildContext, value: ir.Value, target: ir.Value) -> ir.Value:
     """Convert a stored tile to the destination element type when they differ."""
-    import mlir.ir as ir
 
-    from ..aten_bridge import convert_tensor_element_type
+    from .emit import cast_tensor
 
-    try:
-        value_type = ir.RankedTensorType(value.type)
-        target_type = ir.RankedTensorType(target.type)
-    except Exception:
+    if not isinstance(value.type, ir.RankedTensorType) or not isinstance(
+        target.type, ir.RankedTensorType
+    ):
         return value
-    if str(value_type.element_type) == str(target_type.element_type):
-        return value
-    converted = convert_tensor_element_type(ctx, value, target_type.element_type)
-    return converted if converted is not None else value
+    return cast_tensor(value, target.type.element_type)
 
 
+@lowers(tracing_ops._mask_to)
+def lower_mask_to(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """Pass-through until boundary tiles are masked (plan Phase 6)."""
+    return ctx.get_value(node.args[0])
+
+
+@lowers(memory_ops.store)
 def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     """Record or apply a Helion store in the active loop context."""
     index_nodes = node.args[1]
@@ -71,8 +81,6 @@ def _store_into_synthetic_accumulator(
     ctx: BuildContext, index_nodes: list | tuple, value: ir.Value
 ) -> None:
     """Insert into the active loop level's synthetic per-iteration accumulator."""
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
 
     context = ctx.for_store_ctx_stack[-1]
     current = context.current
@@ -111,7 +119,6 @@ def _store_via_bound_target(
     node: torch.fx.Node,
 ) -> bool:
     """Try the descriptor-based terminal store; return False to defer."""
-    import mlir.ir as ir
 
     from ..support.errors import NodeLoweringError
 
@@ -142,7 +149,6 @@ def _store_via_deferred_target(
     node: torch.fx.Node,
 ) -> None:
     """Positional terminal store used when the destination has no SSA value yet."""
-    import mlir.ir as ir
 
     offsets: list[ir.Value] = []
     static_sizes: list[int] = []

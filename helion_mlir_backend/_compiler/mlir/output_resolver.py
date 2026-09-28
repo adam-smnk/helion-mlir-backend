@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import helion.language.memory_ops as memory_ops
 import torch
 import torch.fx
 
@@ -39,7 +40,7 @@ class OutputTensorResolver:
             for node in graph.nodes:
                 if (
                     node.op == "call_function"
-                    and getattr(node.target, "__name__", "") == "store"
+                    and node.target is memory_ops.store
                     and len(node.args) >= 1
                     and isinstance(node.args[0], torch.fx.Node)
                 ):
@@ -111,7 +112,7 @@ class OutputTensorResolver:
             for node in graph_info.graph.nodes:
                 if (
                     node.op == "call_function"
-                    and getattr(node.target, "__name__", "") == "store"
+                    and node.target is memory_ops.store
                     and len(node.args) >= 1
                     and isinstance(node.args[0], torch.fx.Node)
                 ):

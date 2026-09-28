@@ -201,11 +201,13 @@ def test_indexing_maps_for_high_dim_multi_reduction():
     import mlir.ir as ir
 
     from helion_mlir_backend._compiler.mlir.codegen import _get_shared_mlir_context
-    from helion_mlir_backend._compiler.mlir.lowering.einsum_ops import _indexing_maps
+    from helion_mlir_backend._compiler.mlir.lowering.contraction_ops import (
+        indexing_maps,
+    )
 
     spec = build_contract_spec(_HIGH_DIM_EQUATION, _HIGH_DIM_SHAPES)
     with _get_shared_mlir_context(), ir.Location.unknown():
-        maps = [str(ir.AffineMapAttr.get(m)) for m in _indexing_maps(spec)]
+        maps = [str(ir.AffineMapAttr.get(m)) for m in indexing_maps(spec)]
     assert maps == _HIGH_DIM_MAPS
 
 
@@ -607,8 +609,13 @@ def test_codegen_rejects_inconsistent_operand_shapes():
     from mlir.dialects import tensor as tensor_d
     import mlir.ir as ir
 
+    from helion_mlir_backend._compiler.mlir.analysis.contractions import (
+        match_contraction,
+    )
     from helion_mlir_backend._compiler.mlir.codegen import _get_shared_mlir_context
-    from helion_mlir_backend._compiler.mlir.lowering import lower_einsum
+    from helion_mlir_backend._compiler.mlir.lowering.contraction_ops import (
+        emit_contraction,
+    )
     from helion_mlir_backend._compiler.mlir.support.errors import (
         UnsupportedOperationError,
     )
@@ -629,20 +636,17 @@ def test_codegen_rejects_inconsistent_operand_shapes():
             rhs = tensor_d.EmptyOp([16, 32], f32).result
             ctx = _StubBuildContext({lhs_node: lhs, rhs_node: rhs})
             with pytest.raises(UnsupportedOperationError, match="bound to sizes"):
-                lower_einsum(ctx, einsum_node)
+                emit_contraction(ctx, match_contraction(einsum_node))
 
 
 class _StubBuildContext:
-    """Minimal ``BuildContext`` surface used by ``lower_einsum``."""
+    """Minimal ``BuildContext`` surface used by ``emit_contraction``."""
 
     def __init__(self, values):
         self._values = values
 
     def get_value(self, node):
         return self._values.get(node)
-
-    def set_value(self, node, value):
-        self._values[node] = value
 
 
 def test_genuinely_mismatched_extents_still_fail_in_type_propagation():

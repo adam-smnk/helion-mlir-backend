@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Literal
 
+import helion.language._tracing_ops as tracing_ops
 import torch
 import torch.fx
 
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from helion._compiler.host_function import HostFunction
 
 LoopKind = Literal["tile", "grid"]
-LOOP_TARGET_NAMES = ("_for_loop", "_for_loop_step")
+LOOP_TARGETS = (tracing_ops._for_loop, tracing_ops._for_loop_step)
 
 
 @dataclass(frozen=True)
@@ -152,7 +153,7 @@ class KernelGeometry:
 
 
 def is_loop_node(node: object) -> bool:
-    return getattr(getattr(node, "target", None), "__name__", "") in LOOP_TARGET_NAMES
+    return getattr(node, "target", None) in LOOP_TARGETS
 
 
 def loop_block_ids(hf: HostFunction, node: torch.fx.Node) -> list[int]:

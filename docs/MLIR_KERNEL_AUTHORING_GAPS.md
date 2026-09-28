@@ -180,9 +180,9 @@ the fast path should accept it explicitly: `linalg.matmul` supports mixed
 precision natively and this is *the* shape the AMX strategy looks for
 (`is_amx_bf16_contraction` requires bf16/bf16/f32).
 
-**RESOLVED.** `emit_matmul_like` now accepts a wider accumulator than its
-operands (bf16/bf16 -> f32, f16/f16 -> f32, i8/i8 -> i32) and keeps emitting
-`linalg.matmul` / `linalg.batch_matmul` directly.
+**RESOLVED.** The contraction lowering (now `lowering/contraction_ops.py`) accepts a
+wider accumulator than its operands (bf16/bf16 -> f32, f16/f16 -> f32, i8/i8 -> i32)
+and keeps emitting `linalg.matmul` / `linalg.batch_matmul` directly.
 
 ### 8. Host-tensor view / reshape and 4D matmul
 

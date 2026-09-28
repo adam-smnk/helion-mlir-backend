@@ -1,21 +1,15 @@
-"""ATen operation bridge for custom and generic lowering."""
+"""Generic ATen lowering through torch-mlir helper functions."""
 
 from __future__ import annotations
 
 from .aten_helper_table import AtenHelperTable
-from .aten_ops import aten_target_matches
-from .aten_ops import convert_tensor_element_type
-from .aten_ops import lower_custom_aten
-from .aten_ops import lower_passthrough
+from .helper_call import lower_via_aten_helper
 from .helper_rebuild import rebuild_aten_helper_for_call
 from .torch_mlir_pipeline import batch_import_and_lower
 
 __all__ = [
     "AtenHelperTable",
-    "aten_target_matches",
     "batch_import_and_lower",
-    "convert_tensor_element_type",
-    "lower_custom_aten",
-    "lower_passthrough",
+    "lower_via_aten_helper",
     "rebuild_aten_helper_for_call",
 ]

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import helion.language._tracing_ops as tracing_ops
+from mlir.dialects import tensor as tensor_d
+import mlir.ir as ir
 import torch
 
-if TYPE_CHECKING:
-    import mlir.ir as ir
+from .registry import lowers
 
+if TYPE_CHECKING:
     from ..build_context import BuildContext
 
 
+@lowers(tracing_ops._host_tensor)
 def lower_host_tensor(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Lower ``_host_tensor('name')`` to a function argument value."""
     name = node.args[0]
@@ -58,17 +62,12 @@ def materialize_host_tensor_alias_shape(
     downstream slices see the alias's real geometry instead of silently
     using the base type.
     """
-    from mlir.dialects import tensor as tensor_d
-    import mlir.ir as ir
 
-    try:
-        base_type = ir.RankedTensorType(base_value.type)
-        base_shape = [int(dim) for dim in base_type.shape]
-        element_type = base_type.element_type
-    except Exception:
-        # Native MLIR binding raises for a non-ranked-tensor type; treat as
-        # "not aliasable" rather than a specific error.
+    base_type = base_value.type
+    if not isinstance(base_type, ir.RankedTensorType):
         return None
+    base_shape = [int(dim) for dim in base_type.shape]
+    element_type = base_type.element_type
 
     alias_shape = ctx.shape_from_node_meta(alias_node)
     if alias_shape is None or base_shape == alias_shape:

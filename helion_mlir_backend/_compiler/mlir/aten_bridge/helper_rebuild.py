@@ -98,7 +98,7 @@ def rebuild_aten_helper_for_call(
 
         rebuilt = rebuilt_map.get(id(node))
         if rebuilt is not None:
-            ctx.node_to_aten_func[id(node)] = rebuilt
+            ctx.aten_helpers.entries[id(node)] = rebuilt
         return rebuilt
     finally:
         for argument_node, old_value, old_tensor_meta in backups:

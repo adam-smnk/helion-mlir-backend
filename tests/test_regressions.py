@@ -266,7 +266,7 @@ _CASES: dict[
         pytest.param("ragged_row_max", marks=_known_gap("I18: ragged reduction")),
         pytest.param("row_softmax", marks=_known_gap("I17: helper shape guessing")),
         pytest.param("where_relu", marks=_known_gap("I17: helper batch failure")),
-        pytest.param("acc_plus_addmm", marks=_known_gap("I5: mm matches addmm")),
+        "acc_plus_addmm",
         pytest.param("store_then_load", marks=_known_gap("I11: no store SSA state")),
         pytest.param(
             "nested_and_outer_store", marks=_known_gap("I11: first-store geometry")
@@ -276,7 +276,7 @@ _CASES: dict[
         pytest.param(
             "non_contiguous_input", marks=_known_gap("I15: strides ignored by ABI")
         ),
-        pytest.param("hl_dot", marks=_known_gap("I6: hl.dot unsupported")),
+        "hl_dot",
     ],
 )
 def test_review_probe(case: str) -> None:

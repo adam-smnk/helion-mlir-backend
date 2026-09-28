@@ -8,13 +8,13 @@ Mapping summary
 ---------------
 Helion construct          → MLIR construct
 ──────────────────────────────────────────────────────────────────────────────
-Outer ``hl.tile([m,n])``  → ``scf.forall`` (parallel) + ``shared_outs``
+Outer ``hl.tile([m,n])``  → normalized ``scf.forall`` + ``shared_outs``
 Inner ``hl.tile(k)``      → ``scf.for``   (sequential, carries accumulator)
 ``hl.zeros([bm,bn])``     → ``tensor.empty`` + ``linalg.fill``
 ``hl.load(t, idx)``       → ``tensor.extract_slice``
 ``hl.store(t, idx, v)``   → ``tensor.parallel_insert_slice`` (in forall term.)
-``torch.addmm``           → ``linalg.matmul``
-``aten.mm``               → ``linalg.matmul`` (zero-init outs)
+matmul family, ``hl.dot``,
+einsum, ``acc + mm``      → one ``linalg.matmul``/``batch_matmul``/``contract``
 Pointwise aten ops        → ``linalg.generic`` or ``arith.*``
 ``_host_tensor(name)``    → reference to the corresponding function argument
 ``_get_symnode(bs_N)``    → the concrete block-size integer constant
@@ -23,15 +23,14 @@ Pointwise aten ops        → ``linalg.generic`` or ``arith.*``
 
 ATen lowering architecture
 --------------------------
-This builder uses a hybrid design. Helion-specific device-IR nodes
-(``_for_loop``, ``_host_tensor``, ``_phi``, ``_new_var``, ``load``, and
-``store``) determine the tile/control-flow structure and lower directly to
-``scf``/``tensor``/``linalg`` operations. Generic ATen nodes are extracted
-into pure FX subgraphs by ``aten_lowering.py``, imported through
+Every node is dispatched by target identity through ``lowering/registry.py``.
+Helion-specific device-IR nodes determine the tile/control-flow structure and
+lower directly to ``scf``/``tensor``/``linalg`` operations. Generic ATen nodes
+are extracted into pure FX subgraphs by ``aten_lowering.py``, imported through
 ``torch_mlir.extras.fx_importer.FxImporter``, lowered through torch-mlir's
 Torch-to-Linalg pipeline, and cloned back into this module as private helper
-``func.func`` operations. A small set of manual ATen lowerings remains for
-Helion-specific operand conventions and recognized accumulation patterns.
+``func.func`` operations. A small set of direct ATen lowerings remains for
+Helion-specific operand conventions and contractions.
 
 This split is necessary because ``FxImporter`` cannot import Helion's
 non-ATen FX targets, while torch-mlir provides broad, reusable coverage for
@@ -42,29 +41,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import functools
 import logging
 from typing import TYPE_CHECKING
 
+from mlir.dialects import func as func_d
+import mlir.ir as ir
 import torch
 import torch.fx
 
 from .aten_bridge import AtenHelperTable
 from .build_context import BuildContext
-from .lowering import lower_load
-from .lowering import lower_nested_for_loop
-from .lowering import lower_store
-from .support import ModuleBuilderError
-from .support import NodeLoweringError
+from .lowering import build_kernel_body
+from .lowering import lower_node
+from .support import MLIRBackendError
 from .support import UnsupportedOperationError
-from .support import ValueNotFoundError
-from .support import block_id_from_key
-from .support import safe_int_conversion
 from .support import torch_tensor_to_mlir_type
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
-    import mlir.ir as ir
 
 log = logging.getLogger(__name__)
 
@@ -85,8 +81,6 @@ def _get_shared_mlir_context() -> ir.Context:
     """
     global _shared_mlir_context, _context_construction_count
     if _shared_mlir_context is None:
-        import mlir.ir as ir
-
         _context_construction_count += 1
         if _context_construction_count > 1:
             # A second construction means _shared_mlir_context was reset to
@@ -142,44 +136,29 @@ class MLIRModuleBuilder:
         self.config = config
         self.env = env
         self.context = BuildContext(host_function, config, env)
-        self.context.lower_node_callback = self._lower_node
-        self._helper_table: AtenHelperTable | None = None
+        self.context.lower_node_callback = functools.partial(lower_node, self.context)
 
     def build(self) -> ir.Module:
         """Build and return the generated MLIR module."""
-        import mlir.ir as ir
 
         try:
             ctx = _get_shared_mlir_context()
-            from mlir.dialects import arith as arith_d  # noqa: F401
-            from mlir.dialects import func as func_d  # noqa: F401
-            from mlir.dialects import linalg as linalg_d  # noqa: F401
-            from mlir.dialects import scf as scf_d  # noqa: F401
-            from mlir.dialects import tensor as tensor_d  # noqa: F401
 
             with ir.Location.unknown(ctx):
                 module = ir.Module.create()
                 self.context.mlir_module = module
                 self.context.mlir_context = ctx
-                self._helper_table = AtenHelperTable(module)
+                self.context.aten_helpers = AtenHelperTable(module)
                 with ir.InsertionPoint(module.body), self.hf:
                     self._resolve_geometry()
                     self._prebuild_aten_helpers(module)
                     self._build_function()
             return module
-        except (
-            ModuleBuilderError,
-            NodeLoweringError,
-            ValueNotFoundError,
-            UnsupportedOperationError,
-        ):
+        except MLIRBackendError:
             raise
         except Exception as exc:
-            raise ModuleBuilderError(
-                "module_creation",
-                reason=str(exc),
-                recovery_hint="Check that kernel has static_shapes=True and all ops are in hl.tile() loops",
-            ) from exc
+            exc.add_note(f"While generating MLIR for Helion kernel '{self.hf.name}'")
+            raise
 
     def build_phase_modules(self) -> list[PhaseModuleResult]:
         """Build one MLIR module per ``hl.barrier()``-separated phase.
@@ -189,10 +168,7 @@ class MLIRModuleBuilder:
         ``generate_mlir()``/``execute_mlir()`` two-call flow, which keeps
         using :meth:`build`'s single-module, single-phase-only contract.
         """
-        from mlir.dialects import func as func_d
-        import mlir.ir as ir
 
-        from .lowering import build_kernel_body
         from .phase_plan import build_phase_plans
         from .phase_plan import find_extra_host_tensor_names
         from .phase_plan import find_host_tensor_fake_value
@@ -217,10 +193,6 @@ class MLIRModuleBuilder:
         results: list[PhaseModuleResult] = []
         try:
             mlir_ctx = _get_shared_mlir_context()
-            from mlir.dialects import arith as arith_d  # noqa: F401
-            from mlir.dialects import linalg as linalg_d  # noqa: F401
-            from mlir.dialects import scf as scf_d  # noqa: F401
-            from mlir.dialects import tensor as tensor_d  # noqa: F401
 
             with ir.Location.unknown(mlir_ctx), self.hf:
                 self._resolve_geometry()
@@ -229,7 +201,7 @@ class MLIRModuleBuilder:
                     module = ir.Module.create()
                     self.context.mlir_module = module
                     self.context.mlir_context = mlir_ctx
-                    self._helper_table = AtenHelperTable(module)
+                    self.context.aten_helpers = AtenHelperTable(module)
                     phase_name = f"{self.hf.name}__phase{plan.phase_index}"
                     phase_graphs = iter_phase_graphs(self.hf, plan.root_ids)
 
@@ -296,19 +268,11 @@ class MLIRModuleBuilder:
                         )
                     )
             return results
-        except (
-            ModuleBuilderError,
-            NodeLoweringError,
-            ValueNotFoundError,
-            UnsupportedOperationError,
-        ):
+        except MLIRBackendError:
             raise
         except Exception as exc:
-            raise ModuleBuilderError(
-                "phase_module_creation",
-                reason=str(exc),
-                recovery_hint="Check that kernel has static_shapes=True and all ops are in hl.tile() loops",
-            ) from exc
+            exc.add_note(f"While generating MLIR for Helion kernel '{self.hf.name}'")
+            raise
 
     def _build_function(self) -> None:
         from .phase_plan import requires_multi_phase_driver
@@ -358,9 +322,6 @@ class MLIRModuleBuilder:
         tensor_params: list[tuple[str, torch.Tensor]],
         out_params: list[tuple[str, torch.Tensor]],
     ) -> None:
-        from mlir.dialects import func as func_d
-        import mlir.ir as ir
-
         output_types = [torch_tensor_to_mlir_type(t) for _, t in out_params]
         out_names = {name for name, _ in out_params}
         out_tensor_ids = {id(t) for _, t in out_params}
@@ -380,7 +341,7 @@ class MLIRModuleBuilder:
             if self.context.geometry is None:
                 with self.hf:
                     self._resolve_geometry()
-            func_d.ReturnOp(self._build_kernel_body([t for _, t in out_params]))
+            func_d.ReturnOp(build_kernel_body(self.context, [t for _, t in out_params]))
 
     def _find_output_tensors(
         self, tensor_params: list[tuple[str, torch.Tensor]]
@@ -390,405 +351,52 @@ class MLIRModuleBuilder:
         return OutputTensorResolver(self.hf).resolve_all(tensor_params)
 
     def _resolve_geometry(self) -> None:
-        """Record per-block-id loop geometry (needs ``with self.hf:``)."""
+        """Record loop geometry and contraction matches (needs ``with self.hf:``)."""
+        from .analysis.contractions import ContractionPlan
         from .analysis.geometry import KernelGeometry
 
         self.context.geometry = KernelGeometry.from_host_function(
             self.hf, self.config, self.env
         )
-
-    # ------------------------------------------------------------------
-    # Kernel body – outer forall structure
-    # ------------------------------------------------------------------
-
-    def _build_kernel_body(self, out_tensors: list[torch.Tensor]) -> list[ir.Value]:
-        from .lowering import build_kernel_body
-
-        return build_kernel_body(self.context, out_tensors)
-
-    # ------------------------------------------------------------------
-    # Root graph processing
-    # ------------------------------------------------------------------
-
-    def _process_root_graphs(self, shared_out: ir.Value) -> ir.Value:
-        return self.context.lower_root_graphs(shared_out)
-
-    # ------------------------------------------------------------------
-    # Graph walker
-    # ------------------------------------------------------------------
-
-    def _process_graph(self, graph: torch.fx.Graph) -> ir.Value | None:
-        return self.context.lower_graph(graph)
-
-    # ------------------------------------------------------------------
-    # Per-node lowering dispatcher
-    # ------------------------------------------------------------------
-
-    def _lower_node(self, node: torch.fx.Node) -> ir.Value | None:
-        """Dispatch a single FX node to the appropriate MLIR builder."""
-        if node.op == "placeholder":
-            # Handled when the graph is entered (for_loop iter args).
-            return self.context.node_to_value.get(node)
-
-        if node.op == "output":
-            return None
-
-        if node.op == "call_method":
-            return self._lower_call_method(node)
-
-        if node.op == "call_function":
-            target = node.target
-            tname = getattr(target, "__name__", str(target))
-
-            from .support import lower_helion_node
-
-            handled, value = lower_helion_node(self, node, tname)
-            if handled:
-                return value
-
-            from .aten_bridge import lower_custom_aten
-
-            lowered_custom = lower_custom_aten(self, node)
-            if lowered_custom is not None:
-                return lowered_custom
-            if tname == "subscript":
-                lowered_subscript = self._lower_subscript(node)
-                if lowered_subscript is not None:
-                    return lowered_subscript
-                raise UnsupportedOperationError(
-                    tname,
-                    reason=f"Unsupported subscript form with args={node.args!r}",
-                )
-            # --- All standard ATen ops → pre-built linalg helper (func.call) ---
-            from mlir.dialects import func as func_d
-
-            from .aten_lowering import collect_tensor_input_positions
-            from .aten_lowering import is_aten_op
-            from .aten_lowering import normalized_aten_args
-
-            if is_aten_op(node):
-                entry = (
-                    self._helper_table.get(id(node))
-                    if self._helper_table is not None
-                    else self.context.node_to_aten_func.get(id(node))
-                )
-                if entry is None:
-                    log.warning(
-                        "ATen node '%s' not found in pre-built helper map; "
-                        "it may have failed during preprocessing.",
-                        node.name,
-                    )
-                    raise UnsupportedOperationError(
-                        tname,
-                        reason="ATen node was not pre-lowered (check preprocessing warnings)",
-                    )
-                func_name, return_types = entry
-                norm_args = normalized_aten_args(node)
-                tensor_positions = collect_tensor_input_positions(node)
-                input_mlir_vals = [
-                    self._get_value(norm_args[i])
-                    for i in tensor_positions
-                    if isinstance(norm_args[i], torch.fx.Node)
-                    and self._get_value(norm_args[i]) is not None
-                ]
-
-                if not self._helper_signature_matches(func_name, input_mlir_vals):
-                    # Expected mismatch: the pre-built helper was generated
-                    # from a "typical" tile shape before codegen; rebuild a
-                    # variant from the concrete operand types actually bound
-                    # at this call site (e.g. a boundary tile).
-                    rebuilt = self._rebuild_aten_helper_for_call(
-                        node,
-                        input_mlir_vals,
-                    )
-                    if rebuilt is not None:
-                        func_name, return_types = rebuilt
-
-                if not self._helper_signature_matches(func_name, input_mlir_vals):
-                    raise NodeLoweringError(
-                        node,
-                        reason=(
-                            f"ATen helper '{func_name}' signature does not match "
-                            f"operand types {[str(v.type) for v in input_mlir_vals]} "
-                            "even after rebuilding"
-                        ),
-                        recovery_hint=(
-                            "Check that node.meta['val'] reflects the concrete "
-                            "tile shape at this call site"
-                        ),
-                    )
-
-                call = func_d.CallOp(return_types, func_name, input_mlir_vals)
-                return call.results[0] if call.results else None
-
-            # Not a helion op, not an ATen op.
-            log.warning("Unhandled FX op: %s (target=%s)", node.name, tname)
-            raise UnsupportedOperationError(
-                tname,
-                reason="Not a helion-specific op or a recognised ATen op",
-            )
-
-        return None
-
-    def _lower_aten_matmul(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering import lower_matmul
-
-        return lower_matmul(self.context, node)
-
-    def _lower_aten_baddbmm(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering import lower_baddbmm
-
-        return lower_baddbmm(self.context, node)
-
-    def _lower_call_method(self, node: torch.fx.Node) -> ir.Value | None:
-        """Lower selected Tensor call-method ops.
-
-        Supported today:
-        - ``contiguous`` / ``clone`` / ``detach``: treated as aliases.
-        - ``view`` / ``reshape`` only when shape is unchanged.
-
-        Shape-changing view/reshape/flatten forms are not lowered yet in this
-        path and must go through dedicated support.
-        """
-        method = str(node.target)
-
-        if not node.args:
-            return None
-
-        base = node.args[0]
-        base_val = self._get_value(base)
-        if base_val is None:
-            return None
-
-        if method in ("contiguous", "clone", "detach"):
-            return base_val
-
-        if method == "to":
-            from .aten_bridge import convert_tensor_element_type
-            from .support import torch_dtype_to_mlir
-
-            dtype = next(
-                (arg for arg in node.args[1:] if isinstance(arg, torch.dtype)),
-                node.kwargs.get("dtype"),
-            )
-            if dtype is None:
-                value = node.meta.get("val")
-                dtype = value.dtype if isinstance(value, torch.Tensor) else None
-            if dtype is None:
-                return base_val
-            return convert_tensor_element_type(
-                self.context, base_val, torch_dtype_to_mlir(dtype)
-            )
-
-        if method in ("t", "permute", "transpose"):
-            from .lowering import lower_transpose
-
-            return lower_transpose(self.context, node)
-
-        if method in ("view", "reshape"):
-            base_shape = self._shape_from_node_meta(base)
-            result_shape = self._shape_from_node_meta(node)
-            if base_shape is None or result_shape is None:
-                return None
-            if base_shape == result_shape:
-                return base_val
-            if any(dim <= 0 for dim in result_shape):
-                raise UnsupportedOperationError(
-                    method,
-                    reason="Only statically shaped view/reshape operations are supported",
-                )
-            from mlir.dialects import arith as arith_d
-            from mlir.dialects import tensor as tensor_d
-            import mlir.ir as ir
-
-            result_type = ir.RankedTensorType.get(
-                result_shape, ir.RankedTensorType(base_val.type).element_type
-            )
-            shape_type = ir.RankedTensorType.get(
-                [len(result_shape)], ir.IntegerType.get_signless(32)
-            )
-            shape_values = [
-                arith_d.ConstantOp(
-                    ir.IntegerType.get_signless(32),
-                    ir.IntegerAttr.get(ir.IntegerType.get_signless(32), dim),
-                ).result
-                for dim in result_shape
-            ]
-            shape = tensor_d.FromElementsOp(shape_type, shape_values).result
-            return tensor_d.ReshapeOp(result_type, base_val, shape).result
-
-        if method == "flatten":
-            raise UnsupportedOperationError(
-                method,
-                reason="call_method flatten lowering not implemented yet",
-            )
-
-        return None
-
-    def _shape_from_node_meta(self, node: object) -> list[int] | None:
-        return self.context.shape_from_node_meta(node)
-
-    # ------------------------------------------------------------------
-    # Helpers for retrieving values
-    # ------------------------------------------------------------------
-
-    def _get_value(self, node_or_val: object) -> ir.Value | None:
-        return self.context.get_value(node_or_val)
-
-    # ------------------------------------------------------------------
-    # Individual node lowering methods
-    # ------------------------------------------------------------------
-
-    def _lower_host_tensor(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering import lower_host_tensor
-
-        return lower_host_tensor(self.context, node)
-
-    def _lower_get_symnode(self, node: torch.fx.Node) -> ir.Value:
-        """``_get_symnode(key)`` → block-size constant or scalar grid/tile index."""
-        from mlir.dialects import arith as arith_d
-        import mlir.ir as ir
-
-        from .lowering import scalar_tile_value
-
-        key: str = node.args[0]
-        # Parse "block_size_N" to get block_id N.
-        block_id = block_id_from_key(key)
-        if block_id is not None:
-            if block_id not in self.context.geometry.blocks:
-                raise ValueNotFoundError(node, context=f"unknown block key: {key!r}")
-            size = self.context.geometry.block_size(block_id)
-            idx = ir.IndexType.get()
-            return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
-
-        # `hl.grid` and tile position symbols carry no block_size_ prefix; they
-        # resolve to a scalar index through their Helion symbol origin.
-        info = self.context.node_symbol_info(node)
-        if info is not None:
-            resolved = scalar_tile_value(self.context, info[0], info[1])
-            if resolved is not None:
-                return resolved
-
-        raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
-
-    def _lower_tile_scalar_op(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering import lower_tile_scalar_op
-
-        return lower_tile_scalar_op(self.context, node)
-
-    def _lower_tile_index(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering import lower_tile_index
-
-        return lower_tile_index(self.context, node)
-
-    def _lower_mask_to(self, node: torch.fx.Node) -> ir.Value | None:
-        """Conservatively forward masked tensors when the backend has no mask IR."""
-        if not node.args:
-            return None
-        return self._get_value(node.args[0])
-
-    def _lower_subscript(self, node: torch.fx.Node) -> ir.Value | None:
-        from .lowering import lower_subscript
-
-        return lower_subscript(self.context, node)
-
-    def _lower_sym_size(self, node: torch.fx.Node) -> ir.Value:
-        """``sym_size.int(tensor, dim)`` → constant for the tensor dimension."""
-        from mlir.dialects import arith as arith_d
-        import mlir.ir as ir
-
-        from .support import DynamicShapeError
-
-        val = node.meta.get("val")
-        try:
-            concrete = (
-                int(val)
-                if isinstance(val, torch.SymInt)
-                else safe_int_conversion(val, "shape_dimension")
-            )
-        except (TypeError, ValueError) as exc:
-            raise DynamicShapeError(val, symbol_name=node.name) from exc
-
-        idx = ir.IndexType.get()
-        return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, concrete)).result
-
-    def _lower_full(self, node: torch.fx.Node) -> ir.Value:
-        from .lowering import lower_full
-
-        return lower_full(self.context, node)
-
-    def _lower_zeros(self, node: torch.fx.Node) -> ir.Value:
-        from .lowering import lower_zeros
-
-        return lower_zeros(self.context, node)
-
-    def _lower_for_loop(self, node: torch.fx.Node) -> ir.Value:
-        return lower_nested_for_loop(self.context, node)
-
-    def _lower_load(self, node: torch.fx.Node) -> ir.Value:
-        return lower_load(self.context, node)
-
-    def _lower_store(self, node: torch.fx.Node) -> None:
-        lower_store(self.context, node)
-
-    def _lower_store_node(self, node: torch.fx.Node) -> ir.Value | None:
-        self._lower_store(node)
-        return None
-
-    # ------------------------------------------------------------------
-    # ATen pre-pass: lower all ATen nodes before codegen starts
-    # ------------------------------------------------------------------
+        self.context.contractions = ContractionPlan.from_graphs(
+            [graph_info.graph for graph_info in self.hf.device_ir.graphs]
+        )
 
     def _prebuild_aten_helpers(
         self, module: ir.Module, graphs: list[torch.fx.Graph] | None = None
     ) -> None:
-        """Scan device IR for ATen nodes, lower them all via one torch-mlir pass.
+        """Lower every ATen node without a direct lowering via one torch-mlir pass.
 
-        Results are stored in the context's ATen helper map and the helper
-        ``func.func`` operations are inserted at the module's top level.
-        Scoped to *graphs* when given (e.g. one phase's own graphs, for
-        ``build_phase_modules``), otherwise scans the whole kernel's.
+        Helper ``func.func`` operations are inserted at the module's top level and
+        recorded in ``self.context.aten_helpers``. Scoped to *graphs* when given
+        (one phase's own graphs), otherwise the whole kernel's.
         """
-        from .aten_bridge import aten_target_matches
         from .aten_lowering import is_aten_op
         from .aten_lowering import preprocess_aten_nodes
         from .einsum_capture import is_einsum_node
-
-        # Propagate symbolic shapes from outer _for_loop iter-args into inner
-        # loop body placeholders BEFORE scanning ATen nodes.  Without this,
-        # placeholder shapes in nested loop bodies are evaluated to their hint
-        # values (e.g. both tile_m and tile_n evaluate to 64), making them
-        # indistinguishable when resolving block_ids in _resolve_shape.
+        from .support import refresh_aten_tensor_meta
         from .support import restore_symbolic_shapes_in_bodies
 
+        # Nested loop-body placeholders must carry their outer symbolic shapes
+        # before ATen nodes are scanned (see symbolic_shape_restoration).
         restore_symbolic_shapes_in_bodies(self.hf, self.context)
-        self._refresh_aten_tensor_meta()
+        refresh_aten_tensor_meta(self.hf)
 
         search_graphs = (
             graphs
             if graphs is not None
             else [gi.graph for gi in self.hf.device_ir.graphs]
         )
-        aten_nodes: list[torch.fx.Node] = []
-        for graph in search_graphs:
-            for node in graph.nodes:
-                if is_aten_op(node):
-                    if is_einsum_node(node):
-                        continue
-                    if aten_target_matches(
-                        node,
-                        "aten.mm",
-                        "aten.matmul",
-                        "aten.bmm",
-                        "mm.default",
-                        "matmul.default",
-                        "bmm.default",
-                    ):
-                        continue
-                    if self.context.has_symint_operand(node):
-                        continue
-                    aten_nodes.append(node)
-
+        plan = self.context.contractions
+        aten_nodes = [
+            node
+            for graph in search_graphs
+            for node in graph.nodes
+            if is_aten_op(node)
+            and not is_einsum_node(node)
+            and plan.needs_helper(node)
+            and not self.context.has_symint_operand(node)
+        ]
         if not aten_nodes:
             return
 
@@ -799,30 +407,4 @@ class MLIRModuleBuilder:
             self.env,
             self.context.geometry.spans(),
         )
-        self.context.node_to_aten_func = entries
-        if self._helper_table is not None:
-            self._helper_table.replace(entries)
-
-    def _helper_signature_matches(
-        self,
-        func_name: str,
-        input_mlir_vals: list[ir.Value],
-    ) -> bool:
-        """Return True when helper function arg types match provided MLIR values."""
-        if self._helper_table is None:
-            return False
-        return self._helper_table.signature_matches(func_name, input_mlir_vals)
-
-    def _rebuild_aten_helper_for_call(
-        self,
-        node: torch.fx.Node,
-        input_mlir_vals: list[ir.Value],
-    ) -> tuple[str, list[ir.Type]] | None:
-        from .aten_bridge import rebuild_aten_helper_for_call
-
-        return rebuild_aten_helper_for_call(self.context, node, input_mlir_vals)
-
-    def _refresh_aten_tensor_meta(self) -> None:
-        from .support import refresh_aten_tensor_meta
-
-        refresh_aten_tensor_meta(self.hf)
+        self.context.aten_helpers.replace(entries)
