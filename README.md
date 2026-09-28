@@ -149,5 +149,11 @@ uv run ruff format helion_mlir_backend tests
 Run MLIR test suites:
 
 ```bash
-uv run --with pytest pytest tests/test_mlir_backend.py tests/test_mlir_integration.py -q
+uv run pytest                       # whole suite, in parallel (pytest-xdist, one worker per core)
+uv run pytest -m "not slow"         # skip the optimizing-pipeline and AMX IR tests
+uv run pytest tests/test_regressions.py   # files, node ids or -k run in-process
+uv run pytest -n 0                  # whole suite in one process
 ```
+
+Tests marked `isolated` (known native-crash probes and optimizing-pipeline runs) execute
+in a child forked from a pre-imported fork server, so a crash only fails that test.

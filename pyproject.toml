@@ -27,6 +27,7 @@ dev = [
   "pytest-timeout",
   "psutil",
   "hypothesis",
+  "pytest-xdist",
 ]
 
 # Based on Helion rules
@@ -78,6 +79,8 @@ ignore-words-list = "inout,inouts"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Parallel for whole-suite runs; see pytest_xdist_auto_num_workers in tests/conftest.py.
+addopts = ["-n", "auto"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 filterwarnings = [

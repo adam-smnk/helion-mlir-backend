@@ -19,8 +19,6 @@ from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 
-pytestmark = pytest.mark.isolated
-
 
 def _cfg(*block_sizes: int) -> helion.Config:
     return helion.Config(block_sizes=list(block_sizes))

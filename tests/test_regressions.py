@@ -25,11 +25,9 @@ def _cfg(*block_sizes: int) -> helion.Config:
     return helion.Config(block_sizes=list(block_sizes))
 
 
-def _known_gap(issue: str) -> pytest.MarkDecorator:
-    return pytest.mark.xfail(strict=True, reason=issue)
-
-
-pytestmark = pytest.mark.isolated
+def _known_gap(issue: str) -> list[pytest.MarkDecorator]:
+    # Known gaps can crash natively (e.g. out-of-bounds ragged tiles), so they run isolated.
+    return [pytest.mark.xfail(strict=True, reason=issue), pytest.mark.isolated]
 
 
 @helion.kernel(backend="mlir", static_shapes=True, config=_cfg(16))
