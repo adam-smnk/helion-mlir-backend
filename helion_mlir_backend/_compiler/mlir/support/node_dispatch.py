@@ -30,6 +30,7 @@ def lower_helion_node(
         "_new_var": lambda current: builder._get_value(current.args[0]),
         "_phi": lambda current: builder._get_value(current.args[1]),
         "_for_loop": builder._lower_for_loop,
+        "_for_loop_step": builder._lower_for_loop,
         "getitem": lambda current: lower_getitem(builder.context, current),
         "load": builder._lower_load,
         "store": builder._lower_store_node,

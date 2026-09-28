@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.fx
 
+from .analysis.geometry import is_loop_node
+
 if TYPE_CHECKING:
     from helion._compiler.host_function import HostFunction
 
@@ -160,10 +162,7 @@ def iter_phase_graphs(hf: HostFunction, root_ids: list[int]) -> list[torch.fx.Gr
         graph = stack.pop()
         graphs.append(graph)
         for node in graph.nodes:
-            if (
-                node.op == "call_function"
-                and getattr(node.target, "__name__", "") == "_for_loop"
-            ):
+            if node.op == "call_function" and is_loop_node(node):
                 stack.append(device_ir.graphs[node.args[0]].graph)
     return graphs
 

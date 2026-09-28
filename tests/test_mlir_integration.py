@@ -409,7 +409,7 @@ class TestScalarBlockIndices:
         assert "arith.minsi" not in exact_ir, "evenly divided extent needs no clamp"
 
     def test_tile_id_divides_by_block_size(self):
-        """`tile.id` lowers to offset / block_size."""
+        """`tile.id` of an outer tile is the normalized forall IV (offset / block_size)."""
 
         @helion.kernel(static_shapes=True)
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -423,7 +423,8 @@ class TestScalarBlockIndices:
             kernel, [torch.randn(40, 32)], config=helion.Config(block_sizes=[16])
         )
         module.operation.verify()
-        assert "arith.divui" in str(module)
+        assert "arith.divui" not in str(module)
+        assert "scf.forall (%arg1) in (3)" in str(module)
 
     def test_tile_count_is_constant(self):
         """`tile.count` folds to a compile-time cdiv constant."""

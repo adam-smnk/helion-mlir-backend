@@ -1,0 +1,130 @@
+"""Shared helpers for MLIR backend tests."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+import torch
+
+from helion_mlir_backend import generate_mlir
+from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+
+    import helion
+
+
+@contextlib.contextmanager
+def scalar_pipeline() -> Iterator[None]:
+    """Force the scalar lighthouse pipeline regardless of ``HELION_MLIR_PIPELINE``."""
+    with patch.dict(os.environ, {"HELION_MLIR_PIPELINE": "0"}):
+        yield
+
+
+@contextlib.contextmanager
+def opt_pipeline() -> Iterator[None]:
+    """Force the backend's optimizing lighthouse pipeline."""
+    with patch.dict(os.environ, {"HELION_MLIR_PIPELINE": "1"}):
+        yield
+
+
+def execute_module(module: object, *tensors: torch.Tensor, kernel_name: str) -> object:
+    """Run a module from ``generate_mlir`` on the scalar pipeline."""
+    with scalar_pipeline():
+        return MLIRBackend().execute_mlir(module, *tensors, kernel_name=kernel_name)
+
+
+def run_generated(
+    kernel: helion.Kernel,
+    args: list[object],
+    *,
+    config: helion.Config | None = None,
+) -> object:
+    """Run ``kernel`` through the explicit ``generate_mlir``/``execute_mlir`` flow."""
+    module = generate_mlir(kernel, list(args), config=config)
+    tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
+    return execute_module(module, *tensors, kernel_name=kernel.fn.__name__)
+
+
+def run_direct(kernel: helion.Kernel, args: list[object]) -> object:
+    """Run ``kernel`` through the direct ``@helion.kernel(backend="mlir")`` call path."""
+    with scalar_pipeline():
+        return kernel(*args)
+
+
+def check_kernel(
+    kernel: helion.Kernel,
+    reference: Callable[..., object],
+    args: list[object],
+    *,
+    paths: tuple[str, ...] = ("direct",),
+    config: helion.Config | None = None,
+    region: tuple[slice, ...] | None = None,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> None:
+    """Assert that ``kernel(*args)`` matches ``reference(*args)`` on every requested path.
+
+    ``reference`` runs on clones so in-place kernels and references cannot see each
+    other's writes. ``region`` restricts the comparison to the part of the output the
+    kernel writes.
+    """
+    expected = reference(*_clone_args(args))
+    for path in paths:
+        if path == "direct":
+            actual = run_direct(kernel, _clone_args(args))
+        elif path == "generated":
+            actual = run_generated(kernel, _clone_args(args), config=config)
+        else:
+            raise ValueError(f"unknown execution path {path!r}")
+        if region is not None:
+            torch.testing.assert_close(
+                actual[region], expected[region], atol=atol, rtol=rtol, msg=path
+            )
+            continue
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=path)
+
+
+def _clone_args(args: list[object]) -> list[object]:
+    return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
+
+
+def blocked_matmul_cases() -> dict[str, tuple[helion.Kernel, list[object]]]:
+    """Production bf16 blocked-matmul kernels from ``helion_mlir_cpu_utils`` with inputs."""
+    import importlib
+
+    cpu_matmul = importlib.import_module("helion_mlir_cpu_utils.matmul")
+
+    def bf16(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape, dtype=torch.bfloat16)
+
+    vector = [torch.randn(2, 1, 32) for _ in range(3)]
+    return {
+        "blocked_matmul": (
+            cpu_matmul._matmul_blocked_kernel,
+            [bf16(2, 2, 32, 32), bf16(2, 2, 32, 32), cpu_matmul.identity_epilogue],
+        ),
+        "blocked_matmul_bias": (
+            cpu_matmul._matmul_blocked_kernel_bias,
+            [
+                bf16(2, 2, 32, 32),
+                bf16(2, 2, 32, 32),
+                vector[0],
+                cpu_matmul.identity_epilogue,
+            ],
+        ),
+        "blocked_matmul_affine": (
+            cpu_matmul._matmul_blocked_kernel_affine,
+            [
+                bf16(2, 2, 32, 32),
+                bf16(2, 2, 32, 32),
+                *vector,
+                cpu_matmul.identity_epilogue,
+            ],
+        ),
+    }

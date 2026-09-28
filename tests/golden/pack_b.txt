@@ -1,0 +1,14 @@
+func.func {function_type=(tensor<64x64xbf16>) -> tensor<2x64x32xbf16>, sym_name=@sym0, sym_visibility="public"}
+  ^(tensor<64x64xbf16>)
+  tensor.empty -> tensor<2x64x32xbf16>
+  scf.forall {operandSegmentSizes=array<i32: 0, 0, 0, 1>, staticLowerBound=array<i64: 0>, staticStep=array<i64: 1>, staticUpperBound=array<i64: 2>} -> tensor<2x64x32xbf16>
+    ^(index, tensor<2x64x32xbf16>)
+    tensor.expand_shape {reassociation=[[0], [1, 2]], static_output_shape=array<i64: 64, 2, 32>} -> tensor<64x2x32xbf16>
+    tensor.extract_slice {operandSegmentSizes=array<i32: 1, 1, 0, 0>, static_offsets=array<i64: 0, -9223372036854775808, 0>, static_sizes=array<i64: 64, 1, 32>, static_strides=array<i64: 1, 1, 1>} -> tensor<64x1x32xbf16>
+    tensor.empty -> tensor<1x64x32xbf16>
+    linalg.transpose {permutation=array<i64: 1, 0, 2>} -> tensor<1x64x32xbf16>
+      ^(bf16, bf16)
+      linalg.yield
+    scf.forall.in_parallel
+      tensor.parallel_insert_slice {operandSegmentSizes=array<i32: 1, 1, 1, 0, 0>, static_offsets=array<i64: -9223372036854775808, 0, 0>, static_sizes=array<i64: 1, 64, 32>, static_strides=array<i64: 1, 1, 1>}
+  func.return

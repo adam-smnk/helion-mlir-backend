@@ -144,13 +144,13 @@ def plan_slice(
         else:
             offset = ctx.index_const(bias)
 
-        tile_size = ctx.block_id_to_size.get(block_id, 1)
-        upper_bound = ctx.block_id_to_upper_bound.get(block_id)
+        if block_id not in ctx.geometry.blocks:
+            raise NodeLoweringError(
+                index_node,
+                reason=f"Tile index at dimension {dimension} names unknown block_id {block_id}",
+            )
         base_extent = int(base_type.shape[dimension])
-
-        if upper_bound is not None:
-            tile_size = min(tile_size, upper_bound)
-        tile_size = min(tile_size, base_extent)
+        tile_size = min(ctx.geometry.tile_extent(block_id), base_extent)
 
         # Same local-slot invariant as the scalar case above: if the base
         # tensor's extent here exactly equals one tile's worth, this

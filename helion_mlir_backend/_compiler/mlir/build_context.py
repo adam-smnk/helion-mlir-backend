@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     import mlir.ir as ir
     import torch.fx
 
+    from .analysis.geometry import KernelGeometry
     from .lowering.for_store_context import ForStoreContext
 
 
@@ -34,28 +35,22 @@ class BuildContext:
     node_to_value: dict[torch.fx.Node, ir.Value] = field(default_factory=dict)
     param_to_value: dict[str, ir.Value] = field(default_factory=dict)
 
-    block_id_to_size: dict[int, int] = field(default_factory=dict)
-    block_id_to_upper_bound: dict[int, int] = field(default_factory=dict)
-    # The real extent of the dimension a block id tiles (e.g. ``m`` in
-    # ``for tile_m in hl.tile([m])``), independent of any output tensor's
-    # shape. Populated once from ``env.block_sizes`` (see
-    # ``codegen.py::_resolve_block_sizes``); used to bound the outer
-    # ``scf.forall`` by the loop's own declared domain instead of an output
-    # tensor's shape, which can be larger (e.g. a padded output written by a
-    # smaller, unpadded loop).
-    block_id_to_domain_size: dict[int, int] = field(default_factory=dict)
+    geometry: KernelGeometry | None = None
 
     # Written directly once per outer grid block id (build_kernel_body) then
     # save/restored per nested scf.for level via enter_for_loop(); read
-    # everywhere a block id's current induction variable is needed.
+    # everywhere a block id's current induction variable is needed. The value is
+    # the tile's absolute offset (``begin + trip * step``).
     block_id_to_iv: dict[int, ir.Value] = field(default_factory=dict)
+    # The active loop's (begin, end) per block id, as static ints or index values.
+    block_id_to_bounds: dict[int, tuple[int | ir.Value, int | ir.Value]] = field(
+        default_factory=dict
+    )
+    # Normalized (unit-step) trip index of an outer forall dimension, when known.
+    block_id_to_trip_iv: dict[int, ir.Value] = field(default_factory=dict)
     forall_insert_slices: list[tuple] = field(default_factory=list)
     # Mutate only via push_store_ctx(); read the top via for_store_ctx_stack[-1].
     for_store_ctx_stack: list[ForStoreContext] = field(default_factory=list)
-    # Mutate only via enter_for_loop(); read as a last-resort fallback (top of
-    # stack = innermost active loop's block id) when a scalar tile op has no
-    # other way to resolve which block id it belongs to.
-    for_block_id_stack: list[int] = field(default_factory=list)
 
     mlir_module: ir.Module | None = None
     mlir_context: ir.Context | None = None
@@ -98,6 +93,12 @@ class BuildContext:
             index_type,
             ir.IntegerAttr.get(index_type, value),
         ).result
+
+    def as_index(self, value: int | ir.Value) -> ir.Value:
+        """An index value for a static int or an existing scalar value."""
+        if isinstance(value, int):
+            return self.index_const(value)
+        return self.cast_to_index(value)
 
     def cast_to_index(self, value: ir.Value) -> ir.Value:
         """Cast an integer or rank-zero tensor value to MLIR index type."""
@@ -185,12 +186,8 @@ class BuildContext:
                 target_name = getattr(shape_node.target, "__name__", "")
                 if target_name == "_get_symnode" and shape_node.args:
                     block_id = block_id_from_key(shape_node.args[0])
-                    if block_id is not None and block_id in self.block_id_to_size:
-                        size = self.block_id_to_size[block_id]
-                        upper_bound = self.block_id_to_upper_bound.get(block_id)
-                        if upper_bound is not None:
-                            size = min(size, upper_bound)
-                        shape.append(size)
+                    if block_id is not None and block_id in self.geometry.blocks:
+                        shape.append(self.geometry.tile_extent(block_id))
                         continue
                 if (
                     target_name in ("sym_size.int", "sym_size_int")
@@ -209,9 +206,9 @@ class BuildContext:
 
                         resolved = _resolve_dims(
                             value.shape,
-                            self.block_id_to_size,
+                            self.geometry.block_sizes(),
                             self.env,
-                            self.block_id_to_upper_bound,
+                            self.geometry.spans(),
                         )
                         if 0 <= dim < len(resolved):
                             shape.append(resolved[dim])
@@ -219,8 +216,8 @@ class BuildContext:
                 value = shape_node.meta.get("val")
                 if isinstance(value, torch.SymInt):
                     block_id = self.env.get_block_id(value)
-                    if block_id is not None and block_id in self.block_id_to_size:
-                        shape.append(self.block_id_to_size[block_id])
+                    if block_id is not None and block_id in self.geometry.blocks:
+                        shape.append(self.geometry.block_size(block_id))
                         continue
                 if value is not None:
                     try:
@@ -323,27 +320,34 @@ class BuildContext:
         """
         self.param_to_value.clear()
         self.block_id_to_iv.clear()
+        self.block_id_to_bounds.clear()
+        self.block_id_to_trip_iv.clear()
         self.forall_insert_slices.clear()
         self.for_store_ctx_stack.clear()
-        self.for_block_id_stack.clear()
 
     @contextmanager
     def enter_for_loop(
-        self, block_id: int, induction_variable: ir.Value
+        self,
+        block_id: int,
+        induction_variable: ir.Value,
+        bounds: tuple[int | ir.Value, int | ir.Value],
     ) -> Generator[None]:
-        """Bind a loop induction variable and restore the previous binding."""
+        """Bind a loop induction variable and bounds, restoring the previous ones."""
         previous = self.block_id_to_iv.get(block_id)
+        previous_bounds = self.block_id_to_bounds.get(block_id)
         self.block_id_to_iv[block_id] = induction_variable
-        self.for_block_id_stack.append(block_id)
+        self.block_id_to_bounds[block_id] = bounds
         try:
             yield
         finally:
-            if self.for_block_id_stack and self.for_block_id_stack[-1] == block_id:
-                self.for_block_id_stack.pop()
             if previous is None:
                 self.block_id_to_iv.pop(block_id, None)
             else:
                 self.block_id_to_iv[block_id] = previous
+            if previous_bounds is None:
+                self.block_id_to_bounds.pop(block_id, None)
+            else:
+                self.block_id_to_bounds[block_id] = previous_bounds
 
     @contextmanager
     def push_store_ctx(self, store_context: ForStoreContext) -> Generator[None]:

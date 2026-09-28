@@ -19,12 +19,11 @@ def restore_symbolic_shapes_in_bodies(
     context: BuildContext,
 ) -> None:
     """Copy outer loop metadata into nested body placeholders."""
+    from ..analysis.geometry import is_loop_node
+
     for graph_info in host_function.device_ir.graphs:
         for node in graph_info.graph.nodes:
-            if (
-                node.op != "call_function"
-                or getattr(node.target, "__name__", "") != "_for_loop"
-            ):
+            if node.op != "call_function" or not is_loop_node(node):
                 continue
             body_graph = host_function.device_ir.graphs[node.args[0]].graph
             placeholders = [
@@ -34,11 +33,7 @@ def restore_symbolic_shapes_in_bodies(
                 placeholders, node.args[3], strict=False
             ):
                 _restore_placeholder_metadata(
-                    placeholder,
-                    outer_node,
-                    body_graph,
-                    node.args[2] if len(node.args) > 2 else None,
-                    context,
+                    placeholder, outer_node, body_graph, context
                 )
 
 
@@ -46,7 +41,6 @@ def _restore_placeholder_metadata(
     placeholder: torch.fx.Node,
     outer_node: object,
     body_graph: torch.fx.Graph,
-    upper_bounds: object,
     context: BuildContext,
 ) -> None:
     if not isinstance(outer_node, torch.fx.Node):
@@ -62,14 +56,6 @@ def _restore_placeholder_metadata(
         return
 
     concrete_shape = context.shape_from_nodes(list(shape_arg), "iter_arg")
-    if isinstance(upper_bounds, (list, tuple)):
-        for index, bound in enumerate(upper_bounds):
-            if index >= len(concrete_shape):
-                break
-            try:
-                concrete_shape[index] = min(concrete_shape[index], int(bound))
-            except (TypeError, ValueError):
-                continue
     concrete_value = torch.zeros(concrete_shape, dtype=outer_value.dtype)
     placeholder.meta["val"] = concrete_value
     _propagate_body_metadata(
@@ -112,7 +98,9 @@ def _propagate_body_metadata(
             body_node.meta["val"] = concrete_value
             continue
         if target_name in ("sym_size.int", "sym_size_int"):
-            _propagate_sym_size(body_node, placeholder, concrete_shape, shape_arg)
+            _propagate_sym_size(
+                body_node, placeholder, concrete_shape, shape_arg, context
+            )
             continue
         if target_name == "load":
             _propagate_load_shape(body_node, context)
@@ -123,6 +111,7 @@ def _propagate_sym_size(
     placeholder: torch.fx.Node,
     concrete_shape: list[int],
     shape_arg: list,
+    context: BuildContext,
 ) -> None:
     dimension = node.args[1] if len(node.args) > 1 else None
     if not (node.args and node.args[0] is placeholder and isinstance(dimension, int)):
@@ -133,7 +122,13 @@ def _propagate_sym_size(
     # identity, so tag the block id it came from using the same
     # ``tile_with_offset`` convention Helion's own device-IR pass uses (read
     # by ``resolve_index_descriptor``), instead of a side id()-keyed map.
-    if dimension < len(shape_arg):
+    block_id = None
+    previous = node.meta.get("val")
+    if isinstance(previous, torch.SymInt):
+        info = context.symbol_info(previous)
+        if info is not None and info[1] == "block_size":
+            block_id = info[0]
+    if block_id is None and dimension < len(shape_arg):
         shape_node = shape_arg[dimension]
         if (
             isinstance(shape_node, torch.fx.Node)
@@ -141,8 +136,8 @@ def _propagate_sym_size(
             and shape_node.args
         ):
             block_id = block_id_from_key(shape_node.args[0])
-            if block_id is not None:
-                node.meta["tile_with_offset"] = {"block_id": block_id, "offset": 0}
+    if block_id is not None:
+        node.meta["tile_with_offset"] = {"block_id": block_id, "offset": 0}
     node.meta["val"] = concrete_shape[dimension]
 
 

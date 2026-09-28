@@ -30,3 +30,6 @@ class ForStoreContext:
     # id() of the destination FakeTensor this eventually flushes into (when
     # known) -- routes the flush to the right output when a phase has >1.
     target_tensor_id: int | None = None
+    # (dim, begin, size): the accumulator is indexed absolutely along the
+    # loop's own dimension, so only ``[begin, begin + size)`` is flushed.
+    flush_window: tuple[int, int, int] | None = None

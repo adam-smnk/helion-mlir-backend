@@ -3,28 +3,14 @@ generic torch-mlir helper path (Phase 5 of the MLIR backend cleanup)."""
 
 from __future__ import annotations
 
-import os
-from unittest.mock import patch
-
 import helion
 import helion.language as hl
 import pytest
 import torch
 
+from tests.harness import execute_module as _execute
+
 from helion_mlir_backend import generate_mlir
-
-try:
-    from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
-
-    _backend = MLIRBackend
-except Exception:  # pragma: no cover
-    _backend = None
-
-
-def _execute(module, *tensors, kernel_name):
-    # Generic reductions are outside the AMX-specialized pipeline's scope.
-    with patch.dict(os.environ, {"HELION_MLIR_PIPELINE": "0"}):
-        return _backend().execute_mlir(module, *tensors, kernel_name=kernel_name)
 
 
 def test_sum_reduction():

@@ -77,9 +77,9 @@ def rebuild_aten_helper_for_call(
             rebuilt_map = preprocess_aten_nodes(
                 [node],
                 ctx.mlir_module,
-                ctx.block_id_to_size,
+                ctx.geometry.block_sizes(),
                 ctx.env,
-                ctx.block_id_to_upper_bound,
+                ctx.geometry.spans(),
                 {id(node): overrides},
             )
         except Exception as exc:

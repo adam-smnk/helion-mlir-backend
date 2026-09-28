@@ -40,7 +40,6 @@ the ordinary ATen portions of each tile body.
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from dataclasses import field
 import logging
@@ -164,8 +163,7 @@ class MLIRModuleBuilder:
                 self.context.mlir_context = ctx
                 self._helper_table = AtenHelperTable(module)
                 with ir.InsertionPoint(module.body), self.hf:
-                    self._resolve_block_sizes()
-                    self._resolve_block_upper_bounds()
+                    self._resolve_geometry()
                     self._prebuild_aten_helpers(module)
                     self._build_function()
             return module
@@ -225,8 +223,7 @@ class MLIRModuleBuilder:
             from mlir.dialects import tensor as tensor_d  # noqa: F401
 
             with ir.Location.unknown(mlir_ctx), self.hf:
-                self._resolve_block_sizes()
-                self._resolve_block_upper_bounds()
+                self._resolve_geometry()
 
                 for plan in plans:
                     module = ir.Module.create()
@@ -380,9 +377,9 @@ class MLIRModuleBuilder:
         with ir.InsertionPoint(entry):
             for (name, _), arg in zip(input_params, entry.arguments, strict=True):
                 self.context.param_to_value[name] = arg
-            if not self.context.block_id_to_size:
+            if self.context.geometry is None:
                 with self.hf:
-                    self._resolve_block_sizes()
+                    self._resolve_geometry()
             func_d.ReturnOp(self._build_kernel_body([t for _, t in out_params]))
 
     def _find_output_tensors(
@@ -392,72 +389,13 @@ class MLIRModuleBuilder:
 
         return OutputTensorResolver(self.hf).resolve_all(tensor_params)
 
-    def _resolve_block_sizes(self) -> None:
-        """Populate ``block_id_to_size`` from the active config."""
-        for bs in self.env.block_sizes:
-            # from_config requires HostFunction.current() — active via `with self.hf:`.
-            config_val = bs.from_config(self.config)
-            size = config_val if config_val is not None else bs.size
-            if isinstance(size, torch.SymInt):
-                try:
-                    size = int(size)
-                except (TypeError, ValueError):
-                    log.warning("block_id %d has dynamic size %s", bs.block_id, size)
-                    size = -1
-            else:
-                size = int(size)
-            self.context.block_id_to_size[bs.block_id] = size
-            with contextlib.suppress(TypeError, ValueError):
-                self.context.block_id_to_domain_size[bs.block_id] = bs.size_hint()
+    def _resolve_geometry(self) -> None:
+        """Record per-block-id loop geometry (needs ``with self.hf:``)."""
+        from .analysis.geometry import KernelGeometry
 
-    def _resolve_block_upper_bounds(self) -> None:
-        """Infer static upper bounds per block_id from ``_for_loop`` nodes.
-
-        A nested ``_for_loop`` can declare a reused *placeholder* block id
-        equal to an enclosing grid/combined-tile block id (Helion's own
-        convention; the loop's real identity is only resolved later, during
-        lowering, by scanning its body -- see ``_find_reused_block_id``).
-        Trusting such a declaration here would silently clobber the outer
-        block's real upper bound with the inner loop's unrelated extent
-        (observed to corrupt a combined-tile dimension's clamp and produce a
-        wrong-shaped ``linalg.matmul`` operand). Skip any block id that is
-        also a known outer grid/tile block id; ``build_kernel_body`` sets
-        those bounds correctly and separately from the output shape.
-        """
-        grid_block_ids = {
-            bid for ids in self.hf.device_ir.grid_block_ids for bid in ids
-        }
-        for graph_info in self.hf.device_ir.graphs:
-            for node in graph_info.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                if getattr(node.target, "__name__", "") != "_for_loop":
-                    continue
-
-                block_ids = node.args[1] if len(node.args) > 1 else None
-                upper_bounds = node.args[2] if len(node.args) > 2 else None
-                if not isinstance(block_ids, (list, tuple)):
-                    continue
-                if not isinstance(upper_bounds, (list, tuple)):
-                    continue
-
-                for bid, ub in zip(block_ids, upper_bounds, strict=False):
-                    try:
-                        block_id = int(bid)
-                        ub_int = int(ub)
-                    except (TypeError, ValueError):
-                        continue
-                    if ub_int <= 0:
-                        continue
-                    if block_id in grid_block_ids:
-                        continue
-                    prev = self.context.block_id_to_upper_bound.get(block_id)
-                    if prev is None:
-                        self.context.block_id_to_upper_bound[block_id] = ub_int
-                    else:
-                        self.context.block_id_to_upper_bound[block_id] = min(
-                            prev, ub_int
-                        )
+        self.context.geometry = KernelGeometry.from_host_function(
+            self.hf, self.config, self.env
+        )
 
     # ------------------------------------------------------------------
     # Kernel body – outer forall structure
@@ -717,7 +655,9 @@ class MLIRModuleBuilder:
         # Parse "block_size_N" to get block_id N.
         block_id = block_id_from_key(key)
         if block_id is not None:
-            size = self.context.block_id_to_size.get(block_id, 0)
+            if block_id not in self.context.geometry.blocks:
+                raise ValueNotFoundError(node, context=f"unknown block key: {key!r}")
+            size = self.context.geometry.block_size(block_id)
             idx = ir.IndexType.get()
             return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, size)).result
 
@@ -753,28 +693,21 @@ class MLIRModuleBuilder:
         return lower_subscript(self.context, node)
 
     def _lower_sym_size(self, node: torch.fx.Node) -> ir.Value:
-        """``sym_size.int(tensor, dim)`` → constant for the tensor dimension.
-
-        Tolerates dynamic shapes (SymInt) by attempting resolution.
-        """
+        """``sym_size.int(tensor, dim)`` → constant for the tensor dimension."""
         from mlir.dialects import arith as arith_d
         import mlir.ir as ir
 
-        # For static shapes the dimension is a concrete integer.
+        from .support import DynamicShapeError
+
         val = node.meta.get("val")
-        if isinstance(val, torch.SymInt):
-            # Try to resolve SymInt
-            try:
-                concrete = int(val)
-            except (TypeError, ValueError):
-                log.warning("Could not resolve SymInt in sym_size: %s", val)
-                concrete = 0
-        else:
-            try:
-                concrete = safe_int_conversion(val, "shape_dimension")
-            except TypeError:
-                log.warning("Could not convert shape dimension: %s", val)
-                concrete = 0
+        try:
+            concrete = (
+                int(val)
+                if isinstance(val, torch.SymInt)
+                else safe_int_conversion(val, "shape_dimension")
+            )
+        except (TypeError, ValueError) as exc:
+            raise DynamicShapeError(val, symbol_name=node.name) from exc
 
         idx = ir.IndexType.get()
         return arith_d.ConstantOp(idx, ir.IntegerAttr.get(idx, concrete)).result
@@ -862,9 +795,9 @@ class MLIRModuleBuilder:
         entries = preprocess_aten_nodes(
             aten_nodes,
             module,
-            self.context.block_id_to_size,
+            self.context.geometry.block_sizes(),
             self.env,
-            self.context.block_id_to_upper_bound,
+            self.context.geometry.spans(),
         )
         self.context.node_to_aten_func = entries
         if self._helper_table is not None:

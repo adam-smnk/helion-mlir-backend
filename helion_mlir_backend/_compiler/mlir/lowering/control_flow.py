@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..analysis.geometry import is_loop_node
+
 if TYPE_CHECKING:
     import mlir.ir as ir
     import torch
 
+    from ..analysis.geometry import LoopBounds
     from ..build_context import BuildContext
     from .for_store_context import ForStoreContext
 
@@ -65,24 +68,21 @@ def _block_id_to_out_dim_from_terminal_store(
     return None
 
 
-def _resolve_grid_upper_bound(
-    ctx: BuildContext, block_id: int, out_dim_size: int
-) -> int:
-    """The outer ``scf.forall``'s real upper bound for one grid block id.
+def _tile_offset(
+    ctx: BuildContext, trip_iv: ir.Value, begin: int, step: int
+) -> ir.Value:
+    """Absolute tile offset ``begin + trip_iv * step`` for a normalized forall IV."""
+    from mlir.dialects import affine as affine_d
+    import mlir.ir as ir
 
-    Prefers the tile loop's own declared domain size (``hl.tile([m, ...])``'s
-    ``m``, tracked in ``block_id_to_domain_size``) over the output tensor's
-    matching dimension. These normally agree, but can genuinely differ when
-    the loop's domain is smaller than the output it writes into (e.g. a
-    smaller, unpadded loop storing into a larger, separately-allocated
-    padded output) -- using the output's (larger) shape there would make the
-    generated ``scf.forall`` iterate past the loop's real domain, reading
-    out of bounds from any *input* tensor sized to that same domain.
-    """
-    domain_size = ctx.block_id_to_domain_size.get(block_id)
-    if domain_size is not None and domain_size > 0:
-        return min(domain_size, out_dim_size)
-    return out_dim_size
+    if begin == 0 and step == 1:
+        return trip_iv
+    expr = ir.AffineExpr.get_add(
+        ir.AffineExpr.get_mul(ir.AffineDimExpr.get(0), ir.AffineConstantExpr.get(step)),
+        ir.AffineConstantExpr.get(begin),
+    )
+    affine_map = ir.AffineMap.get(1, 0, [expr])
+    return affine_d.AffineApplyOp(affine_map, [trip_iv]).result
 
 
 def build_kernel_body(
@@ -143,7 +143,6 @@ def build_kernel_body(
             block_id: out_dim for out_dim, block_id in enumerate(grid_block_ids_flat)
         }
 
-    lbs = [0] * len(grid_block_ids_flat)
     for idx, bid in enumerate(grid_block_ids_flat):
         if block_id_to_out_dim.get(bid, idx) >= len(out_shape):
             from ..support import UnsupportedOperationError
@@ -166,13 +165,11 @@ def build_kernel_body(
                     ),
                 ],
             )
-    ubs = [
-        _resolve_grid_upper_bound(
-            ctx, bid, out_shape[block_id_to_out_dim.get(bid, idx)]
-        )
-        for idx, bid in enumerate(grid_block_ids_flat)
+    geometry = ctx.geometry
+    root_bounds = [geometry.root_bounds[bid] for bid in grid_block_ids_flat]
+    trip_counts = [
+        -(-(bounds.end - bounds.begin) // bounds.step) for bounds in root_bounds
     ]
-    steps = [ctx.block_id_to_size[block_id] for block_id in grid_block_ids_flat]
 
     if len(out_tensors) > 1:
         _validate_multi_output_shapes(out_tensors, out_shape, block_id_to_out_dim)
@@ -187,15 +184,22 @@ def build_kernel_body(
     # raggedness correctly. A single iteration (step >= extent) is also
     # unaffected since slice_plan already clamps that case statically.
     combined_block_ids = {bid for ids in groups if len(ids) > 1 for bid in ids}
-    for block_id, step, ub in zip(grid_block_ids_flat, steps, ubs, strict=True):
-        if block_id in combined_block_ids and step < ub and ub % step != 0:
+    for block_id, bounds, trips in zip(
+        grid_block_ids_flat, root_bounds, trip_counts, strict=True
+    ):
+        if (
+            block_id in combined_block_ids
+            and trips > 1
+            and geometry.is_ragged(block_id)
+        ):
             from ..support import UnsupportedOperationError
 
             raise UnsupportedOperationError(
                 "ragged combined-tile block size",
                 reason=(
-                    f"block_id {block_id}: dimension of size {ub} is not evenly "
-                    f"divisible by block size {step}, and needs more than one "
+                    f"block_id {block_id}: dimension of size "
+                    f"{bounds.end - bounds.begin} is not evenly divisible by "
+                    f"block size {bounds.step}, and needs more than one "
                     "iteration; this backend does not yet support a "
                     "dynamically-sized boundary tile in this position"
                 ),
@@ -204,13 +208,6 @@ def build_kernel_body(
                     "restructure the kernel so this dimension needs only one iteration",
                 ],
             )
-
-    for block_id, upper_bound in zip(grid_block_ids_flat, ubs, strict=False):
-        previous = ctx.block_id_to_upper_bound.get(block_id)
-        if previous is None:
-            ctx.block_id_to_upper_bound[block_id] = int(upper_bound)
-        else:
-            ctx.block_id_to_upper_bound[block_id] = min(previous, int(upper_bound))
 
     output_search_graphs = (
         phase_graphs
@@ -225,19 +222,23 @@ def build_kernel_body(
         ).result
         for tensor in out_tensors
     ]
-    forall = scf_d.ForallOp(lbs, ubs, steps, shared_outs=output_emptys)
+    rank = len(grid_block_ids_flat)
+    forall = scf_d.ForallOp(
+        [0] * rank, trip_counts, [1] * rank, shared_outs=output_emptys
+    )
 
-    for block_id, induction_variable in zip(
-        grid_block_ids_flat,
-        forall.induction_variables,
-        strict=True,
-    ):
+    with ir.InsertionPoint(forall.body):
         # Bound for the whole compile (no enclosing scope to restore to),
         # unlike nested scf.for levels which use ctx.enter_for_loop's
         # save/restore.
-        ctx.block_id_to_iv[block_id] = induction_variable
-
-    with ir.InsertionPoint(forall.body):
+        for block_id, bounds, trip_iv in zip(
+            grid_block_ids_flat, root_bounds, forall.induction_variables, strict=True
+        ):
+            ctx.block_id_to_trip_iv[block_id] = trip_iv
+            ctx.block_id_to_iv[block_id] = _tile_offset(
+                ctx, trip_iv, bounds.begin, bounds.step
+            )
+            ctx.block_id_to_bounds[block_id] = (bounds.begin, bounds.end)
         shared_outs = list(forall.inner_iter_args)
         ctx.lower_root_graphs(shared_outs[0], root_ids=root_ids)
         in_parallel = scf_d.InParallelOp()
@@ -381,8 +382,7 @@ def _phase_graph_closure(
         pending.extend(
             node.args[0]
             for node in graph.nodes
-            if node.op == "call_function"
-            and getattr(node.target, "__name__", "") == "_for_loop"
+            if node.op == "call_function" and is_loop_node(node)
         )
     return graphs
 
@@ -423,66 +423,6 @@ def _validate_multi_output_shapes(
                     )
 
 
-def _find_reused_block_id(
-    ctx: BuildContext,
-    graph: torch.fx.Graph,
-    upper_bound: object = None,
-    max_depth: int = 8,
-) -> int | None:
-    """Resolve the single new block id introduced by a loop whose ``_for_loop``
-    node reused an already-mapped (outer) block id.
-
-    Helion can nest several loop levels between the reused id's introduction
-    and the level whose real identity we need (e.g. ``grid -> grid -> tile``
-    3+ levels deep), so the body at this exact level may be a pure wrapper --
-    nothing but one further ``_for_loop`` call. Unwrap those wrapper levels
-    one at a time until a body with actual scalar symbol references is found.
-
-    Unwrapping can surface block ids belonging to *deeper* levels as well as
-    this one (e.g. an inner ``hl.grid()`` under an outer ``hl.tile()``), so
-    this level's declared extent is preferred as the authoritative signal
-    before falling back to a lone scalar-symbol candidate. Returns ``None``
-    if no single unambiguous candidate is found.
-    """
-    from ..support import block_id_from_key
-
-    device_ir = ctx.host_function.device_ir
-    current_graph = graph
-    for _ in range(max_depth):
-        scalar_candidates = {
-            info[0]
-            for body_node in current_graph.nodes
-            if (info := ctx.node_symbol_info(body_node)) is not None
-            and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
-            and info[0] not in ctx.block_id_to_iv
-        }
-        all_candidates = set(scalar_candidates)
-        all_candidates.update(
-            candidate
-            for body_node in current_graph.nodes
-            if getattr(body_node.target, "__name__", "") == "_get_symnode"
-            and body_node.args
-            and (candidate := block_id_from_key(body_node.args[0])) is not None
-            and candidate not in ctx.block_id_to_iv
-        )
-        if all_candidates:
-            by_extent = _block_id_matching_extent(ctx, all_candidates, upper_bound)
-            if by_extent is not None:
-                return by_extent
-            if len(scalar_candidates) == 1:
-                return next(iter(scalar_candidates))
-            return None
-        call_nodes = [n for n in current_graph.nodes if n.op == "call_function"]
-        if (
-            len(call_nodes) == 1
-            and getattr(call_nodes[0].target, "__name__", "") == "_for_loop"
-        ):
-            current_graph = device_ir.graphs[call_nodes[0].args[0]].graph
-            continue
-        break
-    return None
-
-
 def _find_descendant_store(
     ctx: BuildContext, graph: torch.fx.Graph, max_depth: int = 16
 ) -> torch.fx.Node | None:
@@ -507,185 +447,44 @@ def _find_descendant_store(
             ):
                 return graph_node
         for graph_node in current_graph.nodes:
-            if (
-                graph_node.op == "call_function"
-                and getattr(graph_node.target, "__name__", "") == "_for_loop"
-            ):
+            if graph_node.op == "call_function" and is_loop_node(graph_node):
                 stack.append((device_ir.graphs[graph_node.args[0]].graph, depth + 1))
     return None
 
 
-def _resolve_multi_block_ids(
-    ctx: BuildContext,
-    body_graph: torch.fx.Graph,
-    block_ids: list[int],
-    upper_bounds: list,
-) -> list[int]:
-    """Disambiguate reused block ids on a combined multi-dim ``_for_loop`` node.
-
-    A single ``for tm, tp in hl.tile([bm, np])`` statement produces one
-    ``_for_loop`` node whose ``block_ids`` can all be the same reused
-    placeholder id, with the real per-dimension identities living in the
-    body's own tile symbols. Since several new dimensions are introduced at
-    once here, disambiguate by matching each dimension's declared upper
-    bound against each candidate block's real size hint.
-    """
-    from ..support import block_id_from_key
-
-    candidates = {
-        info[0]
-        for body_node in body_graph.nodes
-        if (info := ctx.node_symbol_info(body_node)) is not None
-        and info[0] not in ctx.block_id_to_iv
-    }
-    candidates.update(
-        cand_id
-        for body_node in body_graph.nodes
-        if getattr(body_node.target, "__name__", "") == "_get_symnode"
-        and body_node.args
-        and (cand_id := block_id_from_key(body_node.args[0])) is not None
-        and cand_id not in ctx.block_id_to_iv
-    )
-    remaining = set(candidates)
-    resolved: list[int] = []
-    for bid, ub in zip(block_ids, upper_bounds, strict=True):
-        if bid in remaining:
-            resolved.append(bid)
-            remaining.discard(bid)
-            continue
-        ub_static = ub if isinstance(ub, int) else None
-        match: int | None = None
-        if ub_static is not None:
-            for cand in remaining:
-                block_info = next(
-                    (b for b in ctx.env.block_sizes if b.block_id == cand), None
-                )
-                if block_info is None:
-                    continue
-                try:
-                    if int(block_info.size_hint()) == ub_static:
-                        match = cand
-                        break
-                except (TypeError, ValueError):
-                    continue
-        if match is None and remaining:
-            match = next(iter(remaining))
-        resolved.append(match if match is not None else bid)
-        if match is not None:
-            remaining.discard(match)
-    return resolved
-
-
-def _block_id_matching_extent(
-    ctx: BuildContext, candidates: set[int], upper_bound: object
-) -> int | None:
-    """The unique candidate block id whose real size hint is *upper_bound*.
-
-    A nested loop's declared extent is its own dimension's size, so it
-    identifies which of several candidate block ids the level owns. Returns
-    ``None`` unless exactly one candidate matches, so an ambiguous case keeps
-    the raw declaration rather than guessing.
-    """
-    if not isinstance(upper_bound, int):
-        return None
-    matches = []
-    for candidate in candidates:
-        block_info = next(
-            (b for b in ctx.env.block_sizes if b.block_id == candidate), None
-        )
-        if block_info is None:
-            continue
-        try:
-            if int(block_info.size_hint()) == upper_bound:
-                matches.append(candidate)
-        except (TypeError, ValueError):
-            continue
-    return matches[0] if len(matches) == 1 else None
-
-
 def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
-    """Lower a (possibly multi-dimensional) nested scf.for loop with optional
-    synthetic store, recursing one ``scf.for`` per block id to arbitrary depth.
+    """Lower a (possibly multi-dimensional) nested ``_for_loop``/``_for_loop_step``
+    to one ``scf.for`` per block id, with an optional synthetic store.
+
+    Block ids come from the loop's ``ForLoopGraphInfo``; bounds and steps from
+    the node itself (``_for_loop(graph_id, begin, end, args[, step])``).
     """
+    from ..analysis.geometry import loop_block_ids
     from ..support import NodeLoweringError
-    from ..support import block_id_from_key
 
-    body_graph_id = node.args[0]
-    block_ids = list(node.args[1])
-    upper_bounds = list(node.args[2])
     iter_arg_nodes = list(node.args[3])
-    assert len(block_ids) == len(upper_bounds)
-    body_graph_info = ctx.host_function.device_ir.graphs[body_graph_id]
-    body_graph = body_graph_info.graph
+    body_graph = ctx.host_function.device_ir.graphs[node.args[0]].graph
+    block_ids = loop_block_ids(ctx.host_function, node)
+    loop_bounds = ctx.geometry.loop_bounds(node, block_ids)
 
-    if len(block_ids) == 1:
-        block_id = block_ids[0]
-        # Helion can reuse a surrounding grid block id on a nested loop node.
-        # This may be a grid id from an earlier hl.barrier()-separated phase,
-        # so it need not be active in ctx.block_id_to_iv. The body still
-        # contains the inner scalar symbol, whose origin is authoritative.
-        body_block_ids = {
-            info[0]
-            for body_node in body_graph.nodes
-            if (info := ctx.node_symbol_info(body_node)) is not None
-            and info[1] in {"grid", "tile_begin", "tile_end", "tile_id"}
-            and info[0] not in ctx.block_id_to_iv
-        }
-        body_block_ids.update(
-            body_block_id
-            for body_node in body_graph.nodes
-            if getattr(body_node.target, "__name__", "") == "_get_symnode"
-            and body_node.args
-            and (body_block_id := block_id_from_key(body_node.args[0])) is not None
-            and body_block_id not in ctx.block_id_to_iv
+    if len(block_ids) > 1 and iter_arg_nodes:
+        # Helion never attaches a carried accumulator to a combined multi-dim
+        # tile's own ``_for_loop`` node: every dimension of ``hl.tile([a, b])``
+        # is parallel, and reductions get their own nested single-block loop.
+        raise NodeLoweringError(
+            node,
+            reason=(
+                "Combined multi-dimensional tile loops with an external "
+                "loop-carried accumulator are not supported"
+            ),
+            recovery_hint=(
+                "Split the combined hl.tile([...]) into separate nested "
+                "hl.tile() loops, or move the accumulator to an inner loop"
+            ),
         )
-        if len(body_block_ids) == 1:
-            candidate = next(iter(body_block_ids))
-            if candidate != block_id:
-                block_id = candidate
-        elif len(body_block_ids) > 1:
-            # Several new block ids live below this level (e.g. a nested
-            # hl.grid() inside an hl.tile()), so the body alone is ambiguous.
-            # This level's own declared extent identifies which one it owns.
-            candidate = _block_id_matching_extent(ctx, body_block_ids, upper_bounds[0])
-            if candidate is not None:
-                block_id = candidate
-        elif not body_block_ids and block_id in ctx.block_id_to_iv:
-            # Direct body is a pure wrapper with no symbols at this level
-            # (loop nested 3+ levels deep); unwrap further nested
-            # ``_for_loop`` wrappers to find the block id introduced here.
-            resolved = _find_reused_block_id(ctx, body_graph, upper_bounds[0])
-            if resolved is not None:
-                block_id = resolved
-        block_ids = [block_id]
-    else:
-        if iter_arg_nodes:
-            # Defensive only: Helion's device IR never attaches a carried
-            # accumulator directly to a combined multi-dim tile's own
-            # ``_for_loop`` node (verified empirically) — every dimension in
-            # a combined ``hl.tile([a, b])`` is parallel by construction, and
-            # a genuine reduction always gets its own separate, single-block
-            # ``_for_loop`` nested inside (fully supported, see
-            # ``_find_descendant_store``). Host tensors read inside a
-            # combined tile are re-materialized via ``_host_tensor`` and never
-            # lifted as iter args either. If this ever fires, Helion's IR
-            # shape changed and the recursive emitter below needs to thread
-            # ``iter_arg_nodes`` through every level, not just the innermost.
-            raise NodeLoweringError(
-                node,
-                reason=(
-                    "Combined multi-dimensional tile loops with an external "
-                    "loop-carried accumulator are not supported"
-                ),
-                recovery_hint=(
-                    "Split the combined hl.tile([...]) into separate nested "
-                    "hl.tile() loops, or move the accumulator to an inner loop"
-                ),
-            )
-        block_ids = _resolve_multi_block_ids(ctx, body_graph, block_ids, upper_bounds)
 
     return _emit_for_loop_level(
-        ctx, node, body_graph, block_ids, upper_bounds, iter_arg_nodes, 0
+        ctx, node, body_graph, block_ids, loop_bounds, iter_arg_nodes, 0
     )
 
 
@@ -699,20 +498,23 @@ def _compute_synthetic_tile_geometry(
     block_id: int,
     active_outer_block_ids: set[int],
     is_grid_loop: bool,
-    ub_static: int | None,
+    begin_static: int | None,
+    end_static: int | None,
     step: int,
 ) -> tuple[list[int], list[ir.Value]]:
     """Compute a synthetic per-iteration accumulator's shape and the offsets
     it flushes at, one entry per destination-store dimension.
 
-    For the loop's own dimension (``inner_dim``), the tile spans the whole
-    loop range. For a scalar-indexed dimension, the tile has size 1 at that
+    For the loop's own dimension (``inner_dim``), the tile spans ``[0, end)``
+    and flushes at ``begin`` (see ``ForStoreContext.flush_window``). For a
+    scalar-indexed dimension, the tile has size 1 at that
     scalar's current value. For a dimension owned by an active outer loop,
     the tile spans that outer loop's block size at its current offset. Any
     remaining dimension without a resolvable block id falls back to the
     nearest other active outer loop's block id (grid loops only), or is left
     unreduced at its full declared size with a zero offset.
     """
+    geometry = ctx.geometry
     tile_shape: list[int] = []
     flush_offsets: list[ir.Value] = []
     outer_bids = [bid for bid in active_outer_block_ids if bid != block_id]
@@ -721,8 +523,8 @@ def _compute_synthetic_tile_geometry(
         idx_node = index_nodes[dim] if dim < len(index_nodes) else None
         dim_bid = dim_block_ids[dim]
         if dim == inner_dim or dim_bid == block_id:
-            tile_shape.append(ub_static if ub_static is not None else step)
-            flush_offsets.append(ctx.index_const(0))
+            tile_shape.append(end_static if end_static is not None else step)
+            flush_offsets.append(ctx.index_const(begin_static or 0))
             continue
         if idx_node is not None and ctx.is_scalar_index_node(idx_node):
             tile_shape.append(1)
@@ -738,9 +540,9 @@ def _compute_synthetic_tile_geometry(
         if (
             isinstance(dim_bid, int)
             and dim_bid in active_outer_block_ids
-            and dim_bid in ctx.block_id_to_size
+            and dim_bid in geometry.blocks
         ):
-            tile_shape.append(ctx.block_id_to_size[dim_bid])
+            tile_shape.append(geometry.tile_extent(dim_bid))
             flush_offsets.append(ctx.block_id_to_iv[dim_bid])
         elif (
             dim_bid is None
@@ -748,9 +550,9 @@ def _compute_synthetic_tile_geometry(
             and not isinstance(idx_node, slice)
             and not is_grid_loop
             and fallback_outer_bid is not None
-            and fallback_outer_bid in ctx.block_id_to_size
+            and fallback_outer_bid in geometry.blocks
         ):
-            tile_shape.append(ctx.block_id_to_size[fallback_outer_bid])
+            tile_shape.append(geometry.tile_extent(fallback_outer_bid))
             flush_offsets.append(ctx.block_id_to_iv[fallback_outer_bid])
         else:
             tile_shape.append(int(dim_size))
@@ -758,44 +560,41 @@ def _compute_synthetic_tile_geometry(
     return tile_shape, flush_offsets
 
 
-def _resolve_loop_upper_bound(
+def _resolve_loop_bound(
     ctx: BuildContext,
     node: torch.fx.Node,
-    ub_src: object,
-) -> tuple[int | None, ir.Value | None]:
-    """Resolve a ``_for_loop`` upper bound to a static int and/or an ir.Value."""
+    source: object,
+) -> int | ir.Value:
+    """Resolve a ``_for_loop`` begin/end to a static int or an index value."""
     import mlir.ir as ir
     import torch
     import torch.fx
 
     from ..support import NodeLoweringError
 
-    ub_static: int | None = None
-    ub_val: ir.Value | None = None
-    if isinstance(ub_src, int):
-        ub_static = int(ub_src)
-    elif isinstance(ub_src, torch.fx.Node):
-        ub_val = ctx.get_value(ub_src)
-        if ub_val is None:
-            meta_val = ub_src.meta.get("val")
-            if isinstance(meta_val, torch.Tensor) and meta_val.numel() == 1:
-                try:
-                    ub_static = int(meta_val.item())
-                except (TypeError, ValueError):
-                    ub_static = None
-            elif isinstance(meta_val, (int, float)):
-                ub_static = int(meta_val)
-    elif isinstance(ub_src, ir.Value):
-        ub_val = ub_src
-    if ub_static is None and ub_val is None:
+    if isinstance(source, int):
+        return int(source)
+    if isinstance(source, torch.SymInt):
+        try:
+            return int(source)
+        except (TypeError, ValueError):
+            pass
+    value: ir.Value | None = None
+    if isinstance(source, torch.fx.Node):
+        value = ctx.get_value(source)
+        if value is None:
+            meta_val = source.meta.get("val")
+            if isinstance(meta_val, int):
+                return int(meta_val)
+    elif isinstance(source, ir.Value):
+        value = source
+    if value is None:
         raise NodeLoweringError(
             node,
-            reason=f"Unsupported loop upper bound type: {type(ub_src).__name__}",
+            reason=f"Unsupported loop bound: {source!r}",
             recovery_hint="Ensure loop bounds are integer constants or scalar tensor values",
         )
-    if ub_val is not None:
-        ub_val = ctx.cast_to_index(ub_val)
-    return ub_static, ub_val
+    return ctx.cast_to_index(value)
 
 
 def _prepare_synthetic_accumulator(
@@ -804,7 +603,8 @@ def _prepare_synthetic_accumulator(
     block_id: int,
     active_outer_block_ids: set[int],
     is_grid_loop: bool,
-    ub_static: int | None,
+    begin_static: int | None,
+    end_static: int | None,
     step: int,
     iter_init_vals: list[ir.Value],
 ) -> tuple[ForStoreContext | None, int | None]:
@@ -899,6 +699,18 @@ def _prepare_synthetic_accumulator(
     if inner_dim is None:
         return None, None
 
+    owns_inner_dim = dim_block_ids[inner_dim] == block_id
+    if owns_inner_dim and begin_static is None:
+        from ..support import UnsupportedOperationError
+
+        raise UnsupportedOperationError(
+            "store inside a loop with a runtime begin",
+            reason=(
+                f"block_id {block_id}'s loop writes its own output dimension but "
+                "starts at a runtime offset"
+            ),
+        )
+
     tile_shape, flush_offsets = _compute_synthetic_tile_geometry(
         ctx,
         full_shape=full_shape,
@@ -908,9 +720,13 @@ def _prepare_synthetic_accumulator(
         block_id=block_id,
         active_outer_block_ids=active_outer_block_ids,
         is_grid_loop=is_grid_loop,
-        ub_static=ub_static,
+        begin_static=begin_static if owns_inner_dim else 0,
+        end_static=end_static,
         step=step,
     )
+    flush_window = None
+    if owns_inner_dim and begin_static and end_static is not None:
+        flush_window = (inner_dim, begin_static, end_static - begin_static)
     tile_empty = tensor_d.EmptyOp(tile_shape, elem_ty).result
     if isinstance(elem_ty, ir.FloatType):
         zero_attr = ir.FloatAttr.get(elem_ty, 0.0)
@@ -927,7 +743,11 @@ def _prepare_synthetic_accumulator(
         id(target_meta) if isinstance(target_meta, torch.Tensor) else None
     )
     return (
-        ForStoreContext(flush_offsets=flush_offsets, target_tensor_id=target_tensor_id),
+        ForStoreContext(
+            flush_offsets=flush_offsets,
+            target_tensor_id=target_tensor_id,
+            flush_window=flush_window,
+        ),
         synthetic_iter_index,
     )
 
@@ -981,7 +801,7 @@ def _lower_outer_loop_level(
     node: torch.fx.Node,
     body_graph: torch.fx.Graph,
     block_ids: list[int],
-    upper_bounds: list,
+    loop_bounds: list[LoopBounds],
     iter_arg_nodes: list,
     level: int,
     body_block: ir.Block,
@@ -1000,13 +820,13 @@ def _lower_outer_loop_level(
                 node,
                 body_graph,
                 block_ids,
-                upper_bounds,
+                loop_bounds,
                 iter_arg_nodes,
                 level + 1,
             )
     else:
         _emit_for_loop_level(
-            ctx, node, body_graph, block_ids, upper_bounds, iter_arg_nodes, level + 1
+            ctx, node, body_graph, block_ids, loop_bounds, iter_arg_nodes, level + 1
         )
     return []
 
@@ -1016,7 +836,7 @@ def _emit_for_loop_level(
     node: torch.fx.Node,
     body_graph: torch.fx.Graph,
     block_ids: list[int],
-    upper_bounds: list,
+    loop_bounds: list[LoopBounds],
     iter_arg_nodes: list,
     level: int,
 ) -> ir.Value:
@@ -1036,22 +856,12 @@ def _emit_for_loop_level(
     from ..support import NodeLoweringError
 
     block_id = block_ids[level]
-    ub_src = upper_bounds[level]
+    bounds = loop_bounds[level]
     is_innermost = level == len(block_ids) - 1
-    ub_static, ub_val = _resolve_loop_upper_bound(ctx, node, ub_src)
-
-    body_scalar_kinds = {
-        info[1]
-        for body_node in body_graph.nodes
-        if (info := ctx.node_symbol_info(body_node)) is not None
-    }
-    # A pure-wrapper body (loop nested 3+ levels deep) has no direct symbol
-    # references to inspect, so also fall back to the block's own step size:
-    # grid loops always have unit step by construction.
-    is_grid_loop = (
-        "grid" in body_scalar_kinds or ctx.block_id_to_size.get(block_id) == 1
-    )
-    step = ctx.block_id_to_size.get(block_id, ub_static if ub_static is not None else 1)
+    begin = _resolve_loop_bound(ctx, node, bounds.begin)
+    end = _resolve_loop_bound(ctx, node, bounds.end)
+    is_grid_loop = ctx.geometry.is_grid(block_id)
+    step = bounds.step
 
     if is_innermost:
         output_node = next(n for n in body_graph.nodes if n.op == "output")
@@ -1079,22 +889,21 @@ def _emit_for_loop_level(
         block_id,
         active_outer_block_ids,
         is_grid_loop,
-        ub_static,
+        begin if isinstance(begin, int) else None,
+        end if isinstance(end, int) else None,
         step,
         iter_init_vals,
     )
-    lb_val = ctx.index_const(0)
-    ub_val = (
-        ub_val
-        if ub_val is not None
-        else ctx.index_const(ub_static if ub_static is not None else step)
+    for_op = scf_d.ForOp(
+        ctx.as_index(begin),
+        ctx.as_index(end),
+        ctx.index_const(step),
+        iter_args=iter_init_vals,
     )
-    step_val = ctx.index_const(step)
-    for_op = scf_d.ForOp(lb_val, ub_val, step_val, iter_args=iter_init_vals)
     body_block = for_op.body
     with (
         ir.InsertionPoint(body_block),
-        ctx.enter_for_loop(block_id, body_block.arguments[0]),
+        ctx.enter_for_loop(block_id, body_block.arguments[0], (begin, end)),
     ):
         if is_innermost:
             yield_vals = _lower_innermost_loop_body(
@@ -1114,7 +923,7 @@ def _emit_for_loop_level(
                 node,
                 body_graph,
                 block_ids,
-                upper_bounds,
+                loop_bounds,
                 iter_arg_nodes,
                 level,
                 body_block,
@@ -1168,6 +977,24 @@ def _flush_synthetic_accumulator_to_parent(
     import mlir.ir as ir
 
     final_tile = for_op.results[synthetic_iter_index]
+    if synthetic_store_ctx.flush_window is not None:
+        dim, begin, size = synthetic_store_ctx.flush_window
+        shape = list(ir.RankedTensorType(final_tile.type).shape)
+        offsets = [0] * len(shape)
+        offsets[dim] = begin
+        shape[dim] = size
+        final_tile = tensor_d.ExtractSliceOp(
+            ir.RankedTensorType.get(
+                shape, ir.RankedTensorType(final_tile.type).element_type
+            ),
+            final_tile,
+            [],
+            [],
+            [],
+            static_offsets=offsets,
+            static_sizes=shape,
+            static_strides=[1] * len(shape),
+        ).result
     if not ctx.for_store_ctx_stack:
         ctx.forall_insert_slices.append(
             (

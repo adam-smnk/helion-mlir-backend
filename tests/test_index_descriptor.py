@@ -98,7 +98,7 @@ def test_combined_2d_tile_resolves_distinct_block_ids():
     assert not any(d.is_scalar for d in descriptors)
     # The two combined-tile dimensions must resolve to distinct block ids.
     assert descriptors[0].block_id != descriptors[1].block_id
-    assert {ctx.block_id_to_size[d.block_id] for d in descriptors} == {16, 32}
+    assert {ctx.geometry.block_size(d.block_id) for d in descriptors} == {16, 32}
 
 
 def test_nested_tile_k_resolves_reduction_block_id():
@@ -135,7 +135,7 @@ def test_nested_tile_k_resolves_reduction_block_id():
 
     descriptors = [resolve_index_descriptor(ctx, node) for node in load_index_nodes]
     assert all(d.block_id is not None for d in descriptors)
-    resolved_sizes = {ctx.block_id_to_size[d.block_id] for d in descriptors}
+    resolved_sizes = {ctx.geometry.block_size(d.block_id) for d in descriptors}
     # The reduction dimension (block size 64) must be resolvable from a load
     # index inside the inner ``hl.tile(k)`` loop.
     assert 64 in resolved_sizes

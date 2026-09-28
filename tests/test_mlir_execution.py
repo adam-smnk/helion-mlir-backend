@@ -415,14 +415,20 @@ class TestExecuteMlir:
         b_module = generate_mlir(pack_b_panels, [b.view(64, 2, 32).contiguous()])
         b_ir = str(b_module)
         assert "scf.forall (%arg1, %arg2, %arg3)" in b_ir
-        assert "step (1, 8, 32)" in b_ir
+        assert (
+            "affine_map<(d0) -> (d0 * 8)>" in b_ir
+            and "affine_map<(d0) -> (d0 * 32)>" in b_ir
+        )
         assert "linalg.transpose" in b_ir
         assert "permutation = [1, 0, 2]" in b_ir
 
         a_module = generate_mlir(pack_a_panels, [a.view(64, 2, 32).contiguous()])
         a_ir = str(a_module)
         assert "scf.forall (%arg1, %arg2, %arg3)" in a_ir
-        assert "step (1, 8, 32)" in a_ir
+        assert (
+            "affine_map<(d0) -> (d0 * 8)>" in a_ir
+            and "affine_map<(d0) -> (d0 * 32)>" in a_ir
+        )
         assert "linalg.transpose" in a_ir
         assert "permutation = [1, 0, 2]" in a_ir
 
@@ -1159,7 +1165,7 @@ class TestConfigurableBlockSizes:
     """Tests that block_sizes from the config propagate into the generated MLIR."""
 
     def test_block_size_in_ir(self):
-        """Config block_sizes are reflected as scf.forall step in the IR."""
+        """Config block_sizes are reflected as the forall tile-offset map in the IR."""
 
         @helion.kernel(static_shapes=True)
         def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1177,8 +1183,8 @@ class TestConfigurableBlockSizes:
             cfg = helion.Config(block_sizes=[block_size])
             mlir_module = generate_mlir(add_kernel, [A, B], config=cfg)
             ir_str = str(mlir_module)
-            assert f"step ({block_size})" in ir_str, (
-                f"Expected step ({block_size}) in IR, got:\n{ir_str}"
+            assert f"affine_map<(d0) -> (d0 * {block_size})>" in ir_str, (
+                f"Expected tile size {block_size} in IR, got:\n{ir_str}"
             )
 
     def test_decorator_config_is_used_without_kwarg(self):
@@ -1198,7 +1204,7 @@ class TestConfigurableBlockSizes:
 
         ir_str = str(generate_mlir(add_kernel, [A, B]))
 
-        assert "step (8)" in ir_str, (
+        assert "affine_map<(d0) -> (d0 * 8)>" in ir_str, (
             f"decorator block_sizes=[8] was ignored, got:\n{ir_str}"
         )
 
@@ -1221,8 +1227,8 @@ class TestConfigurableBlockSizes:
             generate_mlir(add_kernel, [A, B], config=helion.Config(block_sizes=[32]))
         )
 
-        assert "step (32)" in ir_str
-        assert "step (8)" not in ir_str
+        assert "affine_map<(d0) -> (d0 * 32)>" in ir_str
+        assert "affine_map<(d0) -> (d0 * 8)>" not in ir_str
 
     def test_different_block_sizes_same_result(self):
         """Different block_sizes produce numerically identical results via execute_mlir."""
@@ -1281,8 +1287,8 @@ class TestConfigurableBlockSizes:
             result = add_bs16(A, B)
 
         ir_dump = buf.getvalue()
-        assert "step (16)" in ir_dump, (
-            f"Expected step (16) from Config in pre-lowering IR dump, got:\n{ir_dump[:500]}"
+        assert "affine_map<(d0) -> (d0 * 16)>" in ir_dump, (
+            f"Expected tile size 16 from Config in pre-lowering IR dump, got:\n{ir_dump[:500]}"
         )
         assert _allclose(result, A + B)
 
@@ -1333,8 +1339,10 @@ class TestConfigurableBlockSizes:
             result = matmul_tiled(A, B)
 
         ir_dump = buf.getvalue()
-        # Outer 2D tile: step (16, 16) from scf.forall.
-        assert "step (16, 8)" in ir_dump, "Expected outer scf.forall step (16, 8)"
+        assert (
+            "affine_map<(d0) -> (d0 * 16)>" in ir_dump
+            and "affine_map<(d0) -> (d0 * 8)>" in ir_dump
+        ), "Expected outer tile sizes (16, 8)"
         assert _allclose(result, A @ B)
 
     def test_outer_forall_inner_scf_for_block_sizes_matmul_accumulate(self):
@@ -1382,7 +1390,10 @@ class TestConfigurableBlockSizes:
             result = matmul_acc_tiled(A, B)
 
         ir_dump = buf.getvalue()
-        assert "step (16, 8)" in ir_dump, "Expected outer scf.forall step (16, 8)"
+        assert (
+            "affine_map<(d0) -> (d0 * 16)>" in ir_dump
+            and "affine_map<(d0) -> (d0 * 8)>" in ir_dump
+        ), "Expected outer tile sizes (16, 8)"
         assert _allclose(result, A @ B)
 
     def test_outer_inner_loops_eltwise_block_sizes(self):
@@ -1421,7 +1432,7 @@ class TestConfigurableBlockSizes:
             result = add_nested(A, B)
 
         ir_dump = buf.getvalue()
-        assert "step (16)" in ir_dump, "Expected outer scf.forall step (16)"
+        assert "affine_map<(d0) -> (d0 * 16)>" in ir_dump, "Expected outer tile size 16"
         assert "step %c8" in ir_dump or "step (8)" in ir_dump, (
             "Expected inner loop step 8"
         )

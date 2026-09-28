@@ -16,17 +16,31 @@ from typing import Callable
 
 import torch
 
+from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
+from helion_mlir_backend._compiler.mlir.support.debug import use_optimizing_pipeline
+
 if TYPE_CHECKING:
+    from lighthouse.pipeline.descriptor import Descriptor
     import mlir.ir as ir
 
 log = logging.getLogger(__name__)
 
 
-def _dump_if(envvar: str, label: str, module: ir.Module) -> None:
-    """Print *module* to stdout when *envvar* is set to a truthy value."""
-    if os.environ.get(envvar, "").strip() not in ("", "0", "false", "no"):
+def _dump_if(enabled: bool, label: str, module: ir.Module) -> None:
+    if enabled:
         print(f"=== {label} ===", flush=True)
         print(module, flush=True)
+
+
+def pipeline_descriptor(optimized: bool | None = None) -> Descriptor:
+    """The lighthouse pipeline to lower with; ``HELION_MLIR_PIPELINE`` decides by default."""
+    from lighthouse.pipeline.descriptor import Descriptor
+
+    if optimized is None:
+        optimized = use_optimizing_pipeline()
+    if optimized:
+        return Descriptor("./pipeline.yaml", base_path=os.path.dirname(__file__))
+    return Descriptor("scalar-lowering.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +134,9 @@ class HelionMLIRExecutor:
             raise RuntimeError(f"MLIR inlining failed: {exc}") from exc
 
         _dump_if(
-            "HELION_MLIR_DUMP_PRE_LOWERING", "MLIR before lighthouse lowering", inlined
+            DebugOptions.from_env().dump_pre_lowering,
+            "MLIR before lighthouse lowering",
+            inlined,
         )
 
         try:
@@ -170,7 +186,7 @@ class HelionMLIRExecutor:
 
     def _inline_phase(self, module: ir.Module) -> ir.Module:
         """Phase 1: Inline and extract output metadata while types are still tensors."""
-        _dump_if("HELION_MLIR_DUMP_IR", "MLIR before inlining", module)
+        _dump_if(DebugOptions.from_env().dump_ir, "MLIR before inlining", module)
         inlined = inline_module(module)
         self._result_metadata = self._extract_result_metadata_pre_lowering(
             inlined, self.kernel_name
@@ -228,7 +244,6 @@ class HelionMLIRExecutor:
         import mlir.ir as ir
 
         try:
-            from lighthouse.pipeline.descriptor import Descriptor
             from lighthouse.pipeline.driver import BackendDriver
         except ImportError as exc:
             raise ImportError(
@@ -243,16 +258,14 @@ class HelionMLIRExecutor:
                 result_to_args=True,
                 benchmark=False,
             )
-            if os.environ.get("HELION_MLIR_PIPELINE", "").strip() == "1":
-                driver.add_stage(
-                    Descriptor("./pipeline.yaml", base_path=os.path.dirname(__file__))
-                )
-            else:
-                driver.add_stage(Descriptor("scalar-lowering.yaml"))
+            driver.add_stage(pipeline_descriptor())
             lowered = driver.apply(module)
 
-        log.info("Lowered via scalar-lowering pipeline")
-        _dump_if("HELION_MLIR_DUMP_LOWERED", "MLIR after lighthouse lowering", lowered)
+        _dump_if(
+            DebugOptions.from_env().dump_lowered,
+            "MLIR after lighthouse lowering",
+            lowered,
+        )
         return lowered
 
     def _compile_phase(

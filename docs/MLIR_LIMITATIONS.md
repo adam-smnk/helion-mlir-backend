@@ -226,8 +226,6 @@ This means Triton-specific code-generation behavior is not a fallback for MLIR;
 unsupported MLIR operations must be added to the appropriate MLIR lowering or
 ATen bridge module.
 
-## Out of Scope for This Backend Today
-
 ## 13) Implicit Transpose in a Store Is Rejected
 
 A store must index its destination in the same dimension order the value was
@@ -256,6 +254,29 @@ load order (for example `grid(panel) + tile([k, n])`) are supported directly.
 Note that `hl.grid()` loops are not tunable and consume no `block_sizes` slot;
 only `hl.tile()` loops do. Supplying a config sized for the grid loops silently
 assigns the wrong block size to the tiled loops.
+
+## 14) Optimizing Pipeline Requires Tiles of at Least 32
+
+Under `HELION_MLIR_PIPELINE=1`, lighthouse's cache-level tile-and-fuse assigns a zero tile
+size to every dimension smaller than its 32-element cache tile. An op whose tiled dimensions
+are all smaller than 32 then aborts the process inside upstream MLIR
+(`applyTilingToAll`: "Mismatched number of loops"). This is independent of the backend:
+`scripts/lighthouse_small_tile_repro.py N` reproduces it with a single
+`linalg.elementwise` on `tensor<Nxf32>` (N < 32 aborts, N >= 32 completes).
+
+Workaround until lighthouse is fixed: use block sizes of at least 32 for kernels lowered
+through the optimizing pipeline. The scalar pipeline is unaffected.
+
+## 15) Lighthouse Pipeline Deviations
+
+The local lighthouse checkout carries these pipeline changes (to be upstreamed):
+- `bufferization.yaml` runs one-shot bufferization with `allow-return-allocs-from-loops`, so
+  loop-carried values no longer have to be updated in place (previously any such update
+  failed with "Yield operand #0 is not equivalent to the corresponding iter bbArg").
+- `scalar-lowering.yaml` includes `bufferization-cleanup.yaml` to deallocate the buffers that
+  option allows inside loops.
+
+## Out of Scope for This Backend Today
 
 - Full dynamic-shape-first lowering model.
 - GPU runtime execution path parity with CPU path in this backend.
