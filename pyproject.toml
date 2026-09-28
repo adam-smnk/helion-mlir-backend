@@ -96,7 +96,8 @@ helion = { path = "./helion", editable = true }
 torch-mlir = { index = "torch-mlir" }
 torch = { index = "pytorch" }
 mlir-python-bindings = { index = "eudsl" }
-lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "dc1f627" }
+# lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "dc1f627" }
+lighthouse = { path = "./lighthouse", editable = true }
 
 [[tool.uv.index]]
 name = "torch-mlir"
