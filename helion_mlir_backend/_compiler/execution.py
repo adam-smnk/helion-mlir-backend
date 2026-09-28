@@ -72,6 +72,7 @@ class EntryArg:
     """``in``, ``inout`` or ``scalar``."""
     tensor_param: int | None
     shape: tuple[int, ...]
+    """``-1`` for a size only known at run time."""
     dtype: torch.dtype
 
 
@@ -116,7 +117,10 @@ def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:
                 ir.IntegerAttr(attrs["helion.param"]).value
                 if "helion.param" in attrs
                 else None,
-                tuple(memref.shape),
+                tuple(
+                    -1 if ir.ShapedType.is_dynamic_size(size) else size
+                    for size in memref.shape
+                ),
                 mlir_dtype_to_torch(str(memref.element_type)),
             )
         )
@@ -135,6 +139,12 @@ def compile_entry(
     _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
     if pipeline is None:
         pipeline = "opt" if use_optimizing_pipeline() else "scalar"
+    if pipeline == "opt" and (op := _dynamic_linalg_op(module)) is not None:
+        # The opt pipeline vectorizes without vector sizes (plan I32).
+        log.debug(
+            "'%s' uses the scalar pipeline: %s has runtime-sized operands", entry, op
+        )
+        pipeline = "scalar"
     descriptor = pipeline_descriptor(pipeline)
     with (
         _stage(f"lowering with the lighthouse '{pipeline}' pipeline"),
@@ -157,3 +167,21 @@ def _stage(what: str) -> Iterator[None]:
     except Exception as exc:
         exc.add_note(f"Helion MLIR backend: failed while {what}")
         raise
+
+
+def _dynamic_linalg_op(module: ir.Module) -> str | None:
+    """The name of the first linalg op with a runtime-sized tensor operand or result."""
+    found: list[str] = []
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        if op.name.startswith("linalg.") and any(
+            isinstance(value.type, ir.RankedTensorType)
+            and not ir.RankedTensorType(value.type).has_static_shape
+            for value in [*op.operands, *op.results]
+        ):
+            found.append(op.name)
+            return ir.WalkResult.INTERRUPT
+        return ir.WalkResult.ADVANCE
+
+    module.operation.walk(visit)
+    return found[0] if found else None

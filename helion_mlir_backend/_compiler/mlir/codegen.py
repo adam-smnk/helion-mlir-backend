@@ -50,14 +50,12 @@ from mlir.dialects import bufferization as bufferization_d
 from mlir.dialects import func as func_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
-import torch
 
 from .analysis.signature import KernelSignature
 from .aten_bridge import AtenHelperTable
 from .build_context import BuildContext
 from .lowering import build_phase_body
 from .lowering import lower_node
-from .support import DynamicShapeError
 from .support import MLIRBackendError
 from .support import torch_dtype_to_mlir
 
@@ -182,6 +180,7 @@ class MLIRModuleBuilder:
             ctx.param_to_value.update(zip(refs, args[: len(refs)], strict=True))
             for key, arg in zip(phase.scalars, args[len(refs) :], strict=True):
                 ctx.scalars[key] = tensor_d.ExtractOp(arg, []).result
+            ctx.begin_function(entry)
             results = build_phase_body(ctx, list(phase.root_positions), phase.inouts)
             func_d.ReturnOp(results)
         return fn
@@ -232,14 +231,14 @@ class MLIRModuleBuilder:
             func_d.ReturnOp([])
 
     def _tensor_type(self, name: str) -> ir.RankedTensorType:
-        """The host tensor's type. A size computed from block sizes on the host
-        (``n // block_n``) takes the config's block sizes, as the host code does."""
+        """The host tensor's type: ``?`` for a size only known at run time. A size
+        computed from block sizes on the host (``n // block_n``) takes the config's
+        block sizes, as the host code does."""
         fake = self.context.signature.refs[name].fake
-        block_sizes = {
-            info.var.node.expr: self.context.geometry.block_size(info.block_id)
-            for info in self.env.block_sizes
-        }
-        shape = [_static_size(name, dim, block_sizes) for dim in fake.shape]
+        shape = [
+            ir.ShapedType.get_dynamic_size() if size.free_symbols else int(size)
+            for size in self.context.ref_sizes(name)
+        ]
         return ir.RankedTensorType.get(shape, torch_dtype_to_mlir(fake.dtype))
 
     def _resolve_geometry(self) -> None:
@@ -261,17 +260,6 @@ class MLIRModuleBuilder:
         self.context.contractions = ContractionPlan.from_graphs(
             [graph_info.graph for graph_info in self.hf.device_ir.graphs]
         )
-
-
-def _static_size(name: str, size: int | torch.SymInt, block_sizes: dict) -> int:
-    if not isinstance(size, torch.SymInt):
-        return int(size)
-    value = size.node.expr.xreplace(block_sizes)
-    if value.free_symbols:
-        raise DynamicShapeError(
-            size, symbol_name=f"{size} in the shape of host tensor {name!r}"
-        )
-    return int(value)
 
 
 def _scalar_tensor_type(scalar: ScalarArg) -> ir.RankedTensorType:

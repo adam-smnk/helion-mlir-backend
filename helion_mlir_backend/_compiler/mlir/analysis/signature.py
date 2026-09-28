@@ -49,6 +49,8 @@ class ScalarArg:
     """The ``_get_symnode`` key device code uses."""
     host_expr: str
     dtype: torch.dtype
+    expr: object = None
+    """The ``sympy`` expression an int scalar carries (a size source)."""
 
 
 @dataclass(frozen=True)
@@ -180,8 +182,9 @@ def _runtime_scalar(hf: HostFunction, node: torch.fx.Node) -> ScalarArg | None:
     symbol_origin = hf.expr_to_origin.get(value.node.expr)
     if symbol_origin is None or not symbol_origin.origin.is_host():
         return None
-    dtype = torch.float64 if isinstance(value, torch.SymFloat) else torch.int64
-    return ScalarArg(key, symbol_origin.origin.host_str(), dtype)
+    if isinstance(value, torch.SymFloat):
+        return ScalarArg(key, symbol_origin.origin.host_str(), torch.float64)
+    return ScalarArg(key, symbol_origin.origin.host_str(), torch.int64, value.node.expr)
 
 
 def _declared_base(

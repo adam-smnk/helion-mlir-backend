@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import helion.language._tracing_ops as tracing_ops
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
+import sympy
 import torch
 
 from .registry import lowers
@@ -54,37 +55,46 @@ def materialize_host_tensor_alias_shape(
     base_value: ir.Value,
     alias_node: torch.fx.Node,
 ) -> ir.Value | None:
-    """Materialize a static reshape-style alias when its shape differs.
+    """Materialize a reshape-style alias when its shape differs.
 
     A host-side ``.view()``/``.reshape()`` written outside the tiled loop
     produces a ``_host_tensor`` node that resolves to the *base* parameter's
     SSA value, which still carries the base shape. Emit the shape change so
     downstream slices see the alias's real geometry instead of silently
-    using the base type.
+    using the base type. Runtime sizes come from ``ctx.size``.
     """
 
     base_type = base_value.type
     if not isinstance(base_type, ir.RankedTensorType):
         return None
-    base_shape = [int(dim) for dim in base_type.shape]
     element_type = base_type.element_type
-
-    alias_shape = [int(dim) for dim in alias_node.meta["val"].shape]
-    if base_shape == alias_shape:
+    alias_sizes = [ctx.size_expr(size) for size in alias_node.meta["val"].shape]
+    base_name = next(
+        (name for name, value in ctx.param_to_value.items() if value == base_value),
+        None,
+    )
+    if base_name is not None and alias_sizes == ctx.ref_sizes(base_name):
         return base_value
-
-    if any(dimension < 0 for dimension in base_shape + alias_shape):
-        # Dynamic extents have no static reassociation; bail out.
+    dynamic = ir.ShapedType.get_dynamic_size()
+    base_shape = list(base_type.shape)
+    alias_shape = [dynamic if size.free_symbols else int(size) for size in alias_sizes]
+    if base_shape == alias_shape and dynamic not in alias_shape:
+        return base_value
+    if base_name is not None:
+        base_numel = sympy.prod(ctx.ref_sizes(base_name))
+    elif dynamic not in base_shape:
+        base_numel = sympy.prod([sympy.Integer(size) for size in base_shape])
+    else:
         return None
+    if sympy.prod(alias_sizes) != base_numel:
+        if not base_numel.free_symbols:
+            return None
+        from ..support import UnsupportedOperationError
 
-    base_numel = 1
-    for dimension in base_shape:
-        base_numel *= dimension
-    alias_numel = 1
-    for dimension in alias_shape:
-        alias_numel *= dimension
-    if base_numel != alias_numel:
-        return None
+        raise UnsupportedOperationError(
+            f"host view '{alias_node.args[0]}'",
+            reason=f"cannot show that {alias_sizes} has {base_numel} elements",
+        )
 
     result_type = ir.RankedTensorType.get(alias_shape, element_type)
 
@@ -92,18 +102,20 @@ def materialize_host_tensor_alias_shape(
         reassociation = [list(range(len(base_shape)))]
         return tensor_d.CollapseShapeOp(result_type, base_value, reassociation).result
 
-    # General static N-D -> M-D relayout. Collapse to 1-D first so a single
+    # General N-D -> M-D relayout. Collapse to 1-D first so a single
     # reassociation is always valid, then expand into the alias shape.
     flat_value = base_value
     if len(base_shape) != 1:
-        flat_type = ir.RankedTensorType.get([base_numel], element_type)
+        flat_dim = dynamic if base_numel.free_symbols else int(base_numel)
+        flat_type = ir.RankedTensorType.get([flat_dim], element_type)
         flat_value = tensor_d.CollapseShapeOp(
             flat_type, base_value, [list(range(len(base_shape)))]
         ).result
+    output = [ctx.size(size) for size in alias_sizes]
     return tensor_d.ExpandShapeOp(
         result_type,
         flat_value,
         [list(range(len(alias_shape)))],
-        [],
+        [size for size in output if isinstance(size, ir.Value)],
         alias_shape,
     ).result

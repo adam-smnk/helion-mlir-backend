@@ -62,7 +62,7 @@ def lower_scalar_binary(ctx: BuildContext, node: torch.fx.Node) -> object:
     if scalar is None:
         return NOT_APPLICABLE
 
-    shape = list(tensor_type.shape)
+    shape = emit.sizes(tensor_value)
     splat = linalg_d.fill(scalar, outs=[emit.empty(shape, element_type)])
     lhs, rhs = (tensor_value, splat) if tensor_index == 0 else (splat, tensor_value)
     kind = getattr(linalg_d.ElementwiseKind, _BINARY_KINDS[node.target])

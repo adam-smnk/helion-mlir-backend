@@ -16,6 +16,7 @@ from typing import Literal
 
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
+import torch
 
 from . import emit
 
@@ -33,7 +34,8 @@ class DimSlice:
     size: emit.Size
     """Elements taken from the tensor; fewer than ``tile`` at a boundary."""
     tile: int
-    """Static extent of this dimension in the loaded or stored tile."""
+    """Extent of this dimension in the loaded or stored tile; the dynamic size
+    sentinel when it is the tensor's runtime extent (then ``size`` is all of it)."""
     block_id: int | None = None
     reduces: bool = False
     index: ir.Value | None = None
@@ -66,10 +68,20 @@ class SlicePlan:
         """Real part of the value tile (reduced dims omitted)."""
         return [dim.size for dim in self.dims if not dim.reduces]
 
+    def value_tile_sizes(self) -> list[emit.Size]:
+        """The value tile's dims: static extents, or the runtime size of a dynamic one."""
+        return [
+            dim.size if ir.ShapedType.is_dynamic_size(dim.tile) else dim.tile
+            for dim in self.dims
+            if not dim.reduces
+        ]
+
     def is_partial(self) -> bool:
         """Whether the tile may extend past its loop or tensor."""
         return any(
-            isinstance(dim.size, ir.Value) or dim.size != dim.tile for dim in self.dims
+            not ir.ShapedType.is_dynamic_size(dim.tile)
+            and (isinstance(dim.size, ir.Value) or dim.size != dim.tile)
+            for dim in self.dims
         )
 
     def reduced_dims(self) -> list[int]:
@@ -88,6 +100,7 @@ def plan_slice(
     index_nodes: list | tuple,
     base: ir.Value,
     owned: dict[int, OwnedDim] | None = None,
+    name: str | None = None,
 ) -> SlicePlan:
     """Build a SlicePlan from authoritative index metadata.
 
@@ -100,6 +113,7 @@ def plan_slice(
 
     ``owned`` marks dims where ``base`` is only the current iteration's region
     of a larger tensor (see ``tensor_state``); those are indexed from its origin.
+    ``name`` is the host tensor ``base`` holds, for its runtime extents.
 
     Raises NodeLoweringError if a tile index cannot be resolved to a block id.
     """
@@ -111,8 +125,12 @@ def plan_slice(
     base_rank = len(base_shape)
     dims: list[DimSlice] = []
 
-    def full(start: int, size: int) -> DimSlice:
-        return DimSlice("full", ctx.index_const(start), size, size)
+    def full(dimension: int, index: slice) -> DimSlice:
+        extent = base_shape[dimension]
+        if ir.ShapedType.is_dynamic_size(extent):
+            return _dynamic_full(ctx, index, ctx.extent(base, dimension, name), extent)
+        start, stop = _static_slice_bounds(index, extent)
+        return DimSlice("full", ctx.index_const(start), stop - start, stop - start)
 
     for dimension, index_node in enumerate(index_nodes):
         if dimension >= base_rank:
@@ -120,8 +138,7 @@ def plan_slice(
         extent = base_shape[dimension]
 
         if isinstance(index_node, slice):
-            start, stop = _static_slice_bounds(index_node, extent)
-            dims.append(full(start, stop - start))
+            dims.append(full(dimension, index_node))
             continue
 
         descriptor = resolve_index_descriptor(ctx, index_node)
@@ -166,8 +183,9 @@ def plan_slice(
         block_id, bias = descriptor.block_id, descriptor.bias
         index = ctx.get_value(index_node) if block_id is None else None
         if index is not None and isinstance(index.type, ir.RankedTensorType):
+            size = ctx.extent(base, dimension, name)
             dims.append(
-                DimSlice("gather", ctx.index_const(0), extent, extent, index=index)
+                DimSlice("gather", ctx.index_const(0), size, extent, index=index)
             )
             continue
         if block_id is None:
@@ -181,24 +199,27 @@ def plan_slice(
                 index_node,
                 reason=f"Tile index at dimension {dimension} names unknown block_id {block_id}",
             )
-        offset, size, tile = tile_window(ctx, block_id, bias, extent)
+        offset, size, tile = tile_window(
+            ctx, block_id, bias, ctx.extent(base, dimension, name)
+        )
         dims.append(DimSlice("tile", offset, size, tile, block_id))
 
     while len(dims) < base_rank:
-        dims.append(full(0, base_shape[len(dims)]))
+        dims.append(full(len(dims), slice(None)))
 
     return SlicePlan(dims)
 
 
 def tile_window(
-    ctx: BuildContext, block_id: int, bias: int, extent: int
+    ctx: BuildContext, block_id: int, bias: int, extent: emit.Size
 ) -> tuple[ir.Value, emit.Size, int]:
     """Offset, real size and tile size of ``block_id``'s current tile, shifted by
     ``bias``, in a dimension of ``extent``.
 
     The real part is what lies inside both the loop and the tensor. The tensor
     bound is only checked when the loop may run past it (e.g. an input smaller
-    than the iteration domain, whose excess is then read as zeros).
+    than the iteration domain, whose excess is then read as zeros); a loop whose
+    end is the tensor's extent (the same size value) never does.
     """
     from ..support.errors import UnsupportedOperationError
 
@@ -216,16 +237,45 @@ def tile_window(
         raise UnsupportedOperationError(
             "tile index", reason=f"offset {bias} may index before the tensor start"
         )
-    if isinstance(end, int) and end + bias <= extent:
+    if isinstance(end, int) and isinstance(extent, int) and end + bias <= extent:
         return offset, size, tile
-    d0, d1 = ir.AffineDimExpr.get(0), ir.AffineDimExpr.get(1)
-    offset = emit.affine_min([d0, ir.AffineConstantExpr.get(extent)], [offset])
-    remaining = ir.AffineConstantExpr.get(extent) - d0
-    if isinstance(size, int):
-        size = emit.affine_min([ir.AffineConstantExpr.get(size), remaining], [offset])
+    if bias == 0 and isinstance(end, ir.Value) and end == extent:
+        return offset, size, tile
+    d0 = ir.AffineDimExpr.get(0)
+    if isinstance(extent, int):
+        limit, limit_operands = ir.AffineConstantExpr.get(extent), []
     else:
-        size = emit.affine_min([remaining, d1], [offset, size])
+        limit, limit_operands = ir.AffineDimExpr.get(1), [extent]
+    offset = emit.affine_min([d0, limit], [offset, *limit_operands])
+    remaining = limit - d0
+    if isinstance(size, int):
+        size = emit.affine_min(
+            [ir.AffineConstantExpr.get(size), remaining], [offset, *limit_operands]
+        )
+    else:
+        size = emit.affine_min(
+            [remaining, ir.AffineDimExpr.get(1 + len(limit_operands))],
+            [offset, *limit_operands, size],
+        )
     return offset, size, tile
+
+
+def _dynamic_full(
+    ctx: BuildContext, index: slice, extent: ir.Value, dynamic: int
+) -> DimSlice:
+    """All of a dimension whose extent is only known at run time."""
+    from ..support.errors import UnsupportedOperationError
+
+    if (
+        index.step not in (None, 1)
+        or index.start not in (None, 0)
+        or index.stop is not None
+    ):
+        raise UnsupportedOperationError(
+            "subscript slice",
+            reason=f"{index} of a dimension whose size is only known at run time",
+        )
+    return DimSlice("full", ctx.index_const(0), extent, dynamic)
 
 
 def _static_slice_bounds(index: slice, extent: int) -> tuple[int, int]:
@@ -234,10 +284,9 @@ def _static_slice_bounds(index: slice, extent: int) -> tuple[int, int]:
 
     bounds = []
     for value in (index.start, index.stop):
-        try:
-            bounds.append(None if value is None else int(value))
-        except (TypeError, ValueError):
-            bounds.append(value)
+        if isinstance(value, torch.SymInt) and not value.node.expr.free_symbols:
+            value = int(value.node.expr)
+        bounds.append(value)
     if index.step not in (None, 1) or not all(
         bound is None or isinstance(bound, int) for bound in bounds
     ):

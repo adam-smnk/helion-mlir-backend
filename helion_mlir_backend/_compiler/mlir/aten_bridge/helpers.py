@@ -3,7 +3,9 @@
 At each call site the operands' MLIR types (tensors, and runtime scalars as
 ``i64``/``f64``/``i1``) and the node's literal arguments form a
 :class:`HelperRequest`; running the op on meta tensors gives the result types, so
-nothing is guessed from Helion's symbolic metadata. The call names a helper
+nothing is guessed from Helion's symbolic metadata. A ``?`` dim is a fresh size
+symbol of a fake tensor instead (one ``FakeTensorMode`` for the process), and a
+symbolic result dim is ``?``. The call names a helper
 derived from the request. After every function is built,
 :meth:`AtenHelperTable.materialize` lowers the requests not yet in the
 process-wide cache in one torch-mlir run and clones the helpers into the module.
@@ -22,10 +24,14 @@ from typing import TYPE_CHECKING
 
 from mlir.dialects import arith as arith_d
 from mlir.dialects import func as func_d
+from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 import torch
 from torch._ops import OpOverload
+from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensorMode
 import torch.fx
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.passes.shape_prop import TensorMetadata
 
 from ..support import UnsupportedOperationError
@@ -43,6 +49,21 @@ ORIGINAL_ARGS = "helion_mlir_original_args"
 _CACHE: dict[str, ir.Operation] = {}
 # Keeps the parsed modules that own the cached helper functions alive.
 _CACHE_MODULES: list[ir.Module] = []
+_FAKE_MODE: FakeTensorMode | None = None
+
+
+def _fake_mode() -> FakeTensorMode:
+    """The fake tensor mode of samples with dynamic dims (its own shape env)."""
+    global _FAKE_MODE
+    if _FAKE_MODE is None:
+        _FAKE_MODE = FakeTensorMode(shape_env=ShapeEnv())
+    return _FAKE_MODE
+
+
+def _mode_for(samples: list[object]) -> contextlib.AbstractContextManager:
+    if any(isinstance(sample, FakeTensor) for sample in samples):
+        return _fake_mode()
+    return contextlib.nullcontext()
 
 
 def is_aten_op(node: torch.fx.Node) -> bool:
@@ -192,7 +213,7 @@ def call_helper(
 
     Arguments may be FX nodes, MLIR values or literals; ``node`` locates errors.
     """
-    args, kwargs, values, samples = _bind(ctx, node, args, kwargs)
+    args, kwargs, values, samples = _bind(ctx, node, args, kwargs, target)
     results = _evaluate(target, args, kwargs, samples)
     operands = [_as_operand(value) for value in values]
     request = HelperRequest(
@@ -212,7 +233,7 @@ def call_helper(
 
 def infer_results(ctx: BuildContext, node: torch.fx.Node) -> tuple[torch.Tensor, ...]:
     """The node's results as meta tensors, computed from its operands' MLIR types."""
-    args, kwargs, _, samples = _bind(ctx, node, *original_args(node))
+    args, kwargs, _, samples = _bind(ctx, node, *original_args(node), node.target)
     if node.op == "call_method":
         method = node.target
 
@@ -229,7 +250,7 @@ def _evaluate(
 ) -> tuple[torch.Tensor, ...]:
     args, kwargs = _substitute(args, samples), _substitute(kwargs, samples)
     try:
-        with torch.no_grad():
+        with torch.no_grad(), _mode_for(samples):
             result = target(*args, **kwargs)
     except Exception as error:
         raise UnsupportedOperationError(
@@ -240,9 +261,16 @@ def _evaluate(
 
 
 def _bind(
-    ctx: BuildContext, node: torch.fx.Node, args: tuple, kwargs: dict
+    ctx: BuildContext,
+    node: torch.fx.Node,
+    args: tuple,
+    kwargs: dict,
+    target: object = None,
 ) -> tuple[tuple, dict, list[ir.Value], list[object]]:
-    """Replace inputs by literals or operand markers; collect operand values."""
+    """Replace inputs by literals or operand markers; collect operand values.
+
+    A runtime scalar where ``target``'s schema takes a tensor is a 0-d tensor.
+    """
     values: list[ir.Value] = []
     samples: list[object] = []
 
@@ -270,12 +298,31 @@ def _bind(
         samples.append(_sample(value.type))
         return _Operand(len(values) - 1)
 
-    return (
-        convert(args),
-        {key: convert(value) for key, value in kwargs.items()},
-        values,
-        samples,
-    )
+    bound_args = convert(args)
+    bound_kwargs = {key: convert(value) for key, value in kwargs.items()}
+    schema = getattr(target, "_schema", None)
+    for argument, arg in zip(
+        schema.arguments if schema else [], bound_args, strict=False
+    ):
+        if (
+            isinstance(arg, _Operand)
+            and isinstance(argument.type, torch.TensorType)
+            and not isinstance(values[arg.index].type, ir.RankedTensorType)
+        ):
+            scalar = _as_operand(values[arg.index])
+            values[arg.index] = tensor_d.FromElementsOp(
+                ir.RankedTensorType.get([], scalar.type), [scalar]
+            ).result
+            samples[arg.index] = _sample(values[arg.index].type)
+    if any(isinstance(sample, FakeTensor) for sample in samples):
+        # One mode for every tensor operand of the op.
+        samples = [
+            _sample(value.type, fake=True)
+            if isinstance(value.type, ir.RankedTensorType)
+            else sample
+            for value, sample in zip(values, samples, strict=True)
+        ]
+    return bound_args, bound_kwargs, values, samples
 
 
 def _substitute(structure: object, samples: list[object]) -> object:
@@ -288,8 +335,9 @@ def _substitute(structure: object, samples: list[object]) -> object:
     return structure
 
 
-def _sample(value_type: ir.Type) -> object:
-    """A meta tensor or Python scalar standing in for an operand of ``value_type``."""
+def _sample(value_type: ir.Type, *, fake: bool = False) -> object:
+    """A meta tensor or Python scalar standing in for an operand of ``value_type``;
+    a fake tensor with a fresh size symbol per ``?`` dim if it has any (or ``fake``)."""
     if isinstance(value_type, ir.RankedTensorType):
         element = value_type.element_type
         dtype = (
@@ -301,7 +349,18 @@ def _sample(value_type: ir.Type) -> object:
             raise UnsupportedOperationError(
                 "ATen helper operand", reason=f"unsupported element type {element}"
             )
-        return torch.empty(list(value_type.shape), dtype=dtype, device="meta")
+        shape = list(value_type.shape)
+        if not fake and not any(ir.ShapedType.is_dynamic_size(dim) for dim in shape):
+            return torch.empty(shape, dtype=dtype, device="meta")
+        mode = _fake_mode()
+        sizes = []
+        for dim in shape:
+            if ir.ShapedType.is_dynamic_size(dim):
+                dim = mode.shape_env.create_unbacked_symint()
+                torch._check(dim >= 0)
+            sizes.append(dim)
+        with mode:
+            return torch.empty(sizes, dtype=dtype)
     if isinstance(value_type, ir.IntegerType) and value_type.width == 1:
         return True
     if isinstance(value_type, (ir.IndexType, ir.IntegerType)):
@@ -352,8 +411,16 @@ def _tensor_type(result: object) -> ir.RankedTensorType:
             "ATen helper result", reason=f"non-tensor result {type(result).__name__}"
         )
     return ir.RankedTensorType.get(
-        [int(dim) for dim in result.shape], torch_dtype_to_mlir(result.dtype)
+        [static_dim(dim) for dim in result.shape], torch_dtype_to_mlir(result.dtype)
     )
+
+
+def static_dim(size: int | torch.SymInt) -> int:
+    """A result dim as an MLIR dim: the dynamic size sentinel if it is symbolic."""
+    if isinstance(size, torch.SymInt):
+        expr = size.node.expr
+        return ir.ShapedType.get_dynamic_size() if expr.free_symbols else int(expr)
+    return int(size)
 
 
 @contextlib.contextmanager
@@ -429,10 +496,11 @@ def _fx_graph(request: HelperRequest) -> torch.fx.Graph:
     args = _substitute(request.args, placeholders)
     kwargs = _substitute(dict(request.kwargs), placeholders)
     call = graph.call_function(request.target, args, kwargs)
-    results = request.target(
-        *_substitute(request.args, list(request.samples)),
-        **_substitute(dict(request.kwargs), list(request.samples)),
-    )
+    with _mode_for(list(request.samples)):
+        results = request.target(
+            *_substitute(request.args, list(request.samples)),
+            **_substitute(dict(request.kwargs), list(request.samples)),
+        )
     if isinstance(results, torch.Tensor):
         _set_meta(call, results)
         graph.output((call,))

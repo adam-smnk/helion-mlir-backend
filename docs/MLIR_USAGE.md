@@ -101,10 +101,10 @@ Convention) describes its arguments.
 
 ### Required
 
-- Use `@helion.kernel(static_shapes=True)`.
+- `static_shapes=True` gives fully static IR; `static_shapes=False` compiles one
+  entry per shape bucket that takes runtime sizes (see `docs/MLIR_LIMITATIONS.md`).
 - Provide tensor type annotations.
 - Place tensor work inside helion device loops (`hl.tile(...)`).
-- Use concrete input tensor shapes at compile time.
 
 ### Nested reduction pattern (matmul-like)
 

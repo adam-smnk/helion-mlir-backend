@@ -37,5 +37,6 @@ def lower_transpose(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
             str(node.target),
             reason=f"permutation {permutation} does not match rank {len(shape)}",
         )
-    init = emit.empty([shape[dim] for dim in permutation], source_type.element_type)
+    sizes = emit.sizes(source)
+    init = emit.empty([sizes[dim] for dim in permutation], source_type.element_type)
     return linalg_d.transpose(source, outs=[init], permutation=permutation).results[0]

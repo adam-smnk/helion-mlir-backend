@@ -165,19 +165,26 @@ class MLIRBackend(Backend):
 
         entry = compile_entry(mlir_module, kernel_name, pipeline=pipeline)
         values: list[object] = []
+        alternatives = [
+            "helion_mlir_backend.compile_mlir(kernel, args)",
+            "call the kernel with @helion.kernel(backend='mlir')",
+        ]
         for arg in entry.args:
             if arg.tensor_param is not None:
                 values.append(input_tensors[arg.tensor_param])
+            elif arg.role == "inout" and -1 in arg.shape:
+                raise UnsupportedOperationError(
+                    f"execute_mlir cannot create '{arg.name}'",
+                    reason="its shape is only known when the host code runs",
+                    alternatives=alternatives,
+                )
             elif arg.role == "inout":
                 values.append(torch.zeros(arg.shape, dtype=arg.dtype))
             else:
                 raise UnsupportedOperationError(
                     f"execute_mlir cannot supply host value '{arg.name}'",
                     reason="execute_mlir runs no host code",
-                    alternatives=[
-                        "helion_mlir_backend.compile_mlir(kernel, args)",
-                        "call the kernel with @helion.kernel(backend='mlir')",
-                    ],
+                    alternatives=alternatives,
                 )
         outputs = call_entry(entry, values)
         return outputs[0] if len(outputs) == 1 else outputs

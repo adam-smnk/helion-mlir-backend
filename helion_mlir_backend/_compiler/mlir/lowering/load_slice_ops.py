@@ -44,7 +44,11 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         raise ValueNotFoundError(tensor_node, context="loaded tensor")
 
     plan = plan_slice(
-        ctx, [item for item in index_nodes if item is not None], tensor_value, owned
+        ctx,
+        [item for item in index_nodes if item is not None],
+        tensor_value,
+        owned,
+        name,
     )
     loaded = load_tile(tensor_value, plan)
     gathers = plan.gathers()

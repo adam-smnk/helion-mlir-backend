@@ -9,6 +9,9 @@ Everything here comes from Helion's own metadata, never from tensor shapes:
 
 Nested loops carry their own bounds on the ``_for_loop(graph_id, begin, end, args)`` /
 ``_for_loop_step(..., step)`` node, and their block ids on ``ForLoopGraphInfo.block_ids``.
+
+Sizes are never specialized to their example values: a span or bound with free
+symbols stays an expression (``BuildContext.size`` resolves it at run time).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from typing import TYPE_CHECKING
 from typing import Literal
 
 import helion.language._tracing_ops as tracing_ops
+import sympy
 import torch
 import torch.fx
 
@@ -35,15 +39,22 @@ LOOP_TARGETS = (tracing_ops._for_loop, tracing_ops._for_loop_step)
 @dataclass(frozen=True)
 class BlockGeometry:
     block_id: int
-    block_size: int
+    block_size: int | None
+    """``None`` for a whole-dimension tile (see ``whole``)."""
     kind: LoopKind
     span: int | None
-    """Static ``end - begin``, or ``None`` when the loop bounds are runtime values."""
+    """Static ``end - begin``, or ``None`` when it is not known at compile time."""
+    span_expr: sympy.Expr | None = None
+    """``end - begin`` as an expression of size symbols, when known."""
+    whole: bool = False
+    """A persistent reduction over a dynamic dimension: one tile of the runtime span."""
 
     @property
-    def tile_extent(self) -> int:
+    def tile_extent(self) -> int | None:
         """Static size of a tile: the block size, or the span if that is smaller
-        (a single tile then covers the loop exactly)."""
+        (a single tile then covers the loop exactly); ``None`` for a whole tile."""
+        if self.whole:
+            return None
         if self.span is None:
             return self.block_size
         return min(self.block_size, self.span)
@@ -51,10 +62,11 @@ class BlockGeometry:
 
 @dataclass(frozen=True)
 class LoopBounds:
-    """Bounds of one loop dimension: ints, or FX nodes for runtime values."""
+    """Bounds of one loop dimension: ints, ``SymInt``s or FX nodes (runtime values),
+    or once resolved for a loop, ints or ``index`` values."""
 
-    begin: int | torch.fx.Node
-    end: int | torch.fx.Node
+    begin: object
+    end: object
     step: int
 
 
@@ -71,6 +83,19 @@ class KernelGeometry:
         kinds, root_calls = _loop_kinds_and_root_calls(hf)
         blocks: dict[int, BlockGeometry] = {}
         for info in env.block_sizes:
+            span = _static_int_or_none(info.size)
+            span_expr = (
+                _expr(info.size) if isinstance(info.size, (int, torch.SymInt)) else None
+            )
+            if (
+                span is None
+                and span_expr is not None
+                and _persistent_reduction(info, config)
+            ):
+                blocks[info.block_id] = BlockGeometry(
+                    info.block_id, None, "tile", None, span_expr, whole=True
+                )
+                continue
             configured = info.from_config(config)
             block_size = _static_int(
                 configured if configured is not None else info.size,
@@ -80,14 +105,15 @@ class KernelGeometry:
                 block_id=info.block_id,
                 block_size=block_size,
                 kind=kinds.get(info.block_id, "tile"),
-                span=_static_int_or_none(info.size),
+                span=span,
+                span_expr=span_expr,
             )
         root_bounds: dict[int, LoopBounds] = {}
         for block_ids, (begins, ends) in root_calls:
             for block_id, begin, end in zip(block_ids, begins, ends, strict=True):
                 root_bounds[block_id] = LoopBounds(
-                    begin=_static_int(begin, f"begin of block_id {block_id}"),
-                    end=_static_int(end, f"end of block_id {block_id}"),
+                    begin=_size(begin, f"begin of block_id {block_id}"),
+                    end=_size(end, f"end of block_id {block_id}"),
                     step=blocks[block_id].block_size,
                 )
         return cls(blocks=blocks, root_bounds=root_bounds)
@@ -95,10 +121,10 @@ class KernelGeometry:
     def block(self, block_id: int) -> BlockGeometry:
         return self.blocks[block_id]
 
-    def block_size(self, block_id: int) -> int:
+    def block_size(self, block_id: int) -> int | None:
         return self.blocks[block_id].block_size
 
-    def tile_extent(self, block_id: int) -> int:
+    def tile_extent(self, block_id: int) -> int | None:
         return self.blocks[block_id].tile_extent
 
     def is_grid(self, block_id: int) -> bool:
@@ -151,14 +177,38 @@ def _static_int(value: object, what: str) -> int:
 
 
 def _static_int_or_none(value: object) -> int | None:
+    """``value`` as an int if it has no free symbols (never its example value)."""
     if isinstance(value, int):
         return value
     if isinstance(value, torch.SymInt):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+        expr = value.node.expr
+        return None if expr.free_symbols else int(expr)
     return None
+
+
+def _expr(value: int | torch.SymInt) -> sympy.Expr:
+    return value.node.expr if isinstance(value, torch.SymInt) else sympy.Integer(value)
+
+
+def _size(value: object, what: str) -> int | torch.SymInt:
+    """A static int, or the ``SymInt`` of a runtime size."""
+    static = _static_int_or_none(value)
+    if static is not None:
+        return static
+    if isinstance(value, torch.SymInt):
+        return value
+    raise DynamicShapeError(value, symbol_name=what)
+
+
+def _persistent_reduction(info: object, config: object) -> bool:
+    """A reduction dimension without a reduction loop in ``config``."""
+    from helion._compiler.compile_environment import ReductionLoopBlockSizeSource
+
+    source = info.block_size_source
+    if not info.reduction or not isinstance(source, ReductionLoopBlockSizeSource):
+        return False
+    loops = list(getattr(config, "reduction_loops", None) or [])
+    return len(loops) <= source.reduction_loop or loops[source.reduction_loop] is None
 
 
 def _loop_kinds_and_root_calls(

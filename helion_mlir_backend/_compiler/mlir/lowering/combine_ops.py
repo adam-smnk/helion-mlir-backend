@@ -60,7 +60,7 @@ def lower_reduce(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         combine = _combine(ctx, graph_id)
         loop = scf_d.ForOp(
             ctx.index_const(1),
-            ctx.index_const(extent),
+            ctx.as_index(extent),
             ctx.index_const(1),
             iter_args=[take(ctx, value, dim, ctx.index_const(0))],
         )
@@ -82,23 +82,30 @@ def lower_scan(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     value, dim, extent = _source(ctx, source, dim)
     combine = _combine(ctx, graph_id)
     value_type = ir.RankedTensorType(value.type)
-    first = ctx.index_const(extent - 1 if reverse else 0)
+    last = (
+        extent - 1
+        if isinstance(extent, int)
+        else arith_d.SubIOp(extent, ctx.index_const(1)).result
+    )
+    first = ctx.as_index(last) if reverse else ctx.index_const(0)
     head = take(ctx, value, dim, first)
-    out = emit.empty(list(value_type.shape), value_type.element_type)
+    out = emit.empty(emit.sizes(value), value_type.element_type)
     loop = scf_d.ForOp(
         ctx.index_const(1),
-        ctx.index_const(extent),
+        ctx.as_index(extent),
         ctx.index_const(1),
         iter_args=[head, put(ctx, out, head, dim, first)],
     )
     with ir.InsertionPoint(loop.body):
         step = loop.induction_variable
-        if reverse:
+        if reverse and isinstance(extent, int):
             d0 = ir.AffineDimExpr.get(0)
             position = affine_d.AffineApplyOp(
                 ir.AffineMap.get(1, 0, [ir.AffineConstantExpr.get(extent - 1) - d0]),
                 [step],
             ).result
+        elif reverse:
+            position = arith_d.SubIOp(last, step).result
         else:
             position = step
         acc, partial = loop.inner_iter_args
@@ -118,11 +125,10 @@ def _operands(node: torch.fx.Node, name: str) -> tuple:
 
 def _source(
     ctx: BuildContext, source: torch.fx.Node, dim: int
-) -> tuple[ir.Value, int, int]:
+) -> tuple[ir.Value, int, emit.Size]:
     value = ctx.get_value(source)
-    shape = ir.RankedTensorType(value.type).shape
-    dim %= len(shape)
-    return value, dim, shape[dim]
+    dim %= ir.RankedTensorType(value.type).rank
+    return value, dim, emit.sizes(value)[dim]
 
 
 def _combine(
@@ -181,7 +187,7 @@ def _linalg_reduce(
 ) -> ir.Value:
     value_type = ir.RankedTensorType(value.type)
     element_type = value_type.element_type
-    shape = [size for index, size in enumerate(value_type.shape) if index != dim]
+    shape = [size for index, size in enumerate(emit.sizes(value)) if index != dim]
     init = emit.filled(shape, element_type, identity)
     reduce = linalg_d.ReduceOp([init.type], [value], [init], [dim])
     body = reduce.regions[0].blocks.append(element_type, element_type)

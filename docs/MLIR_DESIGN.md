@@ -280,6 +280,19 @@ with zeros to the static tile, `_mask_to` selects the reduction identity past
 it, and a store extracts it from the value before inserting. Divisible extents
 keep static sizes.
 
+#### Runtime sizes
+
+With `static_shapes=False`, a size with free symbols after substituting the
+config's block sizes is `?` in the types. `BuildContext.size(expr)` turns it into
+an `index` value: a size symbol is `tensor.dim` of the first host tensor
+argument with that size, or the runtime scalar that carries it; compound
+expressions (`s0 // 2`) are `index` arithmetic. The values are emitted at the
+start of the phase function and shared by equal expressions, so a loop over a
+tensor's extent and that tensor's slices use one value and need no extra clamp.
+No size is ever evaluated to its example value. Forall trip counts are
+`ceildiv` of the runtime span; a full slice of a runtime dim is a runtime-sized
+tile; ATen helpers get fake operands with one fresh size symbol per `?` dim.
+
 #### 3. **Accumulation Pattern**
 ```python
 acc = hl.zeros([m, n])
@@ -332,7 +345,7 @@ linalg.generic with custom compute block:
 - `if` on a tensor of more than one element
 - Atomics, `hl.rand`, inline assembly/Triton and `device_print` (rejected with
   the reason)
-- Dynamic shapes
+- Vectorized (optimizing-pipeline) code for ops on runtime-sized tiles
 
 ## Compilation Flow Example
 
@@ -437,7 +450,8 @@ See [tests/test_mlir_backend.py](../tests/test_mlir_backend.py) for test suite.
 1. **Layer Normalization**: Add custom linalg operation or linalg.normalize
 2. **Softmax**: Implement as fused reduction + exponential
 3. **Attention**: Matmul-based building blocks
-4. **Dynamic Shapes**: Support SymInt dimensions fully
+4. **Dynamic Shapes on the optimizing pipeline**: masked vectorization of ops on
+   runtime-sized tiles
 5. **Bufferization**: Option to generate memref-based IR
 6. **Custom Dialects**: Support for domain-specific operations
 

@@ -106,7 +106,7 @@ def emit_contraction(ctx: BuildContext, contraction: Contraction) -> ir.Value:
     result_type = _result_element_type(contraction.root, operand_type)
     if contraction.acc is None:
         accumulate_type = _accumulation_type(result_type)
-        init = emit.filled(spec.out_shape, accumulate_type, 0)
+        init = emit.filled(_out_sizes(spec, lhs, rhs), accumulate_type, 0)
         result = _emit_op(contraction, spec, lhs, rhs, init)
         return emit.cast_tensor(result, result_type)
 
@@ -120,6 +120,17 @@ def _operand(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if value is None:
         raise ValueNotFoundError(node, context="contraction operand")
     return value
+
+
+def _out_sizes(spec: ContractSpec, lhs: ir.Value, rhs: ir.Value) -> list[emit.Size]:
+    """The result's dims; a runtime one is the size of the operand dim it comes from."""
+    lhs_sizes, rhs_sizes = emit.sizes(lhs), emit.sizes(rhs)
+    return [
+        lhs_sizes[spec.lhs.index(position)]
+        if position in spec.lhs
+        else rhs_sizes[spec.rhs.index(position)]
+        for position in spec.out
+    ]
 
 
 def _result_element_type(root: torch.fx.Node, operand_type: ir.Type) -> ir.Type:

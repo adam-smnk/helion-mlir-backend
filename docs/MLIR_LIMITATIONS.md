@@ -15,17 +15,26 @@ This document lists current limitations for the MLIR backend in this repository.
 
 This replaces earlier "IR-only" descriptions.
 
-## 1) Static-Shape Requirement
+## 1) Dynamic Shapes
 
-Current requirement:
-- Kernels should be authored with `static_shapes=True`.
-- Inputs should have concrete compile-time shapes.
-
-Why:
-- The backend resolves tile/block dimensions to concrete sizes for slice types and loop bounds.
-
-Consequence:
-- Highly dynamic shape programs can fail shape propagation/lowering.
+Current behavior:
+- `static_shapes=True` kernels are fully static.
+- `static_shapes=False` kernels compile once per config and Helion shape bucket and
+  run for any sizes in it. Sizes known at compile time (including `hl.specialize`d
+  ones) stay static; the rest are MLIR `?`, read at run time from `tensor.dim` of a
+  host tensor argument or from a runtime scalar argument.
+- A full slice (`x[tm, :]`) of a runtime-sized dim is a runtime-sized tile (no
+  padding); tiled dims keep their static block size and are padded and masked at
+  the end of the loop as for ragged static shapes.
+- Runtime sizes the kernel assumes equal (one symbol) or computes (`n // 2`) are
+  checked on each call.
+- The optimizing pipeline is only used when every linalg op of the inlined module
+  is statically shaped (a tiled matmul); otherwise the kernel falls back to the
+  scalar pipeline (debug log). Lighthouse vectorizes without vector sizes, so it
+  cannot vectorize ops on runtime-sized tiles.
+- A size no host tensor argument or runtime scalar provides raises a
+  `DynamicShapeError`.
+- `execute_mlir` (no host code) cannot create host tensors of runtime shape.
 
 ## 2) CPU-Only Runtime Path
 
@@ -191,7 +200,7 @@ Limits:
 - A host tensor whose shape is computed from block sizes
   (`torch.zeros((m, n // block_n))` with `block_n = hl.register_block_size(n)`)
   takes the config's block sizes, as the host code does; a shape depending on
-  any other runtime value raises a `DynamicShapeError`.
+  other runtime sizes is `?` (see Dynamic Shapes).
 - In host code, `hl.specialize` and `hl.register_tunable` become their
   compile-time values; other Helion API calls there are rejected.
 - No statement other than `hl.barrier()` may appear between two top-level device
@@ -273,7 +282,7 @@ The local lighthouse checkout carries these pipeline changes (to be upstreamed):
 
 ## Out of Scope for This Backend Today
 
-- Full dynamic-shape-first lowering model.
+- Dynamic-shape kernels on the optimizing pipeline beyond statically tiled ones.
 - GPU runtime execution path parity with CPU path in this backend.
 - Guaranteed support for all ATen programs independent of pattern shape.
 

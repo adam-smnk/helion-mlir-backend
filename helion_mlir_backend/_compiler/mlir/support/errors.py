@@ -63,11 +63,11 @@ class ShapeError(MLIRBackendError):
 
 
 class DynamicShapeError(ShapeError):
-    """Raised when dynamic shapes are encountered but not supported."""
+    """Raised when a size is not known at compile time and cannot be computed at run time."""
 
     def __init__(self, shape: object, symbol_name: str | None = None) -> None:
-        reason = f"Dynamic shape {symbol_name or 'with SymInt'} not yet supported"
-        constraint = "Use static_shapes=True in @helion.kernel decorator"
+        reason = f"cannot resolve {symbol_name or 'a symbolic size'}"
+        constraint = "Use static_shapes=True, or hl.specialize() the size"
         super().__init__(shape, reason, constraint)
         self.symbol_name = symbol_name
 

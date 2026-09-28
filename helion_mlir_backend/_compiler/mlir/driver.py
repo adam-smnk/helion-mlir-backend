@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 
 from ..execution import compile_entry
@@ -59,6 +60,10 @@ def compile_kernel(
         host_function = build_host_function(
             hf, builder.context.geometry.block_size, config
         )
+        sizes = {
+            name: builder.context.ref_sizes(name)
+            for name in builder.context.signature.refs
+        }
     entry = compile_entry(module, hf.name, pipeline=pipeline)
     host_globals = host_function.__globals__
     arg_exprs = [
@@ -70,7 +75,9 @@ def compile_kernel(
         try:
             local_vars = next(host)
             call_entry(
-                entry, [eval(expr, host_globals, local_vars) for expr in arg_exprs]
+                entry,
+                [eval(expr, host_globals, local_vars) for expr in arg_exprs],
+                sizes,
             )
             next(host)
         except StopIteration as done:
@@ -80,18 +87,32 @@ def compile_kernel(
     return run
 
 
-def call_entry(entry: CompiledEntry, values: list[object]) -> list[torch.Tensor]:
+def call_entry(
+    entry: CompiledEntry,
+    values: list[object],
+    sizes: dict[str, list[sympy.Expr]] | None = None,
+) -> list[torch.Tensor]:
     """Call ``entry`` with one value per argument; returns the inout tensors.
 
     Tensors are passed contiguous (a copy for strided ones, copied back for inouts).
     An input that overlaps an inout is cloned so the ``restrict`` arguments hold;
-    overlapping inouts are rejected.
+    overlapping inouts are rejected. ``sizes`` (each argument's size expressions)
+    lets runtime sizes the kernel assumes equal be checked.
     """
     tensors = [
         _checked_tensor(arg, value)
         for arg, value in zip(entry.args, values, strict=True)
         if arg.role != "scalar"
     ]
+    if sizes is not None:
+        _check_sizes(
+            [
+                (arg.name, value)
+                for arg, value in zip(entry.args, values, strict=True)
+                if arg.role != "scalar"
+            ],
+            sizes,
+        )
     roles = [arg.role for arg in entry.args if arg.role != "scalar"]
     inouts = [t for t, role in zip(tensors, roles, strict=True) if role == "inout"]
     for i, first in enumerate(inouts):
@@ -128,12 +149,51 @@ def _checked_tensor(arg: EntryArg, value: object) -> torch.Tensor:
         raise NotImplementedError(
             f"'{arg.name}' is on {value.device}; only CPU is supported"
         )
-    if tuple(value.shape) != arg.shape or value.dtype != arg.dtype:
+    if (
+        value.dim() != len(arg.shape)
+        or any(
+            expected not in (-1, actual)
+            for expected, actual in zip(arg.shape, value.shape, strict=True)
+        )
+        or value.dtype != arg.dtype
+    ):
+        expected = tuple("?" if size == -1 else size for size in arg.shape)
         raise ValueError(
             f"'{arg.name}' has shape {tuple(value.shape)} and dtype {value.dtype}; the "
-            f"compiled kernel expects {arg.shape} and {arg.dtype}"
+            f"compiled kernel expects {expected} and {arg.dtype}"
         )
     return value
+
+
+def _check_sizes(
+    tensors: list[tuple[str, torch.Tensor]], sizes: dict[str, list[sympy.Expr]]
+) -> None:
+    """Runtime sizes with one symbol are equal, and sizes computed from symbols
+    (``n // 2``) match them."""
+    bound: dict[sympy.Symbol, int] = {}
+    computed = []
+    for name, tensor in tensors:
+        for dim, expr in enumerate(sizes.get(name, ())):
+            if not expr.free_symbols:
+                continue
+            actual = tensor.shape[dim]
+            if isinstance(expr, sympy.Symbol):
+                expected = bound.setdefault(expr, actual)
+                if expected != actual:
+                    raise ValueError(
+                        f"'{name}' has size {actual} in dim {dim}, but the kernel was "
+                        f"compiled for the same size as another argument's ({expected})"
+                    )
+            else:
+                computed.append((name, dim, expr, actual))
+    for name, dim, expr, actual in computed:
+        if expr.free_symbols <= bound.keys():
+            expected = int(expr.xreplace(bound))
+            if expected != actual:
+                raise ValueError(
+                    f"'{name}' has size {actual} in dim {dim}; the kernel computes "
+                    f"it as {expr} = {expected}"
+                )
 
 
 def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:

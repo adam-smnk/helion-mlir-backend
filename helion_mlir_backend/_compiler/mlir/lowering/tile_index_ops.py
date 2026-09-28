@@ -8,10 +8,10 @@ import helion.language._tracing_ops as tracing_ops
 import helion.language.tile_ops as tile_ops
 from mlir.dialects import arith as arith_d
 from mlir.dialects import linalg as linalg_d
+from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 import torch
 
-from ..support import DynamicShapeError
 from ..support import NodeLoweringError
 from ..support import ValueNotFoundError
 from ..support import block_id_from_key
@@ -41,7 +41,7 @@ def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         if block_id not in ctx.geometry.blocks:
             raise ValueNotFoundError(node, context=f"unknown block key: {key!r}")
         # The tile's size, as in every shape built from this symbol.
-        return ctx.index_const(ctx.geometry.tile_extent(block_id))
+        return ctx.as_index(ctx.tile_size(block_id))
     # ``hl.grid`` and tile position symbols have no ``block_size_`` key; they resolve
     # to a scalar index through their Helion symbol origin.
     info = ctx.node_symbol_info(node)
@@ -53,16 +53,15 @@ def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
 
 @lowers(torch.ops.aten.sym_size.int)
 def lower_sym_size(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
-    """``sym_size.int(tensor, dim)``: a constant for the operand's static dimension."""
+    """``sym_size.int(tensor, dim)``: the operand's dimension, a constant if static."""
     tensor, dim = node.args[:2]
     value = ctx.get_value(tensor)
     if value is None:
         raise ValueNotFoundError(tensor, context="sym_size operand")
-    shape = ir.RankedTensorType(value.type).shape
-    size = shape[dim]
-    if ir.ShapedType.is_dynamic_size(size):
-        raise DynamicShapeError(node.meta.get("val"), symbol_name=node.name)
-    return ctx.index_const(size)
+    size = ir.RankedTensorType(value.type).shape[dim]
+    if not ir.ShapedType.is_dynamic_size(size):
+        return ctx.index_const(size)
+    return tensor_d.DimOp(value, ctx.index_const(dim)).result
 
 
 @lowers(tile_ops.tile_index)
@@ -139,7 +138,7 @@ def scalar_tile_value(ctx: BuildContext, block_id: int, kind: str) -> ir.Value |
         return offset
 
     if kind == "tile_end":
-        valid = ctx.block_id_to_valid.get(block_id, geometry.tile_extent(block_id))
+        valid = ctx.block_id_to_valid.get(block_id, ctx.tile_size(block_id))
         return arith_d.AddIOp(offset, ctx.as_index(valid)).result
 
     if kind == "tile_id":

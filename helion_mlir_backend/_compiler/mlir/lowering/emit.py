@@ -27,11 +27,26 @@ def constant(element_type: ir.Type, value: float) -> ir.Value:
     return arith_d.ConstantOp(element_type, attr).result
 
 
-def empty(shape: list[int], element_type: ir.Type) -> ir.Value:
+def empty(shape: list[Size], element_type: ir.Type) -> ir.Value:
+    """``tensor.empty`` of static dims and ``index`` values for runtime ones."""
+    if any(
+        isinstance(dim, int) and ir.ShapedType.is_dynamic_size(dim) for dim in shape
+    ):
+        raise ValueError("a runtime dim needs its size value (see emit.sizes)")
     return tensor_d.EmptyOp(shape, element_type).result
 
 
-def filled(shape: list[int], element_type: ir.Type, value: float) -> ir.Value:
+def sizes(value: ir.Value) -> list[Size]:
+    """``value``'s dims: static ints, ``tensor.dim`` for runtime ones."""
+    return [
+        tensor_d.DimOp(value, constant(ir.IndexType.get(), dim)).result
+        if ir.ShapedType.is_dynamic_size(size)
+        else size
+        for dim, size in enumerate(ir.RankedTensorType(value.type).shape)
+    ]
+
+
+def filled(shape: list[Size], element_type: ir.Type, value: float) -> ir.Value:
     return linalg_d.fill(
         constant(element_type, value), outs=[empty(shape, element_type)]
     )
@@ -100,7 +115,7 @@ def cast_tensor(value: ir.Value, element_type: ir.Type) -> ir.Value:
     generic = linalg_d.GenericOp(
         [ir.RankedTensorType.get(shape, element_type)],
         [value],
-        [empty(shape, element_type)],
+        [empty(sizes(value), element_type)],
         ir.ArrayAttr.get([identity, identity]),
         ir.ArrayAttr.get([parallel] * len(shape)),
     )
@@ -198,10 +213,13 @@ def parallel_insert_slice(
 
 
 def pad_high(value: ir.Value, sizes: list[Size], shape: list[int]) -> ir.Value:
-    """Zero-pad ``value`` (of ``sizes``) at the end of each dimension to ``shape``."""
+    """Zero-pad ``value`` (of ``sizes``) at the end of each dimension to ``shape``
+    (a dynamic dim of ``shape`` is not padded)."""
     d0 = ir.AffineDimExpr.get(0)
     highs: list[Size] = [
-        target - size
+        0
+        if ir.ShapedType.is_dynamic_size(target)
+        else target - size
         if isinstance(size, int)
         else affine_d.AffineApplyOp(
             ir.AffineMap.get(1, 0, [ir.AffineConstantExpr.get(target) - d0]),
@@ -234,7 +252,7 @@ def mask(value: ir.Value, bounds: dict[int, ir.Value], other: float) -> ir.Value
     generic = linalg_d.GenericOp(
         [value_type],
         [value],
-        [empty(shape, element_type)],
+        [empty(sizes(value), element_type)],
         ir.ArrayAttr.get([identity, identity]),
         ir.ArrayAttr.get([parallel] * len(shape)),
     )

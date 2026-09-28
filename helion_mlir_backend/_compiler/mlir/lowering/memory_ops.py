@@ -76,7 +76,7 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     index_nodes, value_node = node.args[1], node.args[2]
     extra_mask = node.args[3] if len(node.args) > 3 else node.kwargs.get("extra_mask")
     state = ctx.tensors.value(name)
-    plan = plan_slice(ctx, index_nodes, state, ctx.tensors.owned(name))
+    plan = plan_slice(ctx, index_nodes, state, ctx.tensors.owned(name), name)
     if plan.gathers():
         raise UnsupportedOperationError(
             "store", reason="stores indexed by a tensor (scatter) are not supported"
@@ -116,10 +116,14 @@ def _store_value(value: ir.Value, element_type: ir.Type, plan: SlicePlan) -> ir.
     shape = plan.value_shape()
     if not isinstance(value.type, ir.RankedTensorType):
         scalar = emit.cast_scalar(value, element_type)
-        return linalg_d.fill(scalar, outs=[emit.empty(shape, element_type)])
+        return linalg_d.fill(
+            scalar, outs=[emit.empty(plan.value_tile_sizes(), element_type)]
+        )
     if _broadcasts(value, plan):
         return _broadcast(
-            value, emit.empty(shape, element_type), list(range(len(shape)))
+            value,
+            emit.empty(plan.value_tile_sizes(), element_type),
+            list(range(len(shape))),
         )
     value_shape = list(value.type.shape)
     if value_shape not in (shape, plan.tile_shape()):
