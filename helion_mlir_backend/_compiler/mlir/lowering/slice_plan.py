@@ -16,6 +16,7 @@ import mlir.ir as ir
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
+    from .tensor_state import OwnedDim
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ def plan_slice(
     ctx: BuildContext,
     index_nodes: list | tuple,
     base_type: ir.RankedTensorType,
+    owned: dict[int, OwnedDim] | None = None,
 ) -> SlicePlan:
     """Build a SlicePlan from authoritative index metadata.
 
@@ -65,68 +67,64 @@ def plan_slice(
     - Tile index (block_id) → tile: block_id from symbol, size = block size.
     - Literal int → scalar constant offset, size 1, reduces.
 
+    ``owned`` marks dims where ``base_type`` is only the current iteration's region
+    of a larger tensor (see ``tensor_state``); those are indexed from its origin.
+
     Raises NodeLoweringError if a tile index cannot be resolved to a block id.
     """
-
     from ..support.errors import NodeLoweringError
     from ..support.index_meta import resolve_index_descriptor
 
+    owned = owned or {}
     base_rank = len(base_type.shape)
     dims: list[DimSlice] = []
 
     for dimension, index_node in enumerate(index_nodes):
         if dimension >= base_rank:
             break
+        extent = int(base_type.shape[dimension])
 
-        # Full slice: contribute the full base dimension.
         if isinstance(index_node, slice):
+            start, stop = _static_slice_bounds(index_node, extent)
+            dims.append(DimSlice("full", ctx.index_const(start), stop - start))
+            continue
+
+        descriptor = resolve_index_descriptor(ctx, index_node)
+        owner = owned.get(dimension)
+        if owner is not None:
+            if descriptor.block_id != owner.block_id or descriptor.bias:
+                raise NodeLoweringError(
+                    index_node,
+                    reason=(
+                        f"dimension {dimension} is owned by block_id "
+                        f"{owner.block_id} but indexed by another expression"
+                    ),
+                )
             dims.append(
                 DimSlice(
-                    kind="full",
-                    offset=ctx.index_const(0),
-                    size=int(base_type.shape[dimension]),
-                    block_id=None,
-                    reduces=False,
+                    "scalar" if owner.point else "tile",
+                    ctx.index_const(0),
+                    1 if owner.point else extent,
+                    owner.block_id,
+                    reduces=owner.point,
                 )
             )
             continue
 
-        descriptor = resolve_index_descriptor(ctx, index_node)
-
-        # Scalar index: grid/tile.begin or literal int.
         if descriptor.is_scalar:
             block_id = descriptor.block_id
-            scalar_value: ir.Value | None = None
-
             if block_id is not None and block_id in ctx.block_id_to_iv:
                 scalar_value = ctx.block_id_to_iv[block_id]
             else:
-                # Fallback: try to get the value directly.
                 scalar_value = ctx.get_value(index_node)
-
             offset = (
                 ctx.cast_to_index(scalar_value)
                 if scalar_value is not None
                 else ctx.index_const(descriptor.bias)
             )
-            # If the base tensor's own extent here is 1, this dimension has
-            # already been reduced to a single local slot (e.g. a synthetic
-            # per-iteration accumulator); any offset other than 0 would be
-            # out of bounds, regardless of the index's absolute block id/iv.
-            if int(base_type.shape[dimension]) == 1:
-                offset = ctx.index_const(0)
-            dims.append(
-                DimSlice(
-                    kind="scalar",
-                    offset=offset,
-                    size=1,
-                    block_id=block_id,
-                    reduces=True,
-                )
-            )
+            dims.append(DimSlice("scalar", offset, 1, block_id, reduces=True))
             continue
 
-        # Tile index: must resolve to a block id.
         block_id, bias = descriptor.block_id, descriptor.bias
         if block_id is None:
             raise NodeLoweringError(
@@ -134,51 +132,43 @@ def plan_slice(
                 reason=f"Tile index at dimension {dimension} has no resolvable block id",
                 recovery_hint="Ensure all tile indices are in hl.tile() loops with configured block_sizes",
             )
-
-        # Compute the tile offset and size.
+        if block_id not in ctx.geometry.blocks:
+            raise NodeLoweringError(
+                index_node,
+                reason=f"Tile index at dimension {dimension} names unknown block_id {block_id}",
+            )
         if block_id in ctx.block_id_to_iv:
             offset = ctx.block_id_to_iv[block_id]
             if bias:
                 offset = ir.ops.arith.addi(offset, ctx.index_const(bias))
         else:
             offset = ctx.index_const(bias)
+        size = min(ctx.geometry.tile_extent(block_id), extent)
+        dims.append(DimSlice("tile", offset, size, block_id))
 
-        if block_id not in ctx.geometry.blocks:
-            raise NodeLoweringError(
-                index_node,
-                reason=f"Tile index at dimension {dimension} names unknown block_id {block_id}",
-            )
-        base_extent = int(base_type.shape[dimension])
-        tile_size = min(ctx.geometry.tile_extent(block_id), base_extent)
-
-        # Same local-slot invariant as the scalar case above: if the base
-        # tensor's extent here exactly equals one tile's worth, this
-        # dimension has already been reduced to a single local tile by an
-        # enclosing loop (e.g. a synthetic per-iteration accumulator), so the
-        # offset into it must be 0 rather than the absolute block iv/bias.
-        if base_extent == tile_size:
-            offset = ctx.index_const(0)
-
-        dims.append(
-            DimSlice(
-                kind="tile",
-                offset=offset,
-                size=tile_size,
-                block_id=block_id,
-                reduces=False,
-            )
-        )
-
-    # Pad to base rank if needed (remaining dims are full slices).
     while len(dims) < base_rank:
         dims.append(
-            DimSlice(
-                kind="full",
-                offset=ctx.index_const(0),
-                size=int(base_type.shape[len(dims)]),
-                block_id=None,
-                reduces=False,
-            )
+            DimSlice("full", ctx.index_const(0), int(base_type.shape[len(dims)]))
         )
 
     return SlicePlan(dims)
+
+
+def _static_slice_bounds(index: slice, extent: int) -> tuple[int, int]:
+    """``[start, stop)`` of a unit-step slice with static bounds, Python-style."""
+    from ..support.errors import UnsupportedOperationError
+
+    bounds = []
+    for value in (index.start, index.stop):
+        try:
+            bounds.append(None if value is None else int(value))
+        except (TypeError, ValueError):
+            bounds.append(value)
+    if index.step not in (None, 1) or not all(
+        bound is None or isinstance(bound, int) for bound in bounds
+    ):
+        raise UnsupportedOperationError(
+            "subscript slice", reason=f"only static unit-step slices, got {index}"
+        )
+    start, stop, _ = slice(*bounds).indices(extent)
+    return start, max(start, stop)

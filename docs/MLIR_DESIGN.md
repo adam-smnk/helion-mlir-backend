@@ -52,10 +52,17 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
 **Architecture:**
 - **State Management:**
   - `BuildContext.node_to_value`: Maps FX nodes to MLIR SSA values
-  - `BuildContext.block_id_to_size`: Maps block IDs to concrete tile sizes
-  - `BuildContext.block_id_to_iv`: Maps block IDs to scf loop induction variables
+  - `BuildContext.geometry`: `KernelGeometry` (block sizes, spans, loop bounds)
+  - `BuildContext.block_id_to_iv`: Maps block IDs to the current tile offset
   - `BuildContext.param_to_value`: Maps parameters to function arguments
-  - `BuildContext.forall_insert_slices`: Tracks pending parallel tensor insertions
+  - `BuildContext.effects` / `BuildContext.tensors`: host tensors each graph
+    loads/stores (`analysis/tensor_effects.py`) and the current SSA value of every
+    written host tensor (`lowering/tensor_state.py`). A store is an `insert_slice`
+    into that value; a load of a written tensor reads it. Each root graph is its
+    own `scf.forall` whose iterations own disjoint regions of the written tensors
+    (inserted back with `parallel_insert_slice`); if a written tensor is not
+    partitioned by every grid dim, the root runs as a sequential `scf.for` nest.
+    Nested `scf.for` loops carry the tensors their bodies write.
 
 - **Key Methods:**
   - `build()`: Entry point, creates MLIR module

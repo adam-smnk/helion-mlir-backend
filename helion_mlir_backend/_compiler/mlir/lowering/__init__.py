@@ -8,7 +8,7 @@ from __future__ import annotations
 from . import contraction_ops as contraction_ops
 from . import elementwise_ops as elementwise_ops
 from . import view_ops as view_ops
-from .control_flow import build_kernel_body
+from .control_flow import build_phase_body
 from .control_flow import lower_nested_for_loop
 from .host_tensor_ops import lower_host_tensor
 from .load_slice_ops import lower_load
@@ -21,7 +21,7 @@ from .tile_index_ops import scalar_tile_value
 from .transpose_ops import lower_transpose
 
 __all__ = [
-    "build_kernel_body",
+    "build_phase_body",
     "lower_full",
     "lower_host_tensor",
     "lower_load",

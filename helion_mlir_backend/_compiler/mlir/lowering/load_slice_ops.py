@@ -8,6 +8,8 @@ import helion.language.memory_ops as memory_ops
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
+from ..analysis.tensor_effects import host_tensor_name
+from ..support import ValueNotFoundError
 from .registry import lowers
 
 if TYPE_CHECKING:
@@ -22,8 +24,15 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
 
     tensor_node = node.args[0]
     index_nodes = node.args[1]
-    tensor_value = ctx.get_value(tensor_node)
-    assert tensor_value is not None, f"No value for tensor node {tensor_node}"
+    name = host_tensor_name(tensor_node)
+    if name is not None and name in ctx.tensors:
+        tensor_value = ctx.tensors.value(name)
+        owned = ctx.tensors.owned(name)
+    else:
+        tensor_value = ctx.get_value(tensor_node)
+        owned = {}
+    if tensor_value is None:
+        raise ValueNotFoundError(tensor_node, context="loaded tensor")
     tensor_type = ir.RankedTensorType(tensor_value.type)
     ndim = len(tensor_type.shape)
 
@@ -52,7 +61,7 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     # Build authoritative slice plan from index metadata.
     from .slice_plan import plan_slice
 
-    plan = plan_slice(ctx, index_nodes, tensor_type)
+    plan = plan_slice(ctx, index_nodes, tensor_type, owned)
 
     # Extract at full rank (no rank reduction at the op level): letting MLIR
     # infer which size-1 dims to drop from static_sizes alone is ambiguous

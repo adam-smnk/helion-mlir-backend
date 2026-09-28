@@ -6,6 +6,8 @@ compilation pipelines (e.g., Triton, LLVM).
 
 from __future__ import annotations
 
+import re
+
 import helion
 import helion.language as hl
 import pytest
@@ -266,8 +268,8 @@ class TestScalarBlockIndices:
         assert "tensor<4x32x32xf32> to tensor<1x32x32xf32>" in ir_str
         assert "tensor<1x32x32xf32> into tensor<32x32xf32>" in ir_str
         assert "linalg.matmul" in ir_str
-        # The store expands back to the full rank.
-        assert "tensor<32x32xf32> into tensor<4x32x32xf32>" in ir_str
+        # The store writes the iteration's owned [1, 32, 32] region back.
+        assert "tensor<1x32x32xf32> into tensor<4x32x32xf32>" in ir_str
 
     def test_scalar_grid_tile_slice_preserves_rank_metadata(self):
         """Scalar grid indices with a tiled slice must keep explicit size-1 offsets."""
@@ -489,8 +491,11 @@ class TestContractionExpressiveness:
         assert "linalg.matmul" in ir_str
         assert "bf16" in ir_str and "f32" in ir_str
         # Narrow operands accumulate into the wider tile without a helper call.
-        assert "ins(%extracted_slice, %extracted_slice" in ir_str
-        assert "tensor<16x16xbf16>, tensor<16x16xbf16>) outs(" in ir_str
+        assert re.search(
+            r"linalg\.matmul ins\(%extracted_slice\w*, %extracted_slice\w* : "
+            r"tensor<16x16xbf16>, tensor<16x16xbf16>\) outs\(",
+            ir_str,
+        )
         assert "-> tensor<16x16xf32>" in ir_str
 
     def test_f16_operands_accumulate_into_f32(self):

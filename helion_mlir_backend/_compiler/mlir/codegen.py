@@ -52,7 +52,7 @@ import torch.fx
 
 from .aten_bridge import AtenHelperTable
 from .build_context import BuildContext
-from .lowering import build_kernel_body
+from .lowering import build_phase_body
 from .lowering import lower_node
 from .support import MLIRBackendError
 from .support import UnsupportedOperationError
@@ -228,18 +228,10 @@ class MLIRModuleBuilder:
                             ):
                                 self.context.param_to_value[name] = arg
 
-                            real_root_ids = [
-                                self.hf.device_ir.root_ids[pos] for pos in plan.root_ids
-                            ]
-                            scoped_groups = [
-                                self.hf.device_ir.grid_block_ids[pos]
-                                for pos in plan.root_ids
-                            ]
-                            result_vals = build_kernel_body(
+                            result_vals = build_phase_body(
                                 self.context,
-                                [tensor for _, tensor in plan.outputs],
-                                root_ids=real_root_ids,
-                                grid_block_id_groups=scoped_groups,
+                                plan.root_ids,
+                                [name for name, _ in plan.outputs],
                             )
                             func_d.ReturnOp(result_vals)
 
@@ -287,8 +279,7 @@ class MLIRModuleBuilder:
         multi_phase = len(self.hf.device_ir.phases) > 1
 
         if not needs_driver:
-            out_params = self._find_output_tensors(tensor_params)
-            self._build_single_phase_function(tensor_params, out_params)
+            self._build_single_phase_function(tensor_params)
             return
 
         # Multi-phase (hl.barrier()) and/or host-tensor-interop kernels are
@@ -318,17 +309,18 @@ class MLIRModuleBuilder:
         )
 
     def _build_single_phase_function(
-        self,
-        tensor_params: list[tuple[str, torch.Tensor]],
-        out_params: list[tuple[str, torch.Tensor]],
+        self, tensor_params: list[tuple[str, torch.Tensor]]
     ) -> None:
-        output_types = [torch_tensor_to_mlir_type(t) for _, t in out_params]
-        out_names = {name for name, _ in out_params}
-        out_tensor_ids = {id(t) for _, t in out_params}
+        """Inputs: tensor params not written, or also read. Outputs: every written tensor."""
+        effects = self.context.effects
+        graphs = [graph_info.graph for graph_info in self.hf.device_ir.graphs]
+        outputs = effects.written_in(graphs)
+        read = effects.read_in(graphs)
+        output_types = [torch_tensor_to_mlir_type(effects.fakes[n]) for n in outputs]
         input_params = [
             (name, value)
             for name, value in tensor_params
-            if name not in out_names and id(value) not in out_tensor_ids
+            if name not in outputs or name in read
         ]
         input_types = [torch_tensor_to_mlir_type(value) for _, value in input_params]
 
@@ -338,23 +330,16 @@ class MLIRModuleBuilder:
         with ir.InsertionPoint(entry):
             for (name, _), arg in zip(input_params, entry.arguments, strict=True):
                 self.context.param_to_value[name] = arg
-            if self.context.geometry is None:
-                with self.hf:
-                    self._resolve_geometry()
-            func_d.ReturnOp(build_kernel_body(self.context, [t for _, t in out_params]))
-
-    def _find_output_tensors(
-        self, tensor_params: list[tuple[str, torch.Tensor]]
-    ) -> list[tuple[str, torch.Tensor]]:
-        from .output_resolver import OutputTensorResolver
-
-        return OutputTensorResolver(self.hf).resolve_all(tensor_params)
+            roots = range(len(self.hf.device_ir.root_ids))
+            func_d.ReturnOp(build_phase_body(self.context, list(roots), outputs))
 
     def _resolve_geometry(self) -> None:
-        """Record loop geometry and contraction matches (needs ``with self.hf:``)."""
+        """Record loop geometry, tensor effects and contractions (needs ``with self.hf:``)."""
         from .analysis.contractions import ContractionPlan
         from .analysis.geometry import KernelGeometry
+        from .analysis.tensor_effects import TensorEffects
 
+        self.context.effects = TensorEffects.from_host_function(self.hf)
         self.context.geometry = KernelGeometry.from_host_function(
             self.hf, self.config, self.env
         )

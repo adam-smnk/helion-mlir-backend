@@ -7,10 +7,18 @@ from typing import TYPE_CHECKING
 
 import helion.language._tracing_ops as tracing_ops
 import helion.language.memory_ops as memory_ops
+from mlir.dialects import linalg as linalg_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
+from ..analysis.tensor_effects import host_tensor_name
+from ..support import NodeLoweringError
+from ..support import UnsupportedOperationError
+from ..support import ValueNotFoundError
+from . import emit
 from .registry import lowers
+from .slice_plan import SlicePlan
+from .slice_plan import plan_slice
 
 if TYPE_CHECKING:
     import torch.fx
@@ -30,18 +38,6 @@ def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     return container_value
 
 
-def _cast_store_value(ctx: BuildContext, value: ir.Value, target: ir.Value) -> ir.Value:
-    """Convert a stored tile to the destination element type when they differ."""
-
-    from .emit import cast_tensor
-
-    if not isinstance(value.type, ir.RankedTensorType) or not isinstance(
-        target.type, ir.RankedTensorType
-    ):
-        return value
-    return cast_tensor(value, target.type.element_type)
-
-
 @lowers(tracing_ops._mask_to)
 def lower_mask_to(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """Pass-through until boundary tiles are masked (plan Phase 6)."""
@@ -50,214 +46,57 @@ def lower_mask_to(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
 
 @lowers(memory_ops.store)
 def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
-    """Record or apply a Helion store in the active loop context."""
-    index_nodes = node.args[1]
-    value_node = node.args[2]
+    """``insert_slice`` of the value into the destination's current SSA state."""
+    name = host_tensor_name(node.args[0])
+    if name is None or name not in ctx.tensors:
+        raise NodeLoweringError(node, reason="the store target is not a host tensor")
+    index_nodes, value_node = node.args[1], node.args[2]
+    state = ctx.tensors.value(name)
+    state_type = ir.RankedTensorType(state.type)
+    plan = plan_slice(ctx, index_nodes, state_type, ctx.tensors.owned(name))
+    value = _store_value(ctx, node, value_node, state_type.element_type, plan)
+    rank = len(plan.dims)
+    updated = tensor_d.InsertSliceOp(
+        value,
+        state,
+        plan.offsets(),
+        [],
+        [],
+        static_offsets=[ir.ShapedType.get_dynamic_size()] * rank,
+        static_sizes=plan.static_sizes(),
+        static_strides=[1] * rank,
+    ).result
+    ctx.tensors.rebind(name, updated)
+
+
+def _store_value(
+    ctx: BuildContext,
+    node: torch.fx.Node,
+    value_node: object,
+    element_type: ir.Type,
+    plan: SlicePlan,
+) -> ir.Value:
+    """The stored value as a tensor of the slice's shape and destination dtype."""
     value = ctx.get_value(value_node)
-    assert value is not None, f"No value for store value node {value_node}"
-
-    target_value = ctx.get_value(node.args[0])
-    if target_value is not None:
-        value = _cast_store_value(ctx, value, target_value)
-
-    if ctx.for_store_ctx_stack:
-        _store_into_synthetic_accumulator(ctx, index_nodes, value)
-        return
-
-    # Rare: the destination already has an SSA value bound (its dimensions
-    # can be read directly from the value's own type).
-    if target_value is not None and _store_via_bound_target(
-        ctx, index_nodes, value, target_value, node
-    ):
-        return
-
-    # Common case: the output tensor is created later in build_kernel_body,
-    # so target_value has no SSA value yet and offsets must be inferred
-    # positionally against the stored value's own shape.
-    _store_via_deferred_target(ctx, index_nodes, value, target_value, node)
-
-
-def _store_into_synthetic_accumulator(
-    ctx: BuildContext, index_nodes: list | tuple, value: ir.Value
-) -> None:
-    """Insert into the active loop level's synthetic per-iteration accumulator."""
-
-    context = ctx.for_store_ctx_stack[-1]
-    current = context.current
-
-    # Compute the descriptor-based per-iteration insert plan once, on
-    # first use.
-    store_plan = context.store_plan
-    if store_plan is None and current is not None:
-        from .slice_plan import plan_slice
-
-        target_type = ir.RankedTensorType(current.type)
-        store_plan = plan_slice(ctx, index_nodes, target_type)
-        context.store_plan = store_plan
-
-    if store_plan is not None and current is not None:
-        offsets = store_plan.offsets()
-        static_sizes = store_plan.static_sizes()
-        updated = tensor_d.InsertSliceOp(
-            value,
-            current,
-            offsets,
-            [],
-            [],
-            static_offsets=[ir.ShapedType.get_dynamic_size()] * len(offsets),
-            static_sizes=static_sizes,
-            static_strides=[1] * len(offsets),
-        ).result
-        context.current = updated
-
-
-def _store_via_bound_target(
-    ctx: BuildContext,
-    index_nodes: list | tuple,
-    value: ir.Value,
-    target_value: ir.Value,
-    node: torch.fx.Node,
-) -> bool:
-    """Try the descriptor-based terminal store; return False to defer."""
-
-    from ..support.errors import NodeLoweringError
-
-    try:
-        from .slice_plan import plan_slice
-
-        target_type = ir.RankedTensorType(target_value.type)
-        store_plan = plan_slice(ctx, index_nodes, target_type)
-        offsets = store_plan.offsets()
-        static_sizes = store_plan.static_sizes()
-        target_tensor_id = _target_tensor_id(node)
-        ctx.forall_insert_slices.append(
-            (value, offsets, static_sizes, target_tensor_id)
+    if value is None:
+        raise ValueNotFoundError(value_node, context="stored value")
+    if not isinstance(value.type, ir.RankedTensorType):
+        scalar = emit.cast_scalar(value, element_type)
+        return linalg_d.fill(
+            scalar, outs=[emit.empty(plan.value_shape(), element_type)]
         )
-        return True
-    except NodeLoweringError:
-        # Expected bail signal: a tile index has no resolvable block id
-        # (e.g. target_value's dimension doesn't match index_nodes yet).
-        # Any other exception is a real bug and must propagate.
-        return False
-
-
-def _store_via_deferred_target(
-    ctx: BuildContext,
-    index_nodes: list | tuple,
-    value: ir.Value,
-    target_value: ir.Value | None,
-    node: torch.fx.Node,
-) -> None:
-    """Positional terminal store used when the destination has no SSA value yet."""
-
-    offsets: list[ir.Value] = []
-    static_sizes: list[int] = []
-    value_shape = list(ir.RankedTensorType(value.type).shape)
-    value_dim = 0
-    target_rank = len(index_nodes)
-    if target_value is not None:
-        target_rank = max(
-            len(index_nodes), len(ir.RankedTensorType(target_value.type).shape)
-        )
-    else:
-        target_shape = ctx.shape_from_node_meta(node.args[0])
-        if target_shape is not None:
-            target_rank = max(target_rank, len(target_shape))
-    for index_node in index_nodes:
-        if ctx.is_scalar_index_node(index_node):
-            scalar_offset = ctx.get_value(index_node)
-            offsets.append(
-                ctx.cast_to_index(scalar_offset)
-                if scalar_offset is not None
-                else ctx.index_const(0)
-            )
-            static_sizes.append(1)
-            continue
-
-        if isinstance(index_node, slice):
-            offsets.append(ctx.index_const(0))
-            if value_dim < len(value_shape):
-                static_sizes.append(value_shape[value_dim])
-                value_dim += 1
-            else:
-                static_sizes.append(1)
-            continue
-
-        if value_dim >= len(value_shape):
-            break
-        block_id = ctx.infer_block_id_from_index(index_node)
-        if block_id is not None and block_id in ctx.block_id_to_iv:
-            offsets.append(ctx.block_id_to_iv[block_id])
-        else:
-            offsets.append(ctx.index_const(0))
-        static_sizes.append(value_shape[value_dim])
-        value_dim += 1
-
-    if len(offsets) < target_rank:
-        offsets.extend(ctx.index_const(0) for _ in range(target_rank - len(offsets)))
-        static_sizes.extend([1] * (target_rank - len(static_sizes)))
-    elif len(offsets) > target_rank:
-        offsets = offsets[:target_rank]
-        static_sizes = static_sizes[:target_rank]
-
-    if (
-        target_rank > len(value_shape)
-        and len(value_shape) + (target_rank - len(value_shape)) == target_rank
-    ):
-        reduction = target_rank - len(value_shape)
-        static_sizes = [1] * reduction + value_shape
-
-    _validate_store_fits_destination(ctx, node, index_nodes, static_sizes)
-
-    ctx.forall_insert_slices.append(
-        (value, offsets, static_sizes, _target_tensor_id(node))
-    )
-
-
-def _validate_store_fits_destination(
-    ctx: BuildContext,
-    node: torch.fx.Node,
-    index_nodes: list | tuple,
-    static_sizes: list[int],
-) -> None:
-    """Reject a store whose slice would write past the destination tensor.
-
-    A slice can never exceed its tensor's extent, so an oversized dimension
-    always means the value's tile layout does not line up with the order the
-    destination is indexed. The usual cause is an implicit transpose such as
-    ``out[a, b] = src[b, a]``, which Helion traces without rejecting even
-    though the traced value shape does not match the destination slice.
-    """
-    from ..support import UnsupportedOperationError
-
-    dest_shape = ctx.shape_from_node_meta(node.args[0])
-    if dest_shape is None or len(dest_shape) != len(static_sizes):
-        return
-    for dim, (size, extent) in enumerate(zip(static_sizes, dest_shape, strict=True)):
-        if int(size) <= int(extent):
-            continue
+    shape = list(value.type.shape)
+    if shape not in (plan.value_shape(), plan.static_sizes()):
         raise UnsupportedOperationError(
             "store with transposed or mismatched tile layout",
             reason=(
-                f"storing a tile of size {int(size)} into dimension {dim} of a "
-                f"destination whose extent is only {int(extent)} (slice sizes "
-                f"{[int(s) for s in static_sizes]}, destination shape "
-                f"{[int(d) for d in dest_shape]}); the stored value's tile order "
-                "does not match the order the destination is indexed"
+                f"storing a tile of shape {shape} into a slice of shape "
+                f"{plan.value_shape()}; the stored value's tile order does not "
+                "match the order the destination is indexed"
             ),
             alternatives=[
                 "reorder explicitly, e.g. out[a, b] = src[b, a].permute(1, 0)",
                 "index the destination in the same order the value is loaded",
             ],
         )
-
-
-def _target_tensor_id(node: torch.fx.Node) -> int | None:
-    """``id()`` of the store's destination FakeTensor, when resolvable."""
-    import torch
-
-    target_node = node.args[0]
-    if not isinstance(target_node, torch.fx.Node):
-        return None
-    target_val = target_node.meta.get("val")
-    return id(target_val) if isinstance(target_val, torch.Tensor) else None
+    return emit.cast_tensor(value, element_type)

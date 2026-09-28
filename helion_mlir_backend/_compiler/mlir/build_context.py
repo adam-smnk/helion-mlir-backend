@@ -12,6 +12,7 @@ from mlir.dialects import arith as arith_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
+from .lowering.tensor_state import TensorState
 from .support import block_id_from_key
 from .support.index_meta import resolve_index_descriptor
 
@@ -26,8 +27,8 @@ if TYPE_CHECKING:
 
     from .analysis.contractions import ContractionPlan
     from .analysis.geometry import KernelGeometry
+    from .analysis.tensor_effects import TensorEffects
     from .aten_bridge import AtenHelperTable
-    from .lowering.for_store_context import ForStoreContext
 
 
 @dataclass
@@ -43,7 +44,7 @@ class BuildContext:
 
     geometry: KernelGeometry | None = None
 
-    # Written directly once per outer grid block id (build_kernel_body) then
+    # Written directly once per outer grid block id (control_flow._bind_grid_iv) then
     # save/restored per nested scf.for level via enter_for_loop(); read
     # everywhere a block id's current induction variable is needed. The value is
     # the tile's absolute offset (``begin + trip * step``).
@@ -54,9 +55,8 @@ class BuildContext:
     )
     # Normalized (unit-step) trip index of an outer forall dimension, when known.
     block_id_to_trip_iv: dict[int, ir.Value] = field(default_factory=dict)
-    forall_insert_slices: list[tuple] = field(default_factory=list)
-    # Mutate only via push_store_ctx(); read the top via for_store_ctx_stack[-1].
-    for_store_ctx_stack: list[ForStoreContext] = field(default_factory=list)
+    tensors: TensorState = field(default_factory=TensorState)
+    effects: TensorEffects | None = None
 
     mlir_module: ir.Module | None = None
     mlir_context: ir.Context | None = None
@@ -250,35 +250,19 @@ class BuildContext:
                 last_value = value
         return last_value
 
-    def lower_root_graphs(
-        self, shared_out: ir.Value, root_ids: list[int] | None = None
-    ) -> ir.Value:
-        """Lower device root graphs (all of them, or an explicit subset --
-        e.g. one ``hl.barrier()``-separated phase's own roots) for the
-        active forall body. ``root_ids`` are real graph ids, not positions."""
-        result = shared_out
-        ids = (
-            root_ids if root_ids is not None else self.host_function.device_ir.root_ids
-        )
-        for root_id in ids:
-            graph = self.host_function.device_ir.graphs[root_id].graph
-            result = self.lower_graph(graph) or result
-        return result
-
     def reset_for_new_function(self) -> None:
         """Clear per-function state before building another ``func.func``.
 
         Needed only when compiling more than one function against the same
         ``BuildContext`` (one per phase): a previous function's parameter
-        bindings, induction variables, and pending inserts are SSA values
+        bindings, induction variables, and tensor states are SSA values
         scoped to that function and must not leak into the next one.
         """
         self.param_to_value.clear()
         self.block_id_to_iv.clear()
         self.block_id_to_bounds.clear()
         self.block_id_to_trip_iv.clear()
-        self.forall_insert_slices.clear()
-        self.for_store_ctx_stack.clear()
+        self.tensors.clear()
 
     @contextmanager
     def enter_for_loop(
@@ -303,16 +287,3 @@ class BuildContext:
                 self.block_id_to_bounds.pop(block_id, None)
             else:
                 self.block_id_to_bounds[block_id] = previous_bounds
-
-    @contextmanager
-    def push_store_ctx(self, store_context: ForStoreContext) -> Generator[None]:
-        """Push and reliably remove a synthetic store context."""
-        self.for_store_ctx_stack.append(store_context)
-        try:
-            yield
-        finally:
-            if (
-                self.for_store_ctx_stack
-                and self.for_store_ctx_stack[-1] is store_context
-            ):
-                self.for_store_ctx_stack.pop()

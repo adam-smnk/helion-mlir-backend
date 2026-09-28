@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import helion
 import helion.language as hl
-import pytest
 import torch
 
 from tests.harness import execute_module as _execute
@@ -172,17 +171,11 @@ def test_multi_output_kernel_sharing_a_reduction_accumulator():
     torch.testing.assert_close(actual[1], expected * 2.0, atol=1e-3, rtol=1e-3)
 
 
-def test_multi_root_incompatible_geometry_raises_clear_diagnostic():
+def test_independent_root_loops_with_different_grids():
     """Two independent top-level loops (no hl.barrier) with different shapes.
 
-    Both loops share one implicit phase (no barrier splits them), but this
-    backend still requires all of one phase's top-level loops to share a
-    single `scf.forall` iteration space -- a differently-shaped independent
-    loop must raise a clear diagnostic instead of an IndexError.
+    Each root loop is its own ``scf.forall``, emitted in sequence.
     """
-    from helion_mlir_backend._compiler.mlir.support.errors import (
-        UnsupportedOperationError,
-    )
 
     @helion.kernel(static_shapes=True)
     def mismatched_outputs(x: torch.Tensor):
@@ -196,5 +189,8 @@ def test_multi_root_incompatible_geometry_raises_clear_diagnostic():
         return out1, out2
 
     x = torch.randn(16, 16)
-    with pytest.raises(UnsupportedOperationError, match="incompatible geometry"):
-        generate_mlir(mismatched_outputs, [x])
+    module = generate_mlir(mismatched_outputs, [x])
+    assert str(module).count("scf.forall ") == 2
+    out1, out2 = _execute(module, x, kernel_name="mismatched_outputs")
+    torch.testing.assert_close(out1, x)
+    torch.testing.assert_close(out2, x.sum(-1), atol=1e-4, rtol=1e-4)

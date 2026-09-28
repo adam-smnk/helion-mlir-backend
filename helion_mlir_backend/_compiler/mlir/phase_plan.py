@@ -132,17 +132,19 @@ def requires_multi_phase_driver(
     to store into), which would otherwise make every single-phase kernel
     look like it needs a phase driver.
     """
-    from .output_resolver import OutputTensorResolver
+    from .analysis.tensor_effects import TensorEffects
 
     declared_param_names = {name for name, _ in tensor_params}
     multi_phase = len(hf.device_ir.phases) > 1
-    out_params = OutputTensorResolver(hf).resolve_all(tensor_params)
-    out_tensor_ids = {id(t) for _, t in out_params}
-    candidate_names = find_extra_host_tensor_names(hf, declared_param_names)
+    written = set(
+        TensorEffects.from_host_function(hf).written_in(
+            [graph_info.graph for graph_info in hf.device_ir.graphs]
+        )
+    )
     extra_names = [
         name
-        for name in candidate_names
-        if id(find_host_tensor_fake_value(hf, name)) not in out_tensor_ids
+        for name in find_extra_host_tensor_names(hf, declared_param_names)
+        if name not in written
     ]
     return multi_phase or bool(extra_names), extra_names
 
@@ -195,19 +197,22 @@ def build_phase_plans(
     A phase's ``input_names`` is every host tensor name its graphs reference
     that is a declared parameter, a discovered extra host tensor, or an
     earlier phase's output name (bound by the driver after that phase runs).
-    A phase's ``outputs`` reuses :class:`OutputTensorResolver`'s precedence
-    rules, scoped to just this phase's own graphs (root + nested loop
-    bodies) instead of the whole kernel's.
+    A phase's ``outputs`` are the tensors its own graphs (root + nested loop
+    bodies) store into, excluding declared parameters.
     """
-    from .output_resolver import OutputTensorResolver
+    from .analysis.tensor_effects import TensorEffects
 
+    effects = TensorEffects.from_host_function(hf)
     known_names: set[str] = set(declared_param_names) | set(extra_host_tensor_names)
     produced_by_earlier_phase: set[str] = set()
-    resolver = OutputTensorResolver(hf)
     plans: list[PhasePlan] = []
     for phase_index, phase in enumerate(hf.device_ir.phases):
         phase_graphs = iter_phase_graphs(hf, phase.roots)
-        outputs = resolver.resolve_all_in_graphs(phase_graphs)
+        outputs = [
+            (name, effects.fakes[name])
+            for name in effects.written_in(phase_graphs)
+            if name not in declared_param_names
+        ]
         # A store's destination is itself referenced via `_host_tensor(name)`
         # (to get the tensor to store into), so it shows up in the raw scan
         # below even though the phase only *writes* it, never reads its

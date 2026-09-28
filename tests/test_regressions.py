@@ -267,10 +267,8 @@ _CASES: dict[
         pytest.param("row_softmax", marks=_known_gap("I17: helper shape guessing")),
         pytest.param("where_relu", marks=_known_gap("I17: helper batch failure")),
         "acc_plus_addmm",
-        pytest.param("store_then_load", marks=_known_gap("I11: no store SSA state")),
-        pytest.param(
-            "nested_and_outer_store", marks=_known_gap("I11: first-store geometry")
-        ),
+        "store_then_load",
+        "nested_and_outer_store",
         pytest.param("tile_if", marks=_known_gap("I19: _if unsupported")),
         pytest.param("partial_write", marks=_known_gap("I13: host init skipped")),
         pytest.param(
