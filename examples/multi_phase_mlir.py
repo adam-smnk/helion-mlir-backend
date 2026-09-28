@@ -6,19 +6,16 @@ multiple top-level `hl.tile()` loops separated by an explicit phase boundary,
 plus a host-computed tensor ("interop") that isn't one of the kernel's own
 parameters.
 
-Unlike the other examples in this directory, a multi-phase / host-tensor-
-interop kernel can only be compiled and executed through the direct
-`@helion.kernel(backend="mlir")` call path -- NOT through the explicit
-`generate_mlir()` + `execute_mlir()` two-call flow, which raises a clear
-`UnsupportedOperationError` for this pattern (see docs/MLIR_LIMITATIONS.md,
-"Multi-Phase Kernels and Host-Tensor Interop").
+The direct `@helion.kernel(backend="mlir")` call (like `compile_mlir`) runs the
+kernel's host code on every call, so the host-computed `scale` reaches the
+compiled kernel. The explicit `generate_mlir()` + `execute_mlir()` flow runs no
+host code and rejects this kernel (see docs/MLIR_LIMITATIONS.md, item 11).
 
 Why hl.barrier() is required (not optional, not CPU-specific):
 - Helion's frontend rejects a later top-level loop reading a tensor written
   by an earlier one unless hl.barrier() separates them (LoopDependencyError).
-- In this backend, each hl.barrier()-separated phase compiles to its own MLIR
-  function; a real host-side driver runs between phase calls, threading real
-  tensors between phases by their host variable name.
+- In this backend, each hl.barrier()-separated phase compiles to its own
+  private MLIR function; the module's entry function calls them in order.
 
 Note on syntax: Helion does not allow any statement (other than
 hl.barrier() itself) between two top-level device loops, so a host-computed
@@ -95,12 +92,12 @@ def main() -> None:
     print("Key observations:")
     print("=" * 80)
     print("- Two hl.tile() loops, separated by hl.barrier(), compile to two")
-    print("  independent MLIR functions (one per phase).")
+    print("  private MLIR functions called in order by the entry function.")
     print("- `scale` is a host-computed tensor (not a kernel parameter),")
-    print("  recomputed for real by the driver and threaded into phase 0.")
-    print("- `mid` (phase 0's output) is threaded into phase 1 by name.")
-    print("- generate_mlir()/execute_mlir() would reject this same kernel with")
-    print("  a clear UnsupportedOperationError (see docs/MLIR_LIMITATIONS.md).")
+    print("  recomputed by the host code on each call and passed to the entry.")
+    print("- `mid` (phase 0's output) is threaded into phase 1 as an SSA value.")
+    print("- execute_mlir() runs no host code, so it rejects this kernel")
+    print("  (see docs/MLIR_LIMITATIONS.md, item 11).")
 
 
 if __name__ == "__main__":

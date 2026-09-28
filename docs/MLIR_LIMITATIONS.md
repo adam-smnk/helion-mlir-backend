@@ -6,12 +6,10 @@ This document lists current limitations for the MLIR backend in this repository.
 
 - The backend is experimental.
 - CPU execution is supported and validated in tests.
-- The MLIR validation suite spans `tests/test_mlir_backend.py`,
-  `tests/test_mlir_execution.py`, `tests/test_mlir_integration.py`,
-  `tests/test_index_descriptor.py`, `tests/test_reduce_ops.py`, and
-  `tests/test_property_kernels.py` (property-based fuzz coverage).
-- The current suite contains 191 passing tests.
-- Both explicit generate-and-execute flow and direct backend="mlir" flow are exercised.
+- The MLIR validation suite lives under `tests/` (unit, execution, golden-IR,
+  AMX-gate and property-based tests; `uv run pytest tests/`).
+- Direct `backend="mlir"` calls, `compile_mlir`, and the explicit
+  `generate_mlir` + `execute_mlir` flow are exercised.
 - All example scripts under `examples/` are kept runnable and are re-verified
   after backend changes (`uv run python examples/<name>.py`).
 
@@ -153,48 +151,48 @@ Consequence:
 ## 10) Multi-Output Kernels
 
 Current behavior:
-- Every host tensor a phase stores into is an output of that phase's function,
-  in first-store order. Each is threaded as its own SSA value, so outputs need
-  not share shapes, and independent top-level loops with different grids in one
-  phase are separate `scf.forall`s emitted in sequence.
+- Every host tensor the kernel stores into is an inout argument of the entry
+  function and is written in place. Each is threaded as its own SSA value, so
+  outputs need not share shapes, and independent top-level loops with different
+  grids in one phase are separate `scf.forall`s emitted in sequence.
+- Direct calls and `compile_mlir` return the kernel's own `return` value (a
+  tuple for `return a, b`).
 
 Consequence:
-- `execute_mlir` returns a `list` of tensors (not a single tensor) whenever
-  there is more than one output.
-- Which tensors are returned is decided by what the kernel writes, not by its
-  `return` statement (backend review plan, Phase 4).
+- `execute_mlir` (no host code) returns every written tensor in entry argument
+  order: one tensor, or a `list` when there are several.
 
-## 11) Multi-Phase Kernels (`hl.barrier()`) and Host-Tensor Interop
+## 11) Host Code, Multi-Phase Kernels (`hl.barrier()`) and Host Tensors
 
 Current behavior:
-- Kernels using `hl.barrier()` between top-level `hl.tile()`/`hl.grid()` loops,
-  and kernels that read a host-computed tensor beyond their own declared
-  parameters (e.g. `scale = x.mean() * 100.0` then `hl.load(scale, [])`), are
-  supported -- but **only** through the direct `@helion.kernel(backend="mlir")`
-  call path, not through `generate_mlir()`/`execute_mlir()`.
+- One module per config: one private function per `hl.barrier()` phase plus a
+  memref-ABI entry (see `docs/MLIR_DESIGN.md`, Calling Convention). Direct calls
+  and `compile_mlir` run the kernel's host code on every call, before and after
+  the device loops, so host-computed tensors (`scale = x.mean()`), module
+  globals, runtime scalar parameters, host initialization (`torch.full_like`),
+  in-place updates, `out=` parameters and any `return` expression behave as in
+  Helion.
 
-Why:
-- Each `hl.barrier()`-separated phase compiles to its own MLIR module/JIT'd
-  function. A real host-side "driver" (built from the kernel's own AST, with
-  device loops and barriers neutralized) runs between phase calls, threading
-  real tensors by host variable name -- this driver only exists on the direct
-  call path.
-
-Consequence:
-- `generate_mlir()`/`execute_mlir()` raise a clear `UnsupportedOperationError`
-  ("multi-phase or host-tensor-interop kernel") for such kernels, naming the
-  direct call path as the alternative.
-- A phase's output tensor must resolve to a plain host variable name (a
-  computed/expression origin is not yet supported).
-- The kernel's own final `return` must be a plain name or a tuple/list of
-  names (not an arbitrary expression).
-- Each phase is compiled as its own fully separate MLIR module (simpler and
-  safer than one shared multi-entry-point module); this is a compile-time-only
-  cost, cached per kernel/config like any other compile.
-- No statement other than `hl.barrier()` itself may appear between two
-  top-level device loops (a Helion frontend rule, not backend-specific), so a
-  host tensor a later phase needs must be computed before the loop that
-  first uses it, not between phases.
+Limits:
+- `execute_mlir(module, *tensor_params)` runs no host code: host-created tensors
+  the kernel writes start zeroed, and kernels that read host-computed tensors or
+  take runtime scalar parameters are rejected with an `UnsupportedOperationError`
+  naming `compile_mlir`/direct calls.
+- Strided (non-contiguous) tensors are copied to contiguous buffers (and copied
+  back for written ones); the entry uses identity layouts.
+- An input that shares memory with a written tensor is snapshotted (cloned) at
+  the call; two written tensors that share memory are rejected.
+- Written tensors are identified by their host expression: two host names for
+  one storage (a host-side view of a written tensor) are separate arguments and
+  are rejected by the overlap check. Read-only views of a declared parameter are
+  fine (they lower to a reshape of it).
+- A host tensor whose shape depends on a block size
+  (`torch.zeros((m, n // block_n))` with `block_n = hl.register_block_size(n)`)
+  gets a dynamic MLIR type and fails to lower.
+- Runtime scalars take part in `add`/`sub`/`mul`/`div` with a tensor; other ops
+  with a scalar operand go through ATen helpers, which do not accept them yet.
+- No statement other than `hl.barrier()` may appear between two top-level device
+  loops (a Helion frontend rule, not backend-specific).
 
 Example:
 - `examples/multi_phase_mlir.py` -- a runnable two-phase kernel combining

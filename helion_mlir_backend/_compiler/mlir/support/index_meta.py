@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import helion.language._tracing_ops as tracing_ops
 
+from .block_ids import OFFSET_SYMBOL_KINDS
 from .block_ids import SCALAR_SYMBOL_KINDS
 from .block_ids import block_id_from_key
 
@@ -27,6 +28,13 @@ class IndexDescriptor:
     block_id: int | None
     bias: int
     is_scalar: bool
+    kind: str | None = None
+    """The symbol kind (``grid``, ``tile_id``, ...) of a scalar position."""
+
+    @property
+    def is_offset(self) -> bool:
+        """A scalar position equal to its loop's current offset."""
+        return self.kind in OFFSET_SYMBOL_KINDS
 
 
 _UNRESOLVED = IndexDescriptor(block_id=None, bias=0, is_scalar=False)
@@ -64,7 +72,10 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
     if symbol_info is not None:
         block_id, kind = symbol_info
         return IndexDescriptor(
-            block_id=block_id, bias=0, is_scalar=kind in SCALAR_SYMBOL_KINDS
+            block_id=block_id,
+            bias=0,
+            is_scalar=kind in SCALAR_SYMBOL_KINDS,
+            kind=kind,
         )
 
     target = index_node.target
@@ -87,6 +98,7 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
                         block_id=block_id,
                         bias=0,
                         is_scalar=kind in SCALAR_SYMBOL_KINDS,
+                        kind=kind,
                     )
 
     return _UNRESOLVED

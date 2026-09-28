@@ -33,8 +33,10 @@ _SCALAR_KINDS = {
 
 @lowers(tracing_ops._get_symnode)
 def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
-    """``_get_symnode(key)``: a block-size constant or a scalar grid/tile position."""
+    """``_get_symnode(key)``: a block-size constant, runtime scalar or tile position."""
     key = node.args[0]
+    if key in ctx.scalars:
+        return ctx.scalars[key]
     block_id = block_id_from_key(key)
     if block_id is not None:
         if block_id not in ctx.geometry.blocks:

@@ -24,8 +24,8 @@ def _first_amx_ops(module: ir.Module, entry: str) -> set[str]:
     features = TargetInfo.host().features + _AMX_FEATURES
     with TargetInfo.override(features=features), module.context, ir.Location.unknown():
         PassManager.parse("builtin.module(inline,canonicalize)").run(module.operation)
-        driver = BackendDriver(module, entry, result_to_args=True, benchmark=False)
-        driver.add_stage(pipeline_descriptor(optimized=True))
+        driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
+        driver.add_stage(pipeline_descriptor("opt"))
         for stage in driver.stages:
             module = stage.apply(module)
             if "x86" not in str(stage):

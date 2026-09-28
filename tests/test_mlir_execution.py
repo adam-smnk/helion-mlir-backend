@@ -8,6 +8,7 @@ Covers both execution paths:
 from __future__ import annotations
 
 import math
+import re
 
 import helion
 import helion.language as hl
@@ -414,7 +415,7 @@ class TestExecuteMlir:
 
         b_module = generate_mlir(pack_b_panels, [b.view(64, 2, 32).contiguous()])
         b_ir = str(b_module)
-        assert "scf.forall (%arg1, %arg2, %arg3)" in b_ir
+        assert re.search(r"scf\.forall \(%\w+, %\w+, %\w+\)", b_ir)
         assert (
             "affine_map<(d0) -> (d0 * 8)>" in b_ir
             and "affine_map<(d0) -> (d0 * 32)>" in b_ir
@@ -424,7 +425,7 @@ class TestExecuteMlir:
 
         a_module = generate_mlir(pack_a_panels, [a.view(64, 2, 32).contiguous()])
         a_ir = str(a_module)
-        assert "scf.forall (%arg1, %arg2, %arg3)" in a_ir
+        assert re.search(r"scf\.forall \(%\w+, %\w+, %\w+\)", a_ir)
         assert (
             "affine_map<(d0) -> (d0 * 8)>" in a_ir
             and "affine_map<(d0) -> (d0 * 32)>" in a_ir

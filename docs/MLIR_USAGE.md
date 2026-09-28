@@ -6,20 +6,17 @@ This guide describes the current usage of the MLIR backend in this repository.
 
 - The backend is experimental, but it is not IR-only.
 - End-to-end CPU execution is supported through the lighthouse execution path.
-- Two user-facing flows are validated in tests:
-  - Explicit flow: generate MLIR then execute via backend API (single-phase
-    kernels whose device loops reference only declared parameters).
-  - Direct flow: call a kernel decorated with backend="mlir" (also supports
-    `hl.barrier()` multi-phase kernels and host-tensor interop -- see
-    `docs/MLIR_LIMITATIONS.md` item 11).
+- Three user-facing flows are validated in tests:
+  - Direct flow: call a kernel decorated with `backend="mlir"`.
+  - `compile_mlir(kernel, args)`: the same call semantics as a standalone callable.
+  - Explicit flow: `generate_mlir` then `MLIRBackend.execute_mlir`, which runs no
+    host code (see `docs/MLIR_LIMITATIONS.md` item 11).
 
-Reference tests are in `tests/test_mlir_backend.py`, `tests/test_mlir_execution.py`,
-`tests/test_mlir_integration.py`, `tests/test_index_descriptor.py`,
-`tests/test_reduce_ops.py`, `tests/test_property_kernels.py`,
-`tests/test_host_prefix.py`, `tests/test_phase_plan.py`, and
-`tests/test_multi_phase_execution.py` (currently 191 tests across the MLIR test
-suite). Runnable usage examples also live under `examples/` at the repository
-root.
+The direct flow and `compile_mlir` run the kernel's host code on every call and
+return the kernel's own `return` value, like Helion's Triton wrapper. Reference
+tests live under `tests/` (for the call semantics, `tests/test_calling_convention.py`
+and `tests/test_multi_phase_execution.py`). Runnable usage examples live under
+`examples/` at the repository root.
 
 ## Recommended Environment
 
@@ -87,6 +84,19 @@ B = torch.randn(32, 32)
 C = add_direct(A, B)
 ```
 
+### 3) `compile_mlir`
+
+```python
+from helion_mlir_backend import compile_mlir
+
+add = compile_mlir(add_kernel, [A, B], pipeline="scalar")  # or "opt"
+C = add(A, B)
+```
+
+The generated module holds one private tensor function per phase and a public
+memref-ABI entry named after the kernel; `docs/MLIR_DESIGN.md` (Calling
+Convention) describes its arguments.
+
 ## Kernel Requirements
 
 ### Required
@@ -120,8 +130,8 @@ acc = acc + torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
 
 ### Multi-phase kernels (`hl.barrier()`) and host-tensor interop
 
-Only supported through the **direct call path** above (`backend="mlir"`),
-not through `generate_mlir()` + `execute_mlir()`:
+Supported by every flow; `execute_mlir` rejects kernels that read
+host-computed tensors (it runs no host code):
 
 ```python
 @helion.kernel(static_shapes=True, backend="mlir")
@@ -142,17 +152,16 @@ def two_phase(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 ```
 
-Each `hl.barrier()`-separated phase compiles to its own MLIR function; a
-real host-side driver runs between phase calls, threading real tensors
-between phases and any host-computed tensors by their Python variable name.
+Each `hl.barrier()`-separated phase compiles to its own private MLIR function;
+the entry function calls them in order, threading tensors between phases, and
+host-computed tensors are entry arguments evaluated from the host code.
 `hl.barrier()` is required (not optional, not CPU-specific) whenever a later
 phase reads a tensor written by an earlier one -- Helion's frontend rejects
 the kernel otherwise (`LoopDependencyError`), and no statement other than
 `hl.barrier()` itself may appear between two top-level device loops, so a
 host tensor a later phase needs must be computed before the loop that first
 uses it. See `examples/multi_phase_mlir.py` for a complete, runnable example,
-and `docs/MLIR_LIMITATIONS.md` ("Multi-Phase Kernels and Host-Tensor
-Interop") for full scope and current limitations.
+and `docs/MLIR_LIMITATIONS.md` item 11 for current limitations.
 
 ## Configurable Block Sizes
 
@@ -203,9 +212,11 @@ The implementation is organized by responsibility:
 
 ```text
 helion_mlir_backend/_compiler/mlir/
-├── backend.py, bound_kernel.py       # backend registration and runtime hook
+├── backend.py                        # backend registration, execute_mlir
+├── driver.py, host_code.py           # direct-call path: host code + entry call
 ├── build_context.py                  # typed mutable lowering state
-├── codegen.py                        # module orchestration and node dispatch
+├── codegen.py                        # phase functions and memref entry
+├── analysis/                         # geometry, tensor effects, signature, contractions
 ├── aten_lowering.py                  # ATen helper preprocessing
 ├── lowering/                         # operation-family MLIR emitters
 ├── aten_bridge/                      # custom ATen and torch-mlir bridge
@@ -214,8 +225,8 @@ helion_mlir_backend/_compiler/mlir/
 
 `MLIRBackend` inherits from Helion's backend-neutral `Backend`; it does not use
 the Triton Python AST code-generation path. MLIR is emitted directly as
-Linalg-on-Tensors IR and execution is handled separately by
-`HelionMLIRExecutor`.
+Linalg-on-Tensors IR and lowered/JIT-compiled by `_compiler/execution.py`
+(`compile_entry`).
 
 For shape-resolution details, see `docs/BACKEND_SHAPE_INFERENCE_AND_PROPAGATION.md`.
 

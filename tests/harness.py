@@ -64,15 +64,13 @@ def check_kernel(
     *,
     paths: tuple[str, ...] = ("direct",),
     config: helion.Config | None = None,
-    region: tuple[slice, ...] | None = None,
     atol: float = 1e-5,
     rtol: float = 1e-5,
 ) -> None:
     """Assert that ``kernel(*args)`` matches ``reference(*args)`` on every requested path.
 
     ``reference`` runs on clones so in-place kernels and references cannot see each
-    other's writes. ``region`` restricts the comparison to the part of the output the
-    kernel writes.
+    other's writes.
     """
     expected = reference(*_clone_args(args))
     for path in paths:
@@ -82,11 +80,6 @@ def check_kernel(
             actual = run_generated(kernel, _clone_args(args), config=config)
         else:
             raise ValueError(f"unknown execution path {path!r}")
-        if region is not None:
-            torch.testing.assert_close(
-                actual[region], expected[region], atol=atol, rtol=rtol, msg=path
-            )
-            continue
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=path)
 
 

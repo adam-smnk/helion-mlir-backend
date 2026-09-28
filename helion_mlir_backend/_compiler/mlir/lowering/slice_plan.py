@@ -113,7 +113,7 @@ def plan_slice(
 
         if descriptor.is_scalar:
             block_id = descriptor.block_id
-            if block_id is not None and block_id in ctx.block_id_to_iv:
+            if descriptor.is_offset and block_id in ctx.block_id_to_iv:
                 scalar_value = ctx.block_id_to_iv[block_id]
             else:
                 scalar_value = ctx.get_value(index_node)

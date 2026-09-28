@@ -18,7 +18,7 @@ def install() -> bool:
         from helion.runtime.kernel import BoundKernel
 
         from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
-        from helion_mlir_backend._compiler.mlir.bound_kernel import mlir_compile_config
+        from helion_mlir_backend._compiler.mlir.driver import mlir_compile_config
         from helion_mlir_backend._compiler.mlir.einsum_capture import (
             install_einsum_capture,
         )

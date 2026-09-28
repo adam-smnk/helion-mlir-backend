@@ -21,8 +21,6 @@ from ..analysis.geometry import loop_block_ids
 from ..analysis.tensor_effects import accessed_tensor
 from ..support import NodeLoweringError
 from ..support import UnsupportedOperationError
-from ..support import torch_dtype_to_mlir
-from . import emit
 from .registry import lowers
 from .tensor_state import OwnedDim
 from .tensor_state import owned_dims
@@ -46,25 +44,15 @@ def lower_phi(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
 
 
 def build_phase_body(
-    ctx: BuildContext, root_positions: list[int], outputs: list[str]
+    ctx: BuildContext, root_positions: list[int], outputs: tuple[str, ...]
 ) -> list[ir.Value]:
     """Lower the root graphs at ``root_positions`` in order; return ``outputs``' values.
 
-    Every host tensor the roots write starts as its function argument when it has
-    one, otherwise as an uninitialized tensor of its traced shape.
+    Every written host tensor (``outputs``) starts as its function argument.
     """
     device_ir = ctx.host_function.device_ir
-    for position in root_positions:
-        for name in ctx.effects.writes(device_ir.root_ids[position]):
-            if name not in ctx.tensors:
-                initial = ctx.param_to_value.get(name)
-                if initial is None:
-                    fake = ctx.effects.fakes[name]
-                    initial = emit.empty(
-                        [int(dim) for dim in fake.shape],
-                        torch_dtype_to_mlir(fake.dtype),
-                    )
-                ctx.tensors.bind(name, initial)
+    for name in outputs:
+        ctx.tensors.bind(name, ctx.param_to_value[name])
     for position in root_positions:
         _lower_root(
             ctx, device_ir.root_ids[position], list(device_ir.grid_block_ids[position])

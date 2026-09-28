@@ -426,7 +426,7 @@ class TestScalarBlockIndices:
         )
         module.operation.verify()
         assert "arith.divui" not in str(module)
-        assert "scf.forall (%arg1) in (3)" in str(module)
+        assert re.search(r"scf\.forall \(%\w+\) in \(3\)", str(module))
 
     def test_tile_count_is_constant(self):
         """`tile.count` folds to a compile-time cdiv constant."""

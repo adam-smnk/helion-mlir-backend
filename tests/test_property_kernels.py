@@ -184,7 +184,7 @@ def test_multi_phase_multi_output_with_host_interop_random_shapes(
     scale = x.mean() * 2.0
     mid = (x + y) * scale
 
-    assert isinstance(actual, list) and len(actual) == 2
+    assert isinstance(actual, tuple) and len(actual) == 2
     torch.testing.assert_close(actual[0], mid * 2.0)
     torch.testing.assert_close(actual[1], mid - x)
 

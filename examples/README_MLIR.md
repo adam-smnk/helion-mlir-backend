@@ -139,19 +139,18 @@ python examples/sum_mlir.py
 ### 8. multi_phase_mlir.py
 **Multi-Phase Execution (`hl.barrier()` + Host-Tensor Interop)**
 
-Demonstrates two capabilities only available through the direct
-`@helion.kernel(backend="mlir")` call path (not `generate_mlir()` +
-`execute_mlir()`):
+Demonstrates two capabilities of the direct `@helion.kernel(backend="mlir")`
+call path (and `compile_mlir`), which run the kernel's host code on each call
+(`execute_mlir()` runs none and rejects this kernel):
 - **Multi-phase kernels:** two top-level `hl.tile()` loops separated by
   `hl.barrier()`, where the second phase reads the first phase's output.
-  Each phase compiles to its own MLIR function; a real host-side driver
-  runs between phase calls, threading tensors between phases by name.
+  Each phase compiles to its own private MLIR function; the module's entry
+  function calls them in order, threading tensors as SSA values.
 - **Host-tensor interop:** a host-computed tensor (`scale = x.mean() * 2.0`)
   that isn't one of the kernel's own declared parameters, consumed inside a
   device loop via `hl.load(scale, [])`.
 
-See `docs/MLIR_LIMITATIONS.md` ("Multi-Phase Kernels and Host-Tensor
-Interop") for the full scope and current limitations of this feature.
+See `docs/MLIR_LIMITATIONS.md` (item 11) for current limitations.
 
 **Run:**
 ```bash

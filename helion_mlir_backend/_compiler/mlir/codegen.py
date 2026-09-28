@@ -11,13 +11,14 @@ Helion construct          → MLIR construct
 Outer ``hl.tile([m,n])``  → normalized ``scf.forall`` + ``shared_outs``
 Inner ``hl.tile(k)``      → ``scf.for``   (sequential, carries accumulator)
 ``hl.zeros([bm,bn])``     → ``tensor.empty`` + ``linalg.fill``
-``hl.load(t, idx)``       → ``tensor.extract_slice``
-``hl.store(t, idx, v)``   → ``tensor.parallel_insert_slice`` (in forall term.)
+``hl.load(t, idx)``       → ``tensor.extract_slice`` of ``t``'s current value
+``hl.store(t, idx, v)``   → ``tensor.insert_slice`` into ``t``'s current value
 matmul family, ``hl.dot``,
 einsum, ``acc + mm``      → one ``linalg.matmul``/``batch_matmul``/``contract``
 Pointwise aten ops        → ``linalg.generic`` or ``arith.*``
-``_host_tensor(name)``    → reference to the corresponding function argument
+``_host_tensor(name)``    → the phase function's argument for that host tensor
 ``_get_symnode(bs_N)``    → the concrete block-size integer constant
+``_get_symnode(scalar)``  → the runtime scalar argument
 ``_phi``                  → the result of the enclosing ``scf.for``
 ``_new_var``              → pass-through (same MLIR value)
 
@@ -39,28 +40,32 @@ the ordinary ATen portions of each tile body.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import field
 import functools
+from itertools import starmap
 import logging
 from typing import TYPE_CHECKING
 
+from mlir.dialects import bufferization as bufferization_d
 from mlir.dialects import func as func_d
+from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
-import torch
-import torch.fx
 
+from .analysis.signature import KernelSignature
 from .aten_bridge import AtenHelperTable
 from .build_context import BuildContext
 from .lowering import build_phase_body
 from .lowering import lower_node
 from .support import MLIRBackendError
-from .support import UnsupportedOperationError
+from .support import torch_dtype_to_mlir
 from .support import torch_tensor_to_mlir_type
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
+
+    from .analysis.signature import PhaseSignature
+    from .analysis.signature import ScalarArg
+    from .analysis.signature import TensorRef
 
 log = logging.getLogger(__name__)
 
@@ -97,24 +102,12 @@ def _get_shared_mlir_context() -> ir.Context:
     return _shared_mlir_context
 
 
-@dataclass
-class PhaseModuleResult:
-    """One compiled phase, ready for the direct-call driver to JIT and run.
-
-    ``input_names``/``output_names`` are host variable names, in the exact
-    order the phase's ``func.func`` expects its arguments/produces its
-    results -- the driver looks up real tensors by these names and binds
-    results back under ``output_names`` for later phases to consume.
-    """
-
-    name: str
-    module: ir.Module
-    input_names: list[str] = field(default_factory=list)
-    output_names: list[str] = field(default_factory=list)
-
-
 class MLIRModuleBuilder:
     """Builds an ``mlir.ir.Module`` from a compiled :class:`HostFunction`.
+
+    The module holds one private tensor function per ``hl.barrier()`` phase and
+    a public memref-ABI entry function named after the kernel that calls them in
+    order (see ``docs/MLIR_DESIGN.md``, calling convention).
 
     Parameters
     ----------
@@ -152,7 +145,13 @@ class MLIRModuleBuilder:
                 with ir.InsertionPoint(module.body), self.hf:
                     self._resolve_geometry()
                     self._prebuild_aten_helpers(module)
-                    self._build_function()
+                    phases = list(
+                        starmap(
+                            self._build_phase_function,
+                            enumerate(self.context.signature.phases),
+                        )
+                    )
+                    self._build_entry_function(phases)
             return module
         except MLIRBackendError:
             raise
@@ -160,186 +159,92 @@ class MLIRModuleBuilder:
             exc.add_note(f"While generating MLIR for Helion kernel '{self.hf.name}'")
             raise
 
-    def build_phase_modules(self) -> list[PhaseModuleResult]:
-        """Build one MLIR module per ``hl.barrier()``-separated phase.
-
-        Used only by the direct ``backend="mlir"`` driver path
-        (``bound_kernel.py::mlir_compile_config``) -- never by the public
-        ``generate_mlir()``/``execute_mlir()`` two-call flow, which keeps
-        using :meth:`build`'s single-module, single-phase-only contract.
-        """
-
-        from .phase_plan import build_phase_plans
-        from .phase_plan import find_extra_host_tensor_names
-        from .phase_plan import find_host_tensor_fake_value
-        from .phase_plan import iter_phase_graphs
-        from .phase_plan import resolve_host_variable_name
-
-        tensor_params = [
-            (name, value)
-            for name, value in self.hf.params.arguments.items()
-            if isinstance(value, torch.Tensor)
+    def _build_phase_function(self, index: int, phase: PhaseSignature) -> func_d.FuncOp:
+        """``(ins..., inouts..., scalars...) -> inouts...`` over tensors."""
+        ctx = self.context
+        refs = [*phase.ins, *phase.inouts]
+        arg_types = [self._tensor_type(name) for name in refs]
+        arg_types += [
+            _scalar_tensor_type(ctx.signature.scalars[k]) for k in phase.scalars
         ]
-        declared_param_names = {name for name, _ in tensor_params}
-        extra_names = find_extra_host_tensor_names(self.hf, declared_param_names)
-        plans = build_phase_plans(self.hf, declared_param_names, extra_names)
-
-        name_to_fake: dict[str, torch.Tensor] = dict(tensor_params)
-        for name in extra_names:
-            fake = find_host_tensor_fake_value(self.hf, name)
-            if fake is not None:
-                name_to_fake[name] = fake
-
-        results: list[PhaseModuleResult] = []
-        try:
-            mlir_ctx = _get_shared_mlir_context()
-
-            with ir.Location.unknown(mlir_ctx), self.hf:
-                self._resolve_geometry()
-
-                for plan in plans:
-                    module = ir.Module.create()
-                    self.context.mlir_module = module
-                    self.context.mlir_context = mlir_ctx
-                    self.context.aten_helpers = AtenHelperTable(module)
-                    phase_name = f"{self.hf.name}__phase{plan.phase_index}"
-                    phase_graphs = iter_phase_graphs(self.hf, plan.root_ids)
-
-                    with ir.InsertionPoint(module.body):
-                        self._prebuild_aten_helpers(module, graphs=phase_graphs)
-
-                        input_types = [
-                            torch_tensor_to_mlir_type(name_to_fake[name])
-                            for name in plan.input_names
-                        ]
-                        output_types = [
-                            torch_tensor_to_mlir_type(tensor)
-                            for _, tensor in plan.outputs
-                        ]
-                        fn = func_d.FuncOp(
-                            phase_name, ir.FunctionType.get(input_types, output_types)
-                        )
-                        fn.attributes["sym_visibility"] = ir.StringAttr.get("public")
-                        entry = fn.add_entry_block()
-                        with ir.InsertionPoint(entry):
-                            self.context.reset_for_new_function()
-                            for name, arg in zip(
-                                plan.input_names, entry.arguments, strict=True
-                            ):
-                                self.context.param_to_value[name] = arg
-
-                            result_vals = build_phase_body(
-                                self.context,
-                                plan.root_ids,
-                                [name for name, _ in plan.outputs],
-                            )
-                            func_d.ReturnOp(result_vals)
-
-                    output_names: list[str] = []
-                    for _, tensor in plan.outputs:
-                        resolved = resolve_host_variable_name(self.hf, tensor)
-                        if resolved is None:
-                            raise UnsupportedOperationError(
-                                "unresolvable phase output name",
-                                reason=(
-                                    "a phase's output tensor must be bound to a "
-                                    "plain host-level variable name to be threaded "
-                                    "to a later phase or the kernel's return "
-                                    "statement"
-                                ),
-                            )
-                        name_to_fake[resolved] = tensor
-                        output_names.append(resolved)
-
-                    results.append(
-                        PhaseModuleResult(
-                            name=phase_name,
-                            module=module,
-                            input_names=list(plan.input_names),
-                            output_names=output_names,
-                        )
-                    )
-            return results
-        except MLIRBackendError:
-            raise
-        except Exception as exc:
-            exc.add_note(f"While generating MLIR for Helion kernel '{self.hf.name}'")
-            raise
-
-    def _build_function(self) -> None:
-        from .phase_plan import requires_multi_phase_driver
-        from .support import UnsupportedOperationError
-
-        tensor_params = [
-            (name, value)
-            for name, value in self.hf.params.arguments.items()
-            if isinstance(value, torch.Tensor)
-        ]
-        needs_driver, extra_names = requires_multi_phase_driver(self.hf, tensor_params)
-        multi_phase = len(self.hf.device_ir.phases) > 1
-
-        if not needs_driver:
-            self._build_single_phase_function(tensor_params)
-            return
-
-        # Multi-phase (hl.barrier()) and/or host-tensor-interop kernels are
-        # only supported through the direct backend="mlir" call path (see
-        # bound_kernel.py::mlir_compile_config -> build_phase_modules()),
-        # which drives a real host-side wrapper between phases. This
-        # single-module entry point (generate_mlir()/execute_mlir()) has no
-        # such driver, so it can't supply extra host tensors or thread real
-        # values between phases.
-        if multi_phase:
-            reason = "this kernel uses hl.barrier() (multiple phases)"
-        else:
-            reason = (
-                f"this kernel depends on host tensor(s) {extra_names!r} not "
-                "in its declared parameters"
-            )
-        raise UnsupportedOperationError(
-            "multi-phase or host-tensor-interop kernel",
-            reason=(
-                f"{reason}; generate_mlir()/execute_mlir() only support "
-                "single-phase kernels whose device loops reference only "
-                "declared parameters"
-            ),
-            alternatives=[
-                "call the kernel directly via @helion.kernel(backend='mlir')"
-            ],
+        result_types = [self._tensor_type(name) for name in phase.inouts]
+        fn = func_d.FuncOp(
+            f"{self.hf.name}__phase{index}",
+            ir.FunctionType.get(arg_types, result_types),
         )
-
-    def _build_single_phase_function(
-        self, tensor_params: list[tuple[str, torch.Tensor]]
-    ) -> None:
-        """Inputs: tensor params not written, or also read. Outputs: every written tensor."""
-        effects = self.context.effects
-        graphs = [graph_info.graph for graph_info in self.hf.device_ir.graphs]
-        outputs = effects.written_in(graphs)
-        read = effects.read_in(graphs)
-        output_types = [torch_tensor_to_mlir_type(effects.fakes[n]) for n in outputs]
-        input_params = [
-            (name, value)
-            for name, value in tensor_params
-            if name not in outputs or name in read
-        ]
-        input_types = [torch_tensor_to_mlir_type(value) for _, value in input_params]
-
-        fn = func_d.FuncOp(self.hf.name, ir.FunctionType.get(input_types, output_types))
-        fn.attributes["sym_visibility"] = ir.StringAttr.get("public")
+        fn.attributes["sym_visibility"] = ir.StringAttr.get("private")
         entry = fn.add_entry_block()
         with ir.InsertionPoint(entry):
-            for (name, _), arg in zip(input_params, entry.arguments, strict=True):
-                self.context.param_to_value[name] = arg
-            roots = range(len(self.hf.device_ir.root_ids))
-            func_d.ReturnOp(build_phase_body(self.context, list(roots), outputs))
+            ctx.reset_for_new_function()
+            args = list(entry.arguments)
+            ctx.param_to_value.update(zip(refs, args[: len(refs)], strict=True))
+            for key, arg in zip(phase.scalars, args[len(refs) :], strict=True):
+                ctx.scalars[key] = tensor_d.ExtractOp(arg, []).result
+            results = build_phase_body(ctx, list(phase.root_positions), phase.inouts)
+            func_d.ReturnOp(results)
+        return fn
+
+    def _build_entry_function(self, phases: list[func_d.FuncOp]) -> None:
+        """Public ``@<kernel>(inouts..., ins..., scalars...)`` over memrefs.
+
+        Inputs are ``restrict`` tensors, inouts ``restrict writable`` ones; each
+        final inout value is committed with ``materialize_in_destination``.
+        """
+        signature = self.context.signature
+        refs = [*signature.inouts, *signature.ins]
+        scalars = list(signature.scalars.values())
+        tensor_types = [self._tensor_type(ref.name) for ref in refs]
+        tensor_types += [_scalar_tensor_type(scalar) for scalar in scalars]
+        memref_types = [
+            ir.MemRefType.get(list(t.shape), t.element_type) for t in tensor_types
+        ]
+        fn = func_d.FuncOp(self.hf.name, ir.FunctionType.get(memref_types, []))
+        fn.attributes["sym_visibility"] = ir.StringAttr.get("public")
+        fn.attributes["arg_attrs"] = ir.ArrayAttr.get(
+            [_arg_attr(ref.name, _role(ref), ref.tensor_param) for ref in refs]
+            + [_arg_attr(scalar.host_expr, "scalar", None) for scalar in scalars]
+        )
+        entry = fn.add_entry_block()
+        with ir.InsertionPoint(entry):
+            args = list(entry.arguments)
+            values: dict[str, ir.Value] = {}
+            for ref, tensor_type, arg in zip(refs, tensor_types, args, strict=False):
+                values[ref.name] = bufferization_d.ToTensorOp(
+                    tensor_type, arg, restrict=True, writable=ref.written or None
+                ).result
+            for scalar, tensor_type, arg in zip(
+                scalars, tensor_types[len(refs) :], args[len(refs) :], strict=True
+            ):
+                values[scalar.key] = bufferization_d.ToTensorOp(
+                    tensor_type, arg, restrict=True
+                ).result
+            for phase, fn_op in zip(signature.phases, phases, strict=True):
+                operands = [*phase.ins, *phase.inouts, *phase.scalars]
+                call = func_d.CallOp(fn_op, [values[name] for name in operands])
+                values.update(zip(phase.inouts, call.results, strict=True))
+            for ref, arg in zip(refs, args, strict=False):
+                if ref.written:
+                    bufferization_d.MaterializeInDestinationOp(
+                        None, values[ref.name], arg, restrict=True, writable=True
+                    )
+            func_d.ReturnOp([])
+
+    def _tensor_type(self, name: str) -> ir.RankedTensorType:
+        return torch_tensor_to_mlir_type(self.context.signature.refs[name].fake)
 
     def _resolve_geometry(self) -> None:
-        """Record loop geometry, tensor effects and contractions (needs ``with self.hf:``)."""
+        """Record loop geometry, tensor effects, signature and contractions.
+
+        Needs ``with self.hf:``.
+        """
         from .analysis.contractions import ContractionPlan
         from .analysis.geometry import KernelGeometry
         from .analysis.tensor_effects import TensorEffects
 
         self.context.effects = TensorEffects.from_host_function(self.hf)
+        self.context.signature = KernelSignature.from_host_function(
+            self.hf, self.context.effects
+        )
         self.context.geometry = KernelGeometry.from_host_function(
             self.hf, self.config, self.env
         )
@@ -347,14 +252,11 @@ class MLIRModuleBuilder:
             [graph_info.graph for graph_info in self.hf.device_ir.graphs]
         )
 
-    def _prebuild_aten_helpers(
-        self, module: ir.Module, graphs: list[torch.fx.Graph] | None = None
-    ) -> None:
+    def _prebuild_aten_helpers(self, module: ir.Module) -> None:
         """Lower every ATen node without a direct lowering via one torch-mlir pass.
 
         Helper ``func.func`` operations are inserted at the module's top level and
-        recorded in ``self.context.aten_helpers``. Scoped to *graphs* when given
-        (one phase's own graphs), otherwise the whole kernel's.
+        recorded in ``self.context.aten_helpers``.
         """
         from .aten_lowering import is_aten_op
         from .aten_lowering import preprocess_aten_nodes
@@ -367,20 +269,15 @@ class MLIRModuleBuilder:
         restore_symbolic_shapes_in_bodies(self.hf, self.context)
         refresh_aten_tensor_meta(self.hf)
 
-        search_graphs = (
-            graphs
-            if graphs is not None
-            else [gi.graph for gi in self.hf.device_ir.graphs]
-        )
         plan = self.context.contractions
         aten_nodes = [
             node
-            for graph in search_graphs
-            for node in graph.nodes
+            for graph_info in self.hf.device_ir.graphs
+            for node in graph_info.graph.nodes
             if is_aten_op(node)
             and not is_einsum_node(node)
             and plan.needs_helper(node)
-            and not self.context.has_symint_operand(node)
+            and not self.context.has_symbolic_operand(node)
         ]
         if not aten_nodes:
             return
@@ -393,3 +290,24 @@ class MLIRModuleBuilder:
             self.context.geometry.spans(),
         )
         self.context.aten_helpers.replace(entries)
+
+
+def _scalar_tensor_type(scalar: ScalarArg) -> ir.RankedTensorType:
+    return ir.RankedTensorType.get([], torch_dtype_to_mlir(scalar.dtype))
+
+
+def _role(ref: TensorRef) -> str:
+    return "inout" if ref.written else "in"
+
+
+def _arg_attr(name: str, role: str, tensor_param: int | None) -> ir.DictAttr:
+    """Entry argument metadata: host expression, role, tensor-parameter position."""
+    attrs = {
+        "helion.name": ir.StringAttr.get(name),
+        "helion.role": ir.StringAttr.get(role),
+    }
+    if tensor_param is not None:
+        attrs["helion.param"] = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(64), tensor_param
+        )
+    return ir.DictAttr.get(attrs)

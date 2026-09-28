@@ -15,6 +15,8 @@ def block_id_from_key(value: object) -> int | None:
 SCALAR_SYMBOL_KINDS = frozenset(
     {"grid", "tile_begin", "tile_end", "tile_id", "tile_count"}
 )
+#: Scalar positions whose value is their loop's current offset.
+OFFSET_SYMBOL_KINDS = frozenset({"grid", "tile_begin"})
 
 
 def _symbol_expr(value: object) -> object | None:

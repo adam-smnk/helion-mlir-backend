@@ -72,6 +72,10 @@ required-imports = ["from __future__ import annotations"]
 force-single-line = true
 force-sort-within-sections = true
 
+[tool.codespell]
+# "inout": a tensor argument the kernel reads and writes (entry-function role).
+ignore-words-list = "inout,inouts"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

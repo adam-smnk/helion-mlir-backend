@@ -89,4 +89,6 @@ def _owner(
     descriptor = resolve_index_descriptor(ctx, index)
     if descriptor.block_id not in grid_block_ids or descriptor.bias:
         return None
+    if descriptor.is_scalar and not descriptor.is_offset:
+        return None
     return OwnedDim(descriptor.block_id, descriptor.is_scalar)

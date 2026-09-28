@@ -7,9 +7,10 @@ Registers as a Helion compiler backend named "mlir".  The backend:
 - Replaces the final code-generation step with an MLIR module builder that
   produces Linalg-on-Tensors IR instead of Triton Python source code.
 
-The generated MLIR is intentionally high-level (no bufferization, no lowering
-to LLVM) so that a downstream MLIR compiler can apply its own tiling,
-vectorization, and memory-placement passes.
+The generated MLIR is intentionally high-level: Linalg-on-Tensors phase
+functions plus a thin memref entry function that fixes the calling convention
+(no tiling or lowering to LLVM), so a downstream MLIR compiler can apply its
+own tiling, vectorization, and memory-placement passes.
 """
 
 from __future__ import annotations
@@ -130,35 +131,24 @@ class MLIRBackend(Backend):
         mlir_module: object,
         *input_tensors: object,
         kernel_name: str = "kernel",
+        pipeline: str | None = None,
     ) -> object:
-        """Execute a Helion-generated MLIR kernel via lighthouse.
+        """Execute a module from :meth:`generate_mlir` via lighthouse (consumes it).
 
-        Preprocesses the module to move results to arguments (following
-        lighthouse calling convention), then inlines, lowers, JIT-compiles,
-        and executes the kernel.
+        ``input_tensors`` are the kernel's tensor parameters in declaration order.
+        No host code runs: tensors the kernel creates on the host and writes are
+        zero-initialized, and kernels that read host-computed tensors or take
+        runtime scalars are rejected. Use ``compile_mlir`` or a direct kernel call
+        for full Helion semantics.
 
-        Parameters
-        ----------
-        mlir_module : ir.Module
-            Generated MLIR module from :meth:`generate_mlir`.
-        *input_tensors : torch.Tensor
-            Input tensors matching the kernel signature.
-        kernel_name : str
-            Name of the public kernel function (default: "kernel").
-
-        Returns
-        -------
-        torch.Tensor or list[torch.Tensor]
-            Computed result(s).
-
-        Raises
-        ------
-        RuntimeError
-            If preprocessing, inlining, lowering, compilation, or execution fails.
-        NotImplementedError
-            If device is not CPU.
+        Returns every tensor the kernel writes, in entry argument order: one
+        tensor, or a list when there are several.
         """
         import torch
+
+        from ..execution import compile_entry
+        from .driver import call_entry
+        from .support import UnsupportedOperationError
 
         if not input_tensors or not all(
             isinstance(tensor, torch.Tensor) for tensor in input_tensors
@@ -173,8 +163,21 @@ class MLIRBackend(Backend):
                 f"Only CPU device supported for execution; got {device.type}"
             )
 
-        # Execute via lighthouse; result_to_args is handled inside the executor.
-        from helion_mlir_backend._compiler.execution import HelionMLIRExecutor
-
-        executor = HelionMLIRExecutor(kernel_name=kernel_name, device=device)
-        return executor.prepare_and_execute(mlir_module, *input_tensors)
+        entry = compile_entry(mlir_module, kernel_name, pipeline=pipeline)
+        values: list[object] = []
+        for arg in entry.args:
+            if arg.tensor_param is not None:
+                values.append(input_tensors[arg.tensor_param])
+            elif arg.role == "inout":
+                values.append(torch.zeros(arg.shape, dtype=arg.dtype))
+            else:
+                raise UnsupportedOperationError(
+                    f"execute_mlir cannot supply host value '{arg.name}'",
+                    reason="execute_mlir runs no host code",
+                    alternatives=[
+                        "helion_mlir_backend.compile_mlir(kernel, args)",
+                        "call the kernel with @helion.kernel(backend='mlir')",
+                    ],
+                )
+        outputs = call_entry(entry, values)
+        return outputs[0] if len(outputs) == 1 else outputs

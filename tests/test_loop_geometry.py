@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import helion
 import helion.language as hl
 import pytest
@@ -94,102 +96,98 @@ def tile_id_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _add_one(x: torch.Tensor) -> torch.Tensor:
-    return x + 1.0
+def _add_one_in(*region: slice):
+    """Reference for a ``zeros_like`` output with ``x + 1`` written to ``region``."""
+
+    def reference(x: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(x)
+        out[region] = x[region] + 1.0
+        return out
+
+    return reference
 
 
 def _per_tile(value):
     """Reference for ``hl.tile(8, n)`` adding ``value(begin, end)`` to each tile."""
 
     def reference(x: torch.Tensor) -> torch.Tensor:
-        out = x.clone()
+        out = torch.zeros_like(x)
         for begin in range(8, x.size(0), 8):
             end = min(begin + 8, x.size(0))
-            out[begin:end] += value(begin, end)
+            out[begin:end] = x[begin:end] + value(begin, end)
         return out
 
     return reference
 
 
-# Outputs start as zeros_like, which the backend does not yet preserve (I13), so only
-# the region each kernel writes is compared.
 @pytest.mark.parametrize(
-    ("kernel", "reference", "shape", "region"),
+    ("kernel", "reference", "shape"),
     [
-        pytest.param(root_offset_1d, _add_one, (20,), (slice(4, None),), id="root_1d"),
+        pytest.param(root_offset_1d, _add_one_in(slice(4, None)), (20,), id="root_1d"),
         pytest.param(
             root_offset_2d,
-            _add_one,
+            _add_one_in(slice(4, None), slice(8, None)),
             (12, 24),
-            (slice(4, None), slice(8, None)),
             id="root_2d",
         ),
         pytest.param(
             nested_offset,
-            _add_one,
+            _add_one_in(slice(None), slice(2, None)),
             (16, 10),
-            (slice(None), slice(2, None)),
             id="nested_begin",
         ),
         pytest.param(
             nested_offset_end,
-            _add_one,
+            _add_one_in(slice(None), slice(4, 12)),
             (16, 16),
-            (slice(None), slice(4, 12)),
             id="nested_begin_end",
         ),
         pytest.param(
             nested_grid_step,
-            _add_one,
+            _add_one_in(slice(None), slice(None, None, 2)),
             (8, 6),
-            (slice(None), slice(None, None, 2)),
             id="nested_grid_step",
         ),
         pytest.param(
             root_grid_step,
-            _add_one,
+            _add_one_in(slice(1, None, 3)),
             (10, 4),
-            (slice(1, None, 3),),
             id="root_grid_step",
         ),
         pytest.param(
             tile_begin_kernel,
             _per_tile(lambda begin, end: begin),
             (32,),
-            (slice(8, None),),
             id="tile_begin",
         ),
         pytest.param(
             tile_end_kernel,
             _per_tile(lambda begin, end: end),
             (32,),
-            (slice(8, None),),
             id="tile_end",
         ),
         pytest.param(
             tile_id_kernel,
             _per_tile(lambda begin, end: begin // 8),
             (32,),
-            (slice(8, None),),
             id="tile_id",
         ),
     ],
 )
-def test_loop_geometry(kernel, reference, shape, region) -> None:
+def test_loop_geometry(kernel, reference, shape) -> None:
     torch.manual_seed(0)
     check_kernel(
         kernel,
         reference,
         [torch.randn(*shape)],
         paths=("direct", "generated"),
-        region=region,
     )
 
 
 def test_outer_forall_is_normalized() -> None:
     module = generate_mlir(root_offset_2d, [torch.randn(12, 24)])
     text = str(module)
-    assert "scf.forall (%arg1, %arg2) in (2, 2)" in text
+    assert re.search(r"scf\.forall \(%\w+, %\w+\) in \(2, 2\)", text)
     assert "affine_map<(d0) -> (d0 * 4 + 4)>" in text
     assert "affine_map<(d0) -> (d0 * 8 + 8)>" in text
 
@@ -223,9 +221,9 @@ def test_sfc_remap_applies_to_normalized_forall() -> None:
     remapped = False
     with module.context, ir.Location.unknown():
         driver = BackendDriver(
-            module, "f32_matmul_32", result_to_args=True, benchmark=False
+            module, "f32_matmul_32", result_to_args=False, benchmark=False
         )
-        driver.add_stage(pipeline_descriptor(optimized=True))
+        driver.add_stage(pipeline_descriptor("opt"))
         for stage in driver.stages:
             before = str(module)
             module = stage.apply(module)

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
     from .analysis.contractions import ContractionPlan
     from .analysis.geometry import KernelGeometry
+    from .analysis.signature import KernelSignature
     from .analysis.tensor_effects import TensorEffects
     from .aten_bridge import AtenHelperTable
 
@@ -57,6 +58,9 @@ class BuildContext:
     block_id_to_trip_iv: dict[int, ir.Value] = field(default_factory=dict)
     tensors: TensorState = field(default_factory=TensorState)
     effects: TensorEffects | None = None
+    signature: KernelSignature | None = None
+    # Runtime scalar values of the current function, by ``_get_symnode`` key.
+    scalars: dict[str, ir.Value] = field(default_factory=dict)
 
     mlir_module: ir.Module | None = None
     mlir_context: ir.Context | None = None
@@ -216,11 +220,11 @@ class BuildContext:
         info = self.node_symbol_info(node)
         return info is not None and info[1] in SCALAR_SYMBOL_KINDS
 
-    def has_symint_operand(self, node: object) -> bool:
-        """Return whether any operand is a symbolic scalar.
+    def has_symbolic_operand(self, node: object) -> bool:
+        """Return whether any operand is a symbolic int or float scalar.
 
-        torch-mlir cannot import SymInt operands, so these nodes are lowered
-        directly instead of through a generated helper.
+        torch-mlir cannot import symbolic scalar operands, so these nodes are
+        lowered directly instead of through a generated helper.
         """
         import torch
         import torch.fx
@@ -230,7 +234,7 @@ class BuildContext:
         arguments = list(node.args) + list(node.kwargs.values())
         return any(
             isinstance(argument, torch.fx.Node)
-            and isinstance(argument.meta.get("val"), torch.SymInt)
+            and isinstance(argument.meta.get("val"), (torch.SymInt, torch.SymFloat))
             for argument in arguments
         )
 
@@ -263,6 +267,7 @@ class BuildContext:
         self.block_id_to_bounds.clear()
         self.block_id_to_trip_iv.clear()
         self.tensors.clear()
+        self.scalars.clear()
 
     @contextmanager
     def enter_for_loop(

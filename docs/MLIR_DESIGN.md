@@ -42,7 +42,8 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
 - Implements `generate_mlir()` method
 - Inherits from Helion's backend-neutral `Backend` class, not `TritonBackend`
 - Rejects Python-source-codegen-only properties because MLIR is emitted directly
-- Uses the MLIR-specific `bound_kernel.py` hook for direct `backend="mlir"` calls
+- `driver.py` replaces `BoundKernel.compile_config` for direct `backend="mlir"` calls
+  (see [Calling Convention](#calling-convention))
 
 #### 3. **Core Lowering: MLIRModuleBuilder**
 - Location: [codegen.py](../helion_mlir_backend/_compiler/mlir/codegen.py)
@@ -65,8 +66,9 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
     Nested `scf.for` loops carry the tensors their bodies write.
 
 - **Key Methods:**
-  - `build()`: Entry point, creates MLIR module
-  - `_build_function()`: Generates func.func with tensor signature
+  - `build()`: Entry point, creates the MLIR module
+  - `_build_phase_function()`: one private tensor `func.func` per `hl.barrier()` phase
+  - `_build_entry_function()`: the public memref-ABI entry that calls the phases
   - `_prebuild_aten_helpers()`: Batch-lowers ATen nodes without a direct lowering
   - Per-node lowering is `lowering/registry.py::lower_node`
 
@@ -126,6 +128,58 @@ Shared utilities live under [support/](../helion_mlir_backend/_compiler/mlir/sup
 - bool (uint8 is rejected: integers are lowered with signed semantics)
 
 ## MLIR Dialect Stack
+
+### Calling Convention
+
+One module per compiled config holds the whole kernel:
+
+- `@<kernel>__phase<i>(ins..., inouts..., scalars...) -> (inouts...)`: private,
+  pure tensor functions, one per `hl.barrier()`-separated phase.
+- `@<kernel>(inouts..., ins..., scalars...)`: the public entry, over memrefs. It
+  wraps inputs with `bufferization.to_tensor ... restrict` and inouts with
+  `bufferization.to_tensor ... restrict writable`, calls the phases in order
+  (threading SSA values; a barrier is just the call boundary) and commits every
+  final inout with `bufferization.materialize_in_destination ... restrict
+  writable`. Runtime scalars are 0-d memrefs (`f64` for floats, `i64` for ints).
+
+The arguments are the host tensors the device code uses
+([analysis/signature.py](../helion_mlir_backend/_compiler/mlir/analysis/signature.py)):
+declared tensor parameters in declaration order, then other host tensors (locals,
+globals) in first-use order. A tensor written anywhere is an inout, everything
+else an input. A read-only host view of a declared parameter is not an argument:
+it lowers to a reshape of that parameter. Each entry argument carries
+`{helion.name, helion.role, helion.param}` attributes: the host expression that
+produces it, `in`/`inout`/`scalar`, and its position among the tensor
+parameters.
+
+`restrict` means no two arguments may alias; `writable` means the kernel may
+write the buffer in place. Because inouts start from the caller's tensor, host
+initialization (`torch.full_like`), in-place updates and `out=` parameters keep
+their Helion semantics.
+
+Lighthouse's `result_to_args` is not used (`BackendDriver(result_to_args=False)`):
+it only turns results into fresh output buffers, marks every input `restrict`
+(so one buffer cannot be both input and output), rejects returning an argument
+unchanged, and is tensor-only. Runner, `TorchMemoryManager`, pipelines and
+schedules stay lighthouse's.
+
+**Call path** ([driver.py](../helion_mlir_backend/_compiler/mlir/driver.py),
+[host_code.py](../helion_mlir_backend/_compiler/mlir/host_code.py)). Every call
+runs the kernel's host code up to the device loops, evaluates each entry
+argument's host expression in the host locals, calls the entry, then runs the
+host code after the loops and returns the kernel's own `return` value. Host-side
+block sizes (`hl.register_block_size`) become the config's values, as in
+Helion's host codegen. Tensors are passed contiguous: free when they already
+are, otherwise one copy in plus a copy back for inouts (strided memrefs are
+untested in the lighthouse pipelines). An input that overlaps an inout is cloned
+so `restrict` holds (it reads the value from before the call); two inouts that
+share memory are rejected.
+
+**Entry points.** Direct calls (`@helion.kernel(backend="mlir")`) and
+`compile_mlir(kernel, args)` use the call path above. `generate_mlir` returns the
+module for inspection. `MLIRBackend.execute_mlir(module, *tensor_params)` runs no
+host code: it zero-initializes host-created inouts, rejects kernels that read
+host-computed tensors or take runtime scalars, and returns every inout.
 
 ### Dialects Used
 
@@ -261,30 +315,38 @@ Compilation steps:
 1. **Parse & Type Propagation**: Extract shapes and dtypes
 2. **Device IR**: Convert to FX graph with tile loops and indexing
 3. **MLIR Lowering**:
-   - Create func.func with tensor arguments
-   - Create scf.forall over [m, n] tiles → outer loop
+   - Create the phase `func.func` with tensor arguments (`x`, `y` in, `out` inout)
+   - Create scf.forall over [m, n] tiles → outer loop, `shared_outs` = `out`
    - Create scf.for over [k] dimension → inner loop
    - Create linalg.matmul for each tile
-   - Create tensor.parallel_insert_slice for accumulation
+   - Create tensor.parallel_insert_slice of each iteration's owned `out` tile
+   - Create the memref entry that calls the phase
 4. **Generate IR**: Produce valid MLIR textual representation
 
-Generated MLIR IR:
+Generated MLIR IR (abbreviated):
 ```mlir
-"builtin.module"() ({
-  "func.func"() <{sym_name = "matmul", ...}> ({
-  ^bb0(%arg0: tensor<MxKxf32>, %arg1: tensor<KxNxf32>):
-    %out = "scf.forall"(...) ({
-      %acc = "tensor.empty"() : () -> tensor<?x?xf32>
-      %result = "scf.for"(...) ({
-        %mm = "linalg.matmul"(...)
-      })
-      "scf.forall.in_parallel"({
-        "tensor.parallel_insert_slice"(%mm, %out, ...)
-      })
-    })
-    "func.return"(%out) : (tensor<MxNxf32>) -> ()
-  })
-})
+func.func private @matmul__phase0(%x: tensor<MxKxf32>, %y: tensor<KxNxf32>,
+                                  %out: tensor<MxNxf32>) -> tensor<MxNxf32> {
+  %r = scf.forall (%i, %j) in (M/bm, N/bn) shared_outs(%o = %out) -> (tensor<MxNxf32>) {
+    %acc = linalg.fill ... -> tensor<bmxbnxf32>
+    %mm = scf.for %k = ... iter_args(%a = %acc) -> (tensor<bmxbnxf32>) {
+      %t = linalg.matmul ins(...) outs(%a : tensor<bmxbnxf32>) -> tensor<bmxbnxf32>
+      scf.yield %t : tensor<bmxbnxf32>
+    }
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %mm into %o[...] ...
+    }
+  }
+  return %r : tensor<MxNxf32>
+}
+func.func public @matmul(%out: memref<MxNxf32>, %x: memref<MxKxf32>, %y: memref<KxNxf32>) {
+  %o = bufferization.to_tensor %out restrict writable : ...
+  %xt = bufferization.to_tensor %x restrict : ...
+  %yt = bufferization.to_tensor %y restrict : ...
+  %r = call @matmul__phase0(%xt, %yt, %o) : ...
+  bufferization.materialize_in_destination %r in restrict writable %out : ...
+  return
+}
 ```
 
 ## Device Abstraction
@@ -316,7 +378,8 @@ The backend manages this context internally in `build()`.
 
 1. **Tensor Abstraction Overhead**: High-level IR may have larger size than low-level code
 2. **Downstream Optimization**: Performance depends on downstream compiler passes
-3. **Bufferization**: Should be done by downstream pass (not in this backend)
+3. **Bufferization**: Done by lighthouse's pipelines; the backend only fixes the
+   function boundary (`to_tensor` / `materialize_in_destination` in the entry)
 4. **Vectorization**: Implicit in tensor operations, realized downstream
 
 ## Testing Strategy

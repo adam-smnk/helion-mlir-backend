@@ -270,10 +270,8 @@ _CASES: dict[
         "store_then_load",
         "nested_and_outer_store",
         pytest.param("tile_if", marks=_known_gap("I19: _if unsupported")),
-        pytest.param("partial_write", marks=_known_gap("I13: host init skipped")),
-        pytest.param(
-            "non_contiguous_input", marks=_known_gap("I15: strides ignored by ABI")
-        ),
+        "partial_write",
+        "non_contiguous_input",
         "hl_dot",
     ],
 )
@@ -283,14 +281,12 @@ def test_review_probe(case: str) -> None:
     check_kernel(kernel, reference, make_args(), atol=1e-4, rtol=1e-4)
 
 
-@_known_gap("I14: runtime scalar args")
 def test_scalar_argument_changes_between_calls() -> None:
     x = torch.randn(16)
     torch.testing.assert_close(run_direct(scale_kernel, [x, 2.0]), x * 2.0)
     torch.testing.assert_close(run_direct(scale_kernel, [x, 3.0]), x * 3.0)
 
 
-@_known_gap("I13: in-place update of an input")
 def test_inplace_update_of_input() -> None:
     x = torch.randn(16)
     expected = x + 1.0
@@ -299,7 +295,6 @@ def test_inplace_update_of_input() -> None:
     torch.testing.assert_close(x, expected)
 
 
-@_known_gap("I13: out= parameter not written")
 def test_out_parameter_is_written() -> None:
     x = torch.randn(16)
     out = torch.zeros(16)
