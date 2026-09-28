@@ -58,8 +58,7 @@ def take(ctx: BuildContext, value: ir.Value, dim: int, position: ir.Value) -> ir
     offsets = [ctx.index_const(0)] * len(shape)
     offsets[dim] = position
     sizes = [*shape[:dim], 1, *shape[dim + 1 :]]
-    sliced = emit.extract_slice(value, offsets, sizes)
-    return static_reshape(sliced, shape[:dim] + shape[dim + 1 :])
+    return emit.extract_slice(value, offsets, sizes, shape[:dim] + shape[dim + 1 :])
 
 
 def put(
@@ -70,6 +69,7 @@ def put(
     offsets = [ctx.index_const(0)] * len(shape)
     offsets[dim] = position
     sizes = [*shape[:dim], 1, *shape[dim + 1 :]]
+    # Not rank-reducing: that trips an MLIR assertion (areEquivalentSlices) in the opt pipeline.
     return emit.insert_slice(static_reshape(item, sizes), dest, offsets, sizes)
 
 

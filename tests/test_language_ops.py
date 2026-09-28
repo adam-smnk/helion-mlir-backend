@@ -31,6 +31,22 @@ def keep_first(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a * 0.0 + a + b * 0.5
 
 
+def add_combine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return b + a
+
+
+def min_combine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.minimum(a, b)
+
+
+def or_combine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.logical_or(a, b)
+
+
+def mul_combine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:  # noqa: FURB118
+    return a * b
+
+
 @_kernel(8)
 def constant_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -44,6 +60,46 @@ def reduce_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     for tile in hl.tile(x.size(0)):
         out[tile] = hl.reduce(max_combine, x[tile, :], dim=1)
+    return out
+
+
+@_kernel(4)
+def sum_reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = hl.reduce(add_combine, x[tile, :], dim=1)
+    return out
+
+
+@_kernel(4)
+def min_reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = hl.reduce(min_combine, x[tile, :], dim=1)
+    return out
+
+
+@_kernel(4)
+def any_reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = hl.reduce(or_combine, x[tile, :], dim=1)
+    return out
+
+
+@_kernel(4)
+def prod_keep_dims_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile, :] = hl.reduce(mul_combine, x[tile, :], dim=1, keep_dims=True)
+    return out
+
+
+@_kernel(4)
+def fold_reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = hl.reduce(keep_first, x[tile, :], dim=1)
     return out
 
 
@@ -95,9 +151,39 @@ def test_constant_tensor() -> None:
     check_kernel(constant_kernel, lambda x: x * 2.0, [torch.randn(16)])
 
 
-def test_reduce_with_combine_function() -> None:
+@pytest.mark.parametrize(
+    ("kernel", "reference", "x"),
+    [
+        (reduce_kernel, lambda x: x.amax(dim=1), torch.randn(8, 16)),
+        (sum_reduce_kernel, lambda x: x.sum(dim=1), torch.randn(8, 16)),
+        (
+            min_reduce_kernel,
+            lambda x: x.amin(dim=1),
+            torch.randint(-1000, 1000, (8, 16), dtype=torch.int32),
+        ),
+        (any_reduce_kernel, lambda x: x.any(dim=1), torch.rand(8, 16) > 0.9),
+        (
+            prod_keep_dims_kernel,
+            lambda x: x.prod(dim=1, keepdim=True),
+            torch.rand(8, 16) + 0.5,
+        ),
+    ],
+    ids=["maximum", "add", "minimum_int", "logical_or", "mul_keep_dims"],
+)
+def test_reduce_with_known_combiner_is_linalg_reduce(
+    kernel: object, reference: object, x: torch.Tensor
+) -> None:
+    text = str(generate_mlir(kernel, [x]))
+    assert "linalg.reduce" in text
+    assert "scf.for " not in text
+    check_kernel(kernel, reference, [x])
+
+
+def test_reduce_with_other_combiner_is_a_loop() -> None:
     torch.manual_seed(0)
-    check_kernel(reduce_kernel, lambda x: x.amax(dim=1), [torch.randn(8, 16)])
+    x = torch.randn(8, 16)
+    assert "scf.for " in str(generate_mlir(fold_reduce_kernel, [x]))
+    check_kernel(fold_reduce_kernel, lambda x: x[:, 0] + 0.5 * x[:, 1:].sum(dim=1), [x])
 
 
 def test_cumsum() -> None:

@@ -47,6 +47,57 @@ def opt_addmm_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    backend="mlir", static_shapes=True, config=helion.Config(block_sizes=[32, 128])
+)
+def opt_row_sum_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm], dtype=torch.float32)
+        for tn in hl.tile(n):
+            acc = acc + x[tm, tn].sum(dim=-1)
+        out[tm] = acc
+    return out
+
+
+@helion.kernel(
+    backend="mlir", static_shapes=True, config=helion.Config(block_sizes=[32, 128])
+)
+def opt_row_max_kernel(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        acc = hl.full([tm], float("-inf"), dtype=torch.float32)
+        for tn in hl.tile(n):
+            acc = torch.maximum(acc, x[tm, tn].amax(dim=-1))
+        out[tm] = acc
+    return out
+
+
+@helion.kernel(
+    backend="mlir",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[32, 128, 128]),
+)
+def opt_online_softmax_kernel(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tm in hl.tile(m):
+        mi = hl.full([tm], float("-inf"), dtype=torch.float32)
+        di = hl.zeros([tm], dtype=torch.float32)
+        for tn in hl.tile(n):
+            values = x[tm, tn]
+            mi_next = torch.maximum(mi, torch.amax(values, dim=1))
+            di = di * torch.exp(mi - mi_next) + torch.exp(
+                values - mi_next[:, None]
+            ).sum(dim=1)
+            mi = mi_next
+        for tn in hl.tile(n):
+            out[tm, tn] = torch.exp(x[tm, tn] - mi[:, None]) / di[:, None]
+    return out
+
+
 def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], object]]]:
     import helion_mlir_cpu_utils as cpu
 
@@ -54,6 +105,7 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
     bias = torch.randn(320)
     batch_a, batch_b = torch.randn(2, 64, 96), torch.randn(2, 96, 128)
     layer = torch.nn.Linear(192, 160)
+    rows, ragged_rows = torch.randn(64, 1024), torch.randn(64, 1000)
     return {
         "matmul": (lambda: cpu.matmul(a, b), lambda: a @ b),
         "matmul_bias_relu": (
@@ -76,6 +128,15 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
             lambda: opt_addmm_kernel(a[:64], b[:, :64].contiguous()),
             lambda: a[:64] @ b[:, :64],
         ),
+        "row_sum_loop": (lambda: opt_row_sum_loop_kernel(rows), lambda: rows.sum(-1)),
+        "row_max_ragged": (
+            lambda: opt_row_max_kernel(ragged_rows),
+            lambda: ragged_rows.amax(-1),
+        ),
+        "online_softmax": (
+            lambda: opt_online_softmax_kernel(ragged_rows),
+            lambda: ragged_rows.softmax(-1),
+        ),
     }
 
 
@@ -89,6 +150,9 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
         "linear",
         "elementwise",
         "addmm",
+        "row_sum_loop",
+        "row_max_ragged",
+        "online_softmax",
     ],
 )
 def test_optimizing_pipeline_f32(case: str) -> None:

@@ -50,4 +50,14 @@ Pipeline:
 
   - include: x86_64/vectorize.yaml
 
-  - include: x86_64/lower.yaml
+  ## x86_64/lower.yaml, plus the vector.multi_reduction lowering that
+  ## convert-vector-to-llvm no longer includes (reductions fail to JIT without it).
+  - include: bufferization.yaml
+  - include: bufferization-cleanup.yaml
+  - schedule: "omp.py[gen=parallelize]"
+  - schedule: "x86/amx_move_offsets.py[gen=amx_move_offsets]"
+  - schedule: "vectorization.py[gen=x86_vectorization]"
+  - schedule: "vectorization.py[gen=vectorize_all]"
+  - schedule: "vectorization.py[gen=flatten_vector_ops]"
+  - pass: "func.func(lower-vector-multi-reduction)"
+  - include: llvm-lowering.yaml

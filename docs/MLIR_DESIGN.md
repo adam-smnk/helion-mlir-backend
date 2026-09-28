@@ -85,7 +85,9 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 - `scalar_ops.py`: arithmetic, comparisons and `_and`/`_or`/`_not` of scalar
   (`SymInt`) values, e.g. `if` conditions
 - `combine_ops.py`: `hl.reduce` and `hl.associative_scan`/`torch.cumsum` with a
-  combine function, as a sequential `scf.for`
+  combine function, as a sequential `scf.for`; a reduction whose combine function
+  is one `add`/`mul`/`maximum`/`minimum`/`logical_and`/`logical_or` of its two
+  arguments is a `linalg.reduce` instead
 - `unsupported_ops.py`: Helion operations rejected with their reason (atomics,
   random numbers, inline code, `device_print`)
 - `load_slice_ops.py`: tile loads; a 1-D index tensor in one dimension gathers
@@ -286,14 +288,17 @@ for k in range(...):
 ```
 Lowered to:
 ```
-%acc = tensor.empty()
-scf.forall -> {
-  %partial = ...
-  scf.forall.in_parallel {
-    tensor.parallel_insert_slice(%partial, %acc, ...)
-  }
+%init = linalg.fill ...
+%acc = scf.for ... iter_args(%a = %init) {
+  %next = linalg.generic ins(%partial) outs(%a) { addf(%out, %in) }
+  scf.yield %next
 }
 ```
+After inlining, `execution.inline_module` runs `mlir/in_place.py`: an
+elementwise update of a loop-carried value that reads it takes the iter arg as
+its destination (as `linalg.matmul outs(acc)` already does), and
+`acc = acc + x.sum(-1)` (also `*`, `max`, `min`) becomes the reduction started
+from `acc`. Bufferization then needs no buffer per iteration for them.
 
 #### 4. **Element-wise Operations**
 ```python
@@ -413,8 +418,9 @@ The backend manages this context internally in `build()`.
 
 1. **Tensor Abstraction Overhead**: High-level IR may have larger size than low-level code
 2. **Downstream Optimization**: Performance depends on downstream compiler passes
-3. **Bufferization**: Done by lighthouse's pipelines; the backend only fixes the
+3. **Bufferization**: Done by lighthouse's pipelines; the backend fixes the
    function boundary (`to_tensor` / `materialize_in_destination` in the entry)
+   and makes loop-carried updates destination-passing (`mlir/in_place.py`)
 4. **Vectorization**: Implicit in tensor operations, realized downstream
 
 ## Testing Strategy

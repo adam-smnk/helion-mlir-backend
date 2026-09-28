@@ -143,13 +143,17 @@ def _mixed(sizes: list[Size]) -> tuple[list[ir.Value], list[int]]:
 
 
 def extract_slice(
-    tensor: ir.Value, offsets: list[ir.Value], sizes: list[Size]
+    tensor: ir.Value,
+    offsets: list[ir.Value],
+    sizes: list[Size],
+    result_shape: list[int] | None = None,
 ) -> ir.Value:
-    """Unit-stride ``extract_slice`` without rank reduction."""
+    """Unit-stride ``extract_slice``; ``result_shape`` drops unit dims of the slice."""
     dynamic_sizes, static_sizes = _mixed(sizes)
     element_type = ir.RankedTensorType(tensor.type).element_type
+    shape = static_sizes if result_shape is None else result_shape
     return tensor_d.ExtractSliceOp(
-        ir.RankedTensorType.get(static_sizes, element_type),
+        ir.RankedTensorType.get(shape, element_type),
         tensor,
         offsets,
         dynamic_sizes,

@@ -20,6 +20,7 @@ from lighthouse.pipeline.driver import BackendDriver
 import mlir.ir as ir
 from mlir.passmanager import PassManager
 
+from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
 from helion_mlir_backend._compiler.mlir.support.debug import use_optimizing_pipeline
 from helion_mlir_backend._compiler.mlir.support.type_utils import mlir_dtype_to_torch
@@ -52,9 +53,12 @@ def pipeline_descriptor(pipeline: str | None = None) -> Descriptor:
 
 
 def inline_module(module: ir.Module) -> ir.Module:
-    """Inline phase and helper functions into the entry (in place)."""
+    """Inline phase and helper functions into the entry and update loop-carried
+    values in place."""
     with module.context, ir.Location.unknown():
         PassManager.parse("builtin.module(inline,canonicalize)").run(module.operation)
+        update_carried_values_in_place(module)
+        PassManager.parse("builtin.module(canonicalize)").run(module.operation)
     return module
 
 

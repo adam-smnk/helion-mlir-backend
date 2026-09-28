@@ -9,12 +9,12 @@ from __future__ import annotations
 from lighthouse.execution.target import TargetInfo
 from lighthouse.pipeline.driver import BackendDriver
 from mlir import ir
-from mlir.passmanager import PassManager
 import pytest
 
 from tests.harness import blocked_matmul_cases
 
 from helion_mlir_backend import generate_mlir
+from helion_mlir_backend._compiler.execution import inline_module
 from helion_mlir_backend._compiler.execution import pipeline_descriptor
 
 _AMX_FEATURES = ["amx_bf16", "amx_tile", "amx_int8"]
@@ -23,7 +23,7 @@ _AMX_FEATURES = ["amx_bf16", "amx_tile", "amx_int8"]
 def _first_amx_ops(module: ir.Module, entry: str) -> set[str]:
     features = TargetInfo.host().features + _AMX_FEATURES
     with TargetInfo.override(features=features), module.context, ir.Location.unknown():
-        PassManager.parse("builtin.module(inline,canonicalize)").run(module.operation)
+        inline_module(module)
         driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
         driver.add_stage(pipeline_descriptor("opt"))
         for stage in driver.stages:
