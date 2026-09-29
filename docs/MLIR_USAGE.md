@@ -196,6 +196,10 @@ Helion config keys (`num_warps`, `reduction_loops`, ...) are rejected.
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[32, 32, 32], mlir_pipeline="opt"))
 ```
 
+The pipelines are `_compiler/scalar.yaml` (lighthouse's scalar lowering) and
+`_compiler/pipeline.yaml` (tiling, vectorization, OpenMP). Both begin by lowering
+`linalg.pack`/`linalg.unpack` with lighthouse's `x86/pack_lowering.py`.
+
 Config selection follows Helion:
 - One config (`config=` or `configs=[c]`) is used as is; nothing is tuned.
 - Several configs (`configs=[a, b]`) are benchmarked and the fastest is used.

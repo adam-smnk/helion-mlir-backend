@@ -136,6 +136,54 @@ def _every_other(x: torch.Tensor, fill: float) -> torch.Tensor:
     return out
 
 
+@_kernel()
+def pack_blocks_kernel(b: torch.Tensor) -> torch.Tensor:
+    """``[K, N] -> [N/8, K/8, 8, 8]``, zero-padded: blocks past B's end read zeros."""
+    k, n = b.shape
+    kb, nb = (k + 7) // 8, (n + 7) // 8
+    out = torch.empty((nb, kb, 8, 8), dtype=b.dtype, device=b.device)
+    for tn, tk in hl.tile([nb * 8, kb * 8], block_size=[8, 8]):
+        out[tn.id, tk.id, :, :] = b[tk, tn]
+    return out
+
+
+@helion.kernel(
+    backend="mlir", static_shapes=False, config=helion.Config(block_sizes=[8])
+)
+def pad_rows_kernel(x: torch.Tensor, rows: hl.constexpr) -> torch.Tensor:
+    out = torch.empty((rows, x.size(1)), dtype=x.dtype, device=x.device)
+    for tm in hl.tile(rows):
+        out[tm, :] = x[tm, :]
+    return out
+
+
+def _packed_blocks(b: torch.Tensor) -> torch.Tensor:
+    padded = torch.nn.functional.pad(b, (0, -b.shape[1] % 8, 0, -b.shape[0] % 8))
+    kb, nb = padded.shape[0] // 8, padded.shape[1] // 8
+    return padded.reshape(kb, 8, nb, 8).permute(2, 0, 1, 3).contiguous()
+
+
+@pytest.mark.parametrize("shape", [(24, 32), (21, 30)], ids=["aligned", "padded"])
+def test_packing_blocks_padded_in_kernel(shape: tuple[int, int]) -> None:
+    torch.manual_seed(0)
+    check_kernel(pack_blocks_kernel, _packed_blocks, [torch.randn(shape)])
+
+
+def test_tile_id_store_index_is_parallel() -> None:
+    ir = str(generate_mlir(pack_blocks_kernel, [torch.randn(21, 30)]))
+    assert "scf.forall" in ir
+
+
+def test_padded_rows_of_runtime_width() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(13, 10)
+    expected = torch.zeros(24, 10)
+    expected[:13] = x
+    torch.testing.assert_close(
+        run_direct(pad_rows_kernel, [x, hl.constexpr(24)]), expected
+    )
+
+
 def test_combined_2d() -> None:
     torch.manual_seed(0)
     check_kernel(add_2d_kernel, torch.add, [torch.randn(20, 36), torch.randn(20, 36)])
@@ -219,3 +267,13 @@ def test_opt_pipeline() -> None:
         product = matmul_kernel(x, y)
     torch.testing.assert_close(scaled, x * 3.0)
     torch.testing.assert_close(product, x @ y, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.isolated
+def test_opt_pipeline_padded_blocks() -> None:
+    """A bufferized ``tensor.pad`` temporary read back whole had poison padding."""
+    torch.manual_seed(0)
+    b = torch.randn(45, 70)
+    with opt_pipeline():
+        packed = pack_blocks_kernel(b)
+    torch.testing.assert_close(packed, _packed_blocks(b))

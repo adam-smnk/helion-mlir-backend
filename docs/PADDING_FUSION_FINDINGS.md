@@ -16,6 +16,56 @@ packing, so padding-needed shapes get the same single-pass treatment as the
 already-fast aligned-shape path (see `docs/AMX_MATMUL_OPTIMIZATION_FINDINGS.md`
 for that unrelated packing-loop speedup, which *is* shipped).
 
+## Status: padding fused into single-phase packing kernels
+
+Padding now fuses into one single-phase kernel under both pipelines, with no
+host padding and no barrier. The kernel loops over the packed blocks and loads
+past the end of the operand, which reads zeros:
+
+```python
+for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
+    out[tn.id, tk.id, :, :] = b[tk, tn]
+```
+
+`examples/block_packing_mlir.py` has the four layouts (`pack_a`, `pack_b`,
+`pack_a_t`, `pack_b_t`). It compares them with eager PyTorch, the host-padded
+kernel and an inline `linalg.pack`. Three backend changes made this work:
+
+- **The opt pipeline's wrong results.** The partial load is a `tensor.pad`,
+  which bufferizes to a temporary that is filled, copied into, and then copied
+  into the destination. Lighthouse's `vectorization.py[gen=vectorize_all]`
+  (upstream `vectorize_children_and_apply_patterns`) forwards the source copy
+  into a `vector.transfer_read` whose padding is poison. That drops the fill, so
+  the padded rows hold garbage. Section 1's multi-phase failure and the padded
+  `batch_matmul` NaNs (`docs/MLIR_LIMITATIONS.md` section 14) probably belong to
+  the same family.
+  - Fix: `lower_store` (`lowering/memory_ops.py`) now stores a zero-padded load
+    directly when the store covers its whole slice, with no temporary.
+  - The store is an `scf.if`. A tile the operand covers is a static copy. An
+    edge tile reads its real rows with masked row-wise `vector.transfer_read`s
+    and writes zero rows after them.
+  - A destination of runtime size is filled with zeros, and the real part is
+    then inserted.
+- **`tile.id` store indices.** A store indexed by `tile.id` is now an owned
+  (parallel) dimension, so the block loop is an `scf.forall` and no longer a
+  sequential `scf.for`.
+- **Pack ops.** Both pipelines now run lighthouse's
+  `x86/pack_lowering.py[gen=lower_packs_unpacks]` first, so `linalg.pack` and
+  `linalg.unpack` (for example from an inline MLIR snippet) are lowered.
+
+Remaining limits:
+
+- The transposed kernels (`pack_a_t`, `pack_b_t`) pad before `linalg.transpose`,
+  so they do not get the direct store. For small padded operands they are
+  slower than eager.
+- A store whose tile the loop end cuts short (block 64 over an extent of 4000)
+  is partial, so it does not get the direct store either. It stays correct but
+  slow. Iterating over the padded extent with 32x32 blocks avoids this.
+- A pad consumed by an op other than a store (such as `batch_matmul`) still goes
+  through the temporary.
+
+Sections 1 to 3 below are the original findings.
+
 Reproduce with:
 
 ```bash

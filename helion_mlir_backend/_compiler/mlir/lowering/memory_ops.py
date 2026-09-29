@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import functools
 import operator
 from typing import TYPE_CHECKING
 
 import helion.language._tracing_ops as tracing_ops
 import helion.language.memory_ops as memory_ops
+from mlir.dialects import arith as arith_d
 from mlir.dialects import linalg as linalg_d
+from mlir.dialects import scf as scf_d
+from mlir.dialects import vector as vector_d
 import mlir.ir as ir
 import torch
 
@@ -96,6 +100,11 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
         )
         return
     value = _store_value(value, element_type, plan)
+    if extra_mask is None and not plan.is_partial():
+        padded = _zero_padded(value)
+        if padded is not None and list(value.type.shape) == plan.value_shape():
+            ctx.tensors.rebind(name, _store_padded(state, plan, padded))
+            return
     if extra_mask is not None or plan.is_partial():
         value = reshape(value, plan.value_shape())
     if extra_mask is not None:
@@ -109,6 +118,116 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     ctx.tensors.rebind(
         name, emit.insert_slice(value, state, plan.offsets(), plan.sizes())
     )
+
+
+def _zero_padded(value: ir.Value) -> ir.Value | None:
+    """The source of ``value`` if it is a ``tensor.pad`` with zeros at the end."""
+    if not isinstance(value, ir.OpResult) or value.owner.operation.name != "tensor.pad":
+        return None
+    pad = value.owner.operation.opview
+    if list(pad.low) or any(pad.static_low):
+        return None
+    yielded = list(pad.region.blocks[0].operations)[-1].operands[0]
+    if (
+        not isinstance(yielded, ir.OpResult)
+        or yielded.owner.operation.name != "arith.constant"
+    ):
+        return None
+    constant = yielded.owner.operation.attributes["value"]
+    if isinstance(constant, ir.FloatAttr | ir.IntegerAttr) and constant.value == 0:
+        return pad.source
+    return None
+
+
+def _store_padded(state: ir.Value, plan: SlicePlan, source: ir.Value) -> ir.Value:
+    """Store a zero-padded load's real part ``source`` and zeros past it.
+
+    A static tile is a ``vector.transfer_read`` of ``source``, zero past its end,
+    written straight into the destination; only a tile that ``source`` does not
+    fill reads with bounds checks. Otherwise the destination is zeroed and
+    ``source`` inserted. Bufferized, the ``tensor.pad`` of the load is a temporary
+    copied into the destination, and the opt pipeline's vectorizer reads that
+    temporary's padding as poison.
+    """
+    element_type = ir.RankedTensorType(state.type).element_type
+    shape = plan.value_shape()
+    region = emit.extract_slice(state, plan.offsets(), plan.sizes(), shape)
+    zero = emit.constant(element_type, 0)
+    index = ir.IndexType.get()
+    origin = [emit.constant(index, 0)] * len(shape)
+    if not ir.RankedTensorType(region.type).has_static_shape:
+        zeros = linalg_d.fill(zero, outs=[region])
+        filled = emit.insert_slice(source, zeros, origin, emit.sizes(source))
+        return emit.insert_slice(filled, state, plan.offsets(), plan.sizes())
+    vector_type = ir.VectorType.get(shape, element_type)
+    identity = ir.AffineMap.get_minor_identity(len(shape), len(shape))
+
+    def padded_copy() -> ir.Value:
+        if len(shape) == 1:
+            tile = vector_d.TransferReadOp(
+                vector_type, source, origin, identity, zero, [False]
+            ).result
+            return vector_d.TransferWriteOp(
+                region.type, tile, region, origin, identity, [True]
+            ).result
+        # Real rows read with a masked vector read each (an N-D masked read goes
+        # through a stack buffer), then zero rows.
+        rows = emit.sizes(source)[0]
+        rows = rows if isinstance(rows, ir.Value) else emit.constant(index, rows)
+        row_type = ir.VectorType.get(shape[1:], element_type)
+        minor = ir.AffineMap.get_minor_identity(len(shape), len(shape) - 1)
+
+        def rows_loop(
+            begin: ir.Value, end: ir.Value, tile: ir.Value, real: bool
+        ) -> ir.Value:
+            loop = scf_d.ForOp(begin, end, emit.constant(index, 1), [tile])
+            with ir.InsertionPoint(loop.body):
+                at = [loop.induction_variable, *origin[1:]]
+                row = (
+                    vector_d.TransferReadOp(
+                        row_type, source, at, minor, zero, [False] * len(shape[1:])
+                    ).result
+                    if real
+                    else vector_d.broadcast(row_type, zero)
+                )
+                written = vector_d.TransferWriteOp(
+                    region.type,
+                    row,
+                    loop.inner_iter_args[0],
+                    at,
+                    minor,
+                    [True] * len(shape[1:]),
+                ).result
+                scf_d.YieldOp([written])
+            return loop.results[0]
+
+        real = rows_loop(origin[0], rows, region, real=True)
+        return rows_loop(rows, emit.constant(index, shape[0]), real, real=False)
+
+    full = [
+        arith_d.CmpIOp(
+            arith_d.CmpIPredicate.eq, size, emit.constant(index, extent)
+        ).result
+        for size, extent in zip(emit.sizes(source), shape, strict=True)
+        if isinstance(size, ir.Value)
+    ]
+    if (
+        not full
+        or not isinstance(source, ir.OpResult)
+        or source.owner.operation.name != "tensor.extract_slice"
+    ):
+        return emit.insert_slice(padded_copy(), state, plan.offsets(), plan.sizes())
+    # A tile the source covers is a static copy; only edge tiles need padding.
+    extract = source.owner.operation.opview
+    branch = scf_d.IfOp(
+        functools.reduce(arith_d.andi, full), [region.type], has_else=True
+    )
+    with ir.InsertionPoint(branch.then_block):
+        whole = emit.extract_slice(extract.source, list(extract.offsets), shape)
+        scf_d.YieldOp([emit.insert_slice(whole, region, origin, shape)])
+    with ir.InsertionPoint(branch.else_block):
+        scf_d.YieldOp([padded_copy()])
+    return emit.insert_slice(branch.result, state, plan.offsets(), plan.sizes())
 
 
 def _store_value(value: ir.Value, element_type: ir.Type, plan: SlicePlan) -> ir.Value:

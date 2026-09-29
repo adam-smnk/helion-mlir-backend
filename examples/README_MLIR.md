@@ -189,6 +189,29 @@ and per output tile for both buffer layouts.
 
 ---
 
+### 10. block_packing_mlir.py
+**Block packing for blocked matmuls, zero padding included**
+
+Packs matmul operands into 32x32 blocks (`[M/32, K/32, 32, 32]` for A,
+`[N/32, K/32, 32, 32]` for B), zero-padding extents that are not multiples of 32:
+- **Helion kernels** `pack_a`, `pack_b`, `pack_a_t`, `pack_b_t`: one loop over
+  the packed blocks, `out[tn.id, tk.id, :, :] = b[tk, tn]`. Padding is part of
+  the same pass: loads past the operand's end read zeros.
+- **Alternatives for B:** eager PyTorch (pad, reshape, permute, contiguous);
+  host padding plus a Helion panel-copy kernel; one inline MLIR `linalg.pack`.
+
+**Run:**
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc.so.4 python examples/block_packing_mlir.py
+```
+
+**Output:** A correctness check of every approach on aligned and padded shapes.
+Then time and bandwidth tables: B packing by all four approaches, and the other
+layouts against eager. `OMP_NUM_THREADS` defaults to half the logical CPUs.
+Without tcmalloc, large outputs are page-faulted in on every call.
+
+---
+
 ## Running the Examples
 
 ### Prerequisites
@@ -208,6 +231,7 @@ python examples/geglu_mlir.py
 python examples/sum_mlir.py
 python examples/multi_phase_mlir.py
 python examples/inline_mlir.py
+python examples/block_packing_mlir.py
 ```
 
 ### Run Specific Example

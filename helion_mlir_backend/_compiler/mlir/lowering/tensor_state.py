@@ -26,7 +26,9 @@ if TYPE_CHECKING:
 class OwnedDim:
     block_id: int
     point: bool
-    """``hl.grid`` index (size 1) rather than a tile."""
+    """A scalar position (size 1) rather than a tile."""
+    kind: str | None = None
+    """The position's symbol kind: ``grid``, ``tile_begin`` or ``tile_id``."""
 
 
 @dataclass
@@ -90,6 +92,9 @@ def _owner(
     descriptor = resolve_index_descriptor(ctx, index)
     if descriptor.block_id not in grid_block_ids or descriptor.bias:
         return None
-    if descriptor.is_scalar and not descriptor.is_offset:
-        return None
-    return OwnedDim(descriptor.block_id, descriptor.is_scalar)
+    if not descriptor.is_scalar:
+        return OwnedDim(descriptor.block_id, point=False)
+    # Positions distinct in every iteration of the block's loop.
+    if descriptor.is_offset or descriptor.kind == "tile_id":
+        return OwnedDim(descriptor.block_id, point=True, kind=descriptor.kind)
+    return None

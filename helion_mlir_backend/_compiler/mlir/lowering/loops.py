@@ -29,6 +29,7 @@ from .registry import lowers
 from .slice_plan import tile_window
 from .tensor_state import OwnedDim
 from .tensor_state import owned_dims
+from .tile_index_ops import scalar_tile_value
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
@@ -220,7 +221,7 @@ def _owned_region(
             offsets.append(ctx.index_const(0))
             sizes.append(extent)
         elif owner.point:
-            offsets.append(ctx.block_id_to_iv[owner.block_id])
+            offsets.append(scalar_tile_value(ctx, owner.block_id, owner.kind))
             sizes.append(1)
         else:
             offset, size, _ = tile_window(ctx, owner.block_id, 0, extent)

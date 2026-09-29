@@ -215,7 +215,9 @@ the pipeline can lower it: `arith`, `math`, `linalg`, `tensor`, `scf`, `affine`,
 `vector`, `memref`, `bufferization`, and the `x86` dialect (the former `x86vector`
 and `amx`, e.g. `x86.avx.rsqrt`, `x86.amx.tile_load`). An `x86.avx.rsqrt`
 microkernel runs with both pipelines; target-specific operations need a machine
-that supports them. Custom dialects are not available.
+that supports them. Custom dialects are not available. Both pipelines lower
+`linalg.pack` and `linalg.unpack` (see the inline `linalg.pack` in
+`examples/block_packing_mlir.py`).
 
 ## Reference implementations
 

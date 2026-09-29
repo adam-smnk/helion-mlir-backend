@@ -574,6 +574,40 @@ def test_outside_a_kernel() -> None:
         inline_mlir(SOFTPLUS, [torch.randn(4, 4), 2.0], torch.randn(4, 4))
 
 
+PACK_BLOCKS = """
+func.func @pack(%b: tensor<?x?xf32>, %dest: tensor<?x?x8x8xf32>) -> tensor<?x?x8x8xf32> {
+  %zero = arith.constant 0.0 : f32
+  %packed = linalg.pack %b padding_value(%zero : f32) outer_dims_perm = [1, 0]
+      inner_dims_pos = [0, 1] inner_tiles = [8, 8] into %dest
+      : tensor<?x?xf32> -> tensor<?x?x8x8xf32>
+  return %packed : tensor<?x?x8x8xf32>
+}
+"""
+
+
+@helion.kernel(backend="mlir", config=_cfg())
+def linalg_pack_kernel(b: torch.Tensor) -> torch.Tensor:
+    k, n = b.shape
+    out = torch.empty(
+        ((n + 7) // 8, (k + 7) // 8, 8, 8), dtype=b.dtype, device=b.device
+    )
+    for _ in hl.grid(1):
+        whole = out[:, :, :, :]
+        out[:, :, :, :] = inline_mlir(PACK_BLOCKS, [b[:, :], whole], whole)
+    return out
+
+
+def _packed_blocks(b: torch.Tensor) -> torch.Tensor:
+    padded = torch.nn.functional.pad(b, (0, -b.shape[1] % 8, 0, -b.shape[0] % 8))
+    kb, nb = padded.shape[0] // 8, padded.shape[1] // 8
+    return padded.reshape(kb, 8, nb, 8).permute(2, 0, 1, 3).contiguous()
+
+
+def test_linalg_pack_is_lowered() -> None:
+    b = torch.randn(21, 30)
+    torch.testing.assert_close(run_direct(linalg_pack_kernel, [b]), _packed_blocks(b))
+
+
 @helion.kernel(backend="mlir", config=_cfg(32, 32))
 def opt_softplus_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -600,8 +634,11 @@ def opt_matmul_acc_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 @pytest.mark.slow
 def test_opt_pipeline() -> None:
     x, y = torch.randn(64, 64), torch.randn(64, 96)
+    b = torch.randn(45, 70)
     with opt_pipeline():
         softplus = opt_softplus_kernel(x)
         product = opt_matmul_acc_kernel(x, y)
+        packed = linalg_pack_kernel(b)
     torch.testing.assert_close(softplus, torch.nn.functional.softplus(x, 2.0))
     torch.testing.assert_close(product, x @ y, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(packed, _packed_blocks(b))

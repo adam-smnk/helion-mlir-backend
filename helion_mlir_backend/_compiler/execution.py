@@ -53,7 +53,7 @@ def pipeline_descriptor(pipeline: str | None = None) -> Descriptor:
     if pipeline == "opt":
         return Descriptor("./pipeline.yaml", base_path=os.path.dirname(__file__))
     if pipeline == "scalar":
-        return Descriptor("scalar-lowering.yaml")
+        return Descriptor("./scalar.yaml", base_path=os.path.dirname(__file__))
     raise ValueError(f"unknown pipeline {pipeline!r}; expected one of {PIPELINES}")
 
 

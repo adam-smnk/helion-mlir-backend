@@ -156,12 +156,20 @@ Current behavior:
   Helion's masked loads and stores. `extra_mask` zeroes loaded elements and
   skips stored ones.
 - A load past the end of a tensor smaller than the iteration domain reads zeros.
+- A zero-padded load stored whole into a full destination slice
+  (`out[tn.id, tk.id, :, :] = b[tk, tn]` over a padded extent) is written
+  directly: a static copy for tiles the source covers, masked row reads plus
+  zero rows for edge tiles. See `docs/PADDING_FUSION_FINDINGS.md` (Status) and
+  `examples/block_packing_mlir.py`.
 - When every block size divides its loop and the loops stay inside the tensors,
   the IR has only static sizes.
 
 Limits:
 - A tile offset that may point before the start of a tensor (`x[tile.index - 1]`
   style negative offsets from the first tile) is rejected.
+- A padded load transformed before its store (`b_t[tn, tk].permute(1, 0)`), or
+  stored into a tile the loop end cuts short, keeps its `tensor.pad`. The result
+  is correct but slower.
 
 ## 10) Multi-Output Kernels
 

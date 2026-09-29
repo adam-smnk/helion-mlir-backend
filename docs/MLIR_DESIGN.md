@@ -65,6 +65,8 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
     own `scf.forall` whose iterations own disjoint regions of the written tensors
     (inserted back with `parallel_insert_slice`); if a written tensor is not
     partitioned by every grid dim, the root runs as a sequential `scf.for` nest.
+    A store index partitions a grid dim if it is the dim's tile, or a scalar equal
+    to its offset (`hl.grid` index, `tile.begin`) or its tile number (`tile.id`).
     Nested `scf.for` loops carry the tensors their bodies write.
 
 - **Key Methods:**
@@ -100,7 +102,10 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 - `load_slice_ops.py`: tile loads; a 1-D index tensor in one dimension gathers
   through the `aten.index.Tensor` helper
 - `memory_ops.py`: getitem, `_mask_to` and stores (tensor-indexed stores are
-  rejected; a size-1 dim of the value is broadcast into the destination)
+  rejected; a size-1 dim of the value is broadcast into the destination). A
+  zero-padded load stored into a whole destination slice skips its `tensor.pad`:
+  a static copy when the source covers the tile, masked vector reads and zero
+  rows otherwise (a bufferized pad temporary is misvectorized by the opt pipeline)
 - `contraction_ops.py`: the single lowering for `mm`/`bmm`/`matmul`/`addmm`/
   `baddbmm`, `hl.dot`, captured einsum and `acc + contraction`, matched by
   `analysis/contractions.py`

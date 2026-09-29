@@ -7,6 +7,10 @@ Pipeline:
 
   # Based on Lighthouse's x86 pipeline.
   # Skips packing as the entry-level IR from Helion already contains parallel loops.
+  ## Pack and unpack ops the kernel has (e.g. from inline MLIR): tile, lower, vectorize.
+  - schedule: "x86/pack_lowering.py[gen=lower_packs_unpacks]{tile_size=32}"
+  - include: cleanup.yaml
+
   ## Initial elementwise operations fusion to group them.
   - pass: "linalg-fuse-elementwise-ops"
 
