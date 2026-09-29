@@ -162,6 +162,33 @@ eager PyTorch.
 
 ---
 
+### 9. inline_mlir.py
+**Inline MLIR (`helion_mlir_backend.inline_mlir`)**
+
+Calls hand-written MLIR functions on tiles inside device loops:
+- **Tensor snippet:** softplus as a `linalg.generic` over `?`-shaped tiles, with a
+  scalar argument.
+- **`ir.Module` source:** a polynomial built with the MLIR Python bindings, one
+  Horner step per coefficient of a Python list.
+- **Memref body:** an 8x16x8 matmul microkernel that reads the operand tiles in
+  place, accumulates into the accumulator's buffer with `vector.fma`, and returns it.
+- **Buffer layouts:** the same microkernel with identity-layout buffers, and the
+  allocations and copies each variant leaves after bufferization.
+
+Both also give a `reference` implementation for Helion's ref mode and other
+backends. See `docs/INLINE_MLIR_GUIDE.md`.
+
+**Run:**
+```bash
+python examples/inline_mlir.py
+```
+
+**Output:** The error of each kernel against PyTorch, the microkernel's call
+site in the generated module, and a table of allocations and copies per K step
+and per output tile for both buffer layouts.
+
+---
+
 ## Running the Examples
 
 ### Prerequisites
@@ -180,6 +207,7 @@ python examples/broadcast_matmul_mlir.py
 python examples/geglu_mlir.py
 python examples/sum_mlir.py
 python examples/multi_phase_mlir.py
+python examples/inline_mlir.py
 ```
 
 ### Run Specific Example

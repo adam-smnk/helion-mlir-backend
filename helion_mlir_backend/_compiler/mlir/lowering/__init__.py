@@ -10,6 +10,7 @@ from . import contraction_ops as contraction_ops
 from . import control_flow as control_flow
 from . import elementwise_ops as elementwise_ops
 from . import host_tensor_ops as host_tensor_ops
+from . import inline_mlir_ops as inline_mlir_ops
 from . import load_slice_ops as load_slice_ops
 from . import loops as loops
 from . import memory_ops as memory_ops

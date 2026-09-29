@@ -33,9 +33,34 @@ def install() -> bool:
     _patch_bound_kernel(BoundKernel, MLIRBackend, mlir_compile_config)
     _allow_pipeline_config_key()
     _register_cpu_autotune_cache()
+    _accept_mlir_module_globals()
     install_einsum_capture()
     install_original_args_capture()
     return True
+
+
+def _accept_mlir_module_globals() -> None:
+    """Let kernels read ``mlir.ir.Module`` globals (``inline_mlir`` sources).
+
+    Helion rejects globals of unknown types; like Triton ``JITFunction`` globals,
+    a module becomes its source text.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+    import mlir.ir as ir
+
+    from helion_mlir_backend._compiler.mlir.snippets import source_text
+
+    if getattr(CompileEnvironment, "_helion_mlir_module_globals", False):
+        return
+    original = CompileEnvironment.to_fake
+
+    def to_fake(self: CompileEnvironment, obj: object, origin: object) -> object:
+        if isinstance(obj, ir.Module):
+            return source_text(obj)
+        return original(self, obj, origin)
+
+    CompileEnvironment.to_fake = to_fake
+    CompileEnvironment._helion_mlir_module_globals = True
 
 
 def _register_cpu_autotune_cache() -> None:

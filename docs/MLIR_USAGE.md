@@ -214,6 +214,13 @@ config) skips lighthouse and the JIT.
 Tests and the conformance sweep set `HELION_DISALLOW_AUTOTUNING=1` and give every
 kernel a fixed config.
 
+## Inline MLIR
+
+`helion_mlir_backend.inline_mlir(source, args, output_like, reference=...)` calls a
+hand-written MLIR `func.func` (text or an `mlir.ir.Module`) on tiles inside a device
+loop; it is inlined into the kernel and lowered with it. See
+[INLINE_MLIR_GUIDE.md](INLINE_MLIR_GUIDE.md) and `examples/inline_mlir.py`.
+
 ## Debugging Aids
 
 ### Print generated module
@@ -286,6 +293,7 @@ Fix:
 
 ## See Also
 
+- `docs/INLINE_MLIR_GUIDE.md`
 - `docs/MLIR_LIMITATIONS.md`
 - `docs/BACKEND_SHAPE_INFERENCE_AND_PROPAGATION.md`
 - `tests/test_mlir_execution.py`

@@ -110,6 +110,8 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
   `permute` (Helion traces every transpose and tensor method as ATen ops)
 - `emit.py`: shared builders (constants, fills, casts as `linalg.generic`)
 - `host_tensor_ops.py`: host arguments and reshapes of the parameters they alias
+- `inline_mlir_ops.py`: `inline_mlir` calls to the user's function, cloned into
+  the module by `snippets.py`, with operands and results cast to its declared types
 - `tensor_creation_ops.py`: `full` (also `hl.zeros`) and `torch.tensor` constants
 - `tile_index_ops.py`: tile positions, `tile.index`, shape queries
 
@@ -118,6 +120,18 @@ codegen: it installs a `TorchFunctionMode` around Helion's device-IR lowering
 so a contractible `torch.einsum` is recorded as a single custom op instead of
 being expanded by PyTorch's dispatcher. Non-contractible equations are left to
 that expansion.
+
+`inline_mlir` ([language.py](../helion_mlir_backend/language.py), guide in
+[INLINE_MLIR_GUIDE.md](INLINE_MLIR_GUIDE.md)) is a plain function: under the MLIR
+backend it calls the device-only API op `_inline_mlir`, and elsewhere (other
+backends, Helion's ref mode) it calls the user's `reference`, which Helion then
+traces like any device code. The op's fake implementation parses and checks the
+snippet against the call while Helion traces the kernel
+([snippets.py](../helion_mlir_backend/_compiler/mlir/snippets.py)); the lowering
+clones its functions into the module, private and renamed per snippet, and calls
+the entry, so the inliner merges it into the kernel before bufferization. An
+`mlir.ir.Module` global reaches it as text: `inject.py` extends Helion's
+`CompileEnvironment.to_fake`, which accepts only known global types.
 
 #### 5. **ATen Bridge and Support**
 

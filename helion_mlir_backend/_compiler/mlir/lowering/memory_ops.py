@@ -29,8 +29,8 @@ if TYPE_CHECKING:
 
 @lowers(operator.getitem)
 def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
-    """One result of a loop, ``if`` or ``split`` (:class:`emit.Results`) or of a
-    multi-result helper call."""
+    """One result of a loop, ``if`` or ``split`` (:class:`emit.Results`), of a
+    multi-result helper call, or of a multi-result ``inline_mlir``."""
     container_value = ctx.get_value(node.args[0])
     if container_value is None:
         # An item of an Inductor-internal buffer (``_inductor_lowering_extra``).
