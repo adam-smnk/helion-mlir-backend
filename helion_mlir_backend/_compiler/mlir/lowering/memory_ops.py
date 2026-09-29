@@ -29,15 +29,13 @@ if TYPE_CHECKING:
 
 @lowers(operator.getitem)
 def lower_getitem(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
-    """One result of an ``scf.for``/``scf.while``, a multi-result helper call or
-    another node with :class:`emit.Results`."""
+    """One result of a loop, ``if`` or ``split`` (:class:`emit.Results`) or of a
+    multi-result helper call."""
     container_value = ctx.get_value(node.args[0])
     if container_value is None:
+        # An item of an Inductor-internal buffer (``_inductor_lowering_extra``).
         return None
-    index = int(node.args[1])
-    if hasattr(container_value, "results"):
-        return container_value.results[index]
-    return container_value
+    return container_value.results[int(node.args[1])]
 
 
 @lowers(tracing_ops._mask_to)

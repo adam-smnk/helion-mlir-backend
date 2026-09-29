@@ -14,7 +14,7 @@ import torch
 from tests.harness import check_kernel
 
 from helion_mlir_backend import generate_mlir
-from helion_mlir_backend._compiler.mlir.aten_bridge import helpers
+from helion_mlir_backend._compiler.mlir.aten_bridge import helper_cache
 from helion_mlir_backend._compiler.mlir.codegen import MLIRModuleBuilder
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 
@@ -172,14 +172,14 @@ def test_one_torch_mlir_run_per_compile_and_cache_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runs: list[list[str]] = []
-    run = helpers._run_torch_mlir
+    run = helper_cache._run_torch_mlir
 
-    def counted(requests: list[helpers.HelperRequest]) -> object:
+    def counted(requests: list[helper_cache.HelperRequest]) -> object:
         runs.append([request.name for request in requests])
         return run(requests)
 
-    monkeypatch.setattr(helpers, "_CACHE", {})
-    monkeypatch.setattr(helpers, "_run_torch_mlir", counted)
+    monkeypatch.setattr(helper_cache, "CACHE", helper_cache.HelperCache())
+    monkeypatch.setattr(helper_cache, "_run_torch_mlir", counted)
     x = torch.randn(16, 32)
     generate_mlir(pointwise_kernel, [x])
     assert len(runs) == 1
@@ -191,17 +191,17 @@ def test_one_torch_mlir_run_per_compile_and_cache_reuse(
 def test_unlowerable_helper_is_reported_at_its_source_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = helpers._run_torch_mlir
+    run = helper_cache._run_torch_mlir
 
-    def failing_sigmoid(requests: list[helpers.HelperRequest]) -> object:
+    def failing_sigmoid(requests: list[helper_cache.HelperRequest]) -> object:
         if any(
             request.target is torch.ops.aten.sigmoid.default for request in requests
         ):
             raise RuntimeError("no sigmoid today")
         return run(requests)
 
-    monkeypatch.setattr(helpers, "_CACHE", {})
-    monkeypatch.setattr(helpers, "_run_torch_mlir", failing_sigmoid)
+    monkeypatch.setattr(helper_cache, "CACHE", helper_cache.HelperCache())
+    monkeypatch.setattr(helper_cache, "_run_torch_mlir", failing_sigmoid)
     x = torch.randn(16, 32)
     with pytest.raises(UnsupportedOperationError) as info:
         generate_mlir(pointwise_kernel, [x])

@@ -105,12 +105,11 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
   `baddbmm`, `hl.dot`, captured einsum and `acc + contraction`, matched by
   `analysis/contractions.py`
 - `elementwise_ops.py`: index-scalar binary ops, aliases, Helion's GELU ops
-- `view_ops.py`, `method_ops.py`, `transpose_ops.py`: views, `hl.split`/`hl.join`
-  and `Tensor` methods
+- `view_ops.py`, `transpose_ops.py`: views, `hl.subscript`
+  (new axes: Helion admits only `None` and `:`), `hl.split`/`hl.join` and
+  `permute` (Helion traces every transpose and tensor method as ATen ops)
 - `emit.py`: shared builders (constants, fills, casts as `linalg.generic`)
-- `subscript_ops.py`: subscripts of device values (slices, new axes, scalar
-  positions, gathers)
-- `host_tensor_ops.py`: host arguments and alias materialization
+- `host_tensor_ops.py`: host arguments and reshapes of the parameters they alias
 - `tensor_creation_ops.py`: `full` (also `hl.zeros`) and `torch.tensor` constants
 - `tile_index_ops.py`: tile positions, `tile.index`, shape queries
 
@@ -122,24 +121,28 @@ that expansion.
 
 #### 5. **ATen Bridge and Support**
 
-[aten_bridge/helpers.py](../helion_mlir_backend/_compiler/mlir/aten_bridge/helpers.py)
-lowers every ATen node without a direct lowering as a `func.call` to a private
-helper function typed at the call site:
+[aten_bridge/](../helion_mlir_backend/_compiler/mlir/aten_bridge/) lowers every ATen
+node without a direct lowering as a `func.call` to a private helper function typed
+at the call site (`helpers.py`: `call_helper`, `infer_results`, `AtenHelperTable`):
 
 - The operands are the node's inputs as they were lowered: tensors with their
   MLIR types, and runtime scalars (kernel `float`/`int` parameters, tile
   positions) as `f64`/`i64`/`i1`. Constant scalars and non-tensor arguments are
-  literals. Result types come from running the op on meta tensors of the
-  operand types, so nothing is derived from Helion's symbolic metadata.
+  literals. Result types come from running the op on samples of the operand
+  types (`samples.py`), so nothing is derived from Helion's symbolic metadata:
+  meta tensors, or fake tensors and fresh size symbols for `?` dims and for
+  runtime scalars at `SymInt` arguments. Each module has its own fake tensor
+  mode (`AtenHelperTable.sampler`), freed with the module.
 - The helper's name hashes the target, literals and operand types; one helper
   serves every call site with the same signature.
 - Inputs that Helion's `strip_unused_inputs` masked as `None` (`x * x` becomes
   `mul(x, None)`) are restored from the arguments recorded just before it runs
-  (`install_original_args_capture`, installed by `inject.py`).
-- After the module is built, the helpers missing from a process-wide cache are
-  imported with torch-mlir's `FxImporter` and lowered to Linalg in one run. If
-  that run fails, each helper is lowered alone and the first failing one raises
-  an `UnsupportedOperationError` at its node's kernel source line.
+  (`original_args.py`, installed by `inject.py`).
+- After the module is built, the helpers missing from the process-wide
+  `helper_cache.CACHE` are imported with torch-mlir's `FxImporter` and lowered to
+  Linalg in one run. If that run fails, each helper is lowered alone and the first
+  failing one raises an `UnsupportedOperationError` at its node's kernel source
+  line.
 - `infer_results` gives the same meta results to direct lowerings that need a
   result shape (`view`/`reshape`); `call_helper` builds a helper call for an op
   that is not the node's own target (gathers use `aten.index.Tensor`, Helion's
@@ -157,8 +160,7 @@ Shared utilities live under [support/](../helion_mlir_backend/_compiler/mlir/sup
 #### 6. **Type System: torch_dtype_to_mlir()**
 - Location: [type_utils.py](../helion_mlir_backend/_compiler/mlir/support/type_utils.py)
 - Converts PyTorch dtypes to MLIR types
-- Handles tensor shape + dtype conversion
-- Supports dynamic dimensions (SymInt → `?`)
+- `static_dim`: a symbolic tensor dim (`SymInt`) as MLIR `?`
 
 **Supported Types:**
 - float16, bfloat16, float32, float64
@@ -184,8 +186,9 @@ The arguments are the host tensors the device code uses
 ([analysis/signature.py](../helion_mlir_backend/_compiler/mlir/analysis/signature.py)):
 declared tensor parameters in declaration order, then other host tensors (locals,
 globals) in first-use order. A tensor written anywhere is an inout, everything
-else an input. A read-only host view of a declared parameter is not an argument:
-it lowers to a reshape of that parameter. Each entry argument carries
+else an input. A read-only host reshape of a declared parameter (the same
+elements in the same order) is not an argument: it lowers to a reshape of that
+parameter; any other host view is an input of its own. Each entry argument carries
 `{helion.name, helion.role, helion.param}` attributes: the host expression that
 produces it, `in`/`inout`/`scalar`, and its position among the tensor
 parameters.

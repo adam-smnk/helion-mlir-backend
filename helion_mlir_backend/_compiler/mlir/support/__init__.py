@@ -22,6 +22,7 @@ from .errors import ValueNotFoundError
 from .index_meta import IndexDescriptor
 from .index_meta import resolve_index_descriptor
 from .type_utils import mlir_dtype_to_torch
+from .type_utils import static_dim
 from .type_utils import torch_dtype_to_mlir
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "block_id_from_key",
     "mlir_dtype_to_torch",
     "resolve_index_descriptor",
+    "static_dim",
     "symbol_origin_info",
     "torch_dtype_to_mlir",
 ]

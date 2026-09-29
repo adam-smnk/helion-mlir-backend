@@ -34,7 +34,6 @@ aten = torch.ops.aten
 _MM = "mk,kn->mn"
 _BMM = "bmk,bkn->bmn"
 _RANK_EQUATIONS = {2: _MM, 3: _BMM}
-_TRANSPOSE_METHODS = ("t", "permute", "transpose")
 
 
 @dataclass(frozen=True)
@@ -191,41 +190,17 @@ def _transposed_input(node: torch.fx.Node) -> torch.fx.Node | None:
     return base if isinstance(base, torch.fx.Node) else None
 
 
-def is_transpose_node(node: object) -> bool:
-    if not isinstance(node, torch.fx.Node):
-        return False
-    if node.op == "call_method":
-        return node.target in _TRANSPOSE_METHODS
-    return node.op == "call_function" and node.target in (
-        aten.permute.default,
-        aten.transpose.int,
-        aten.t.default,
-    )
-
-
 def transpose_permutation(node: object) -> list[int] | None:
-    """The permutation a permute/transpose/t node applies, if statically known."""
-    if not is_transpose_node(node) or not node.args:
+    """The permutation of a ``permute`` node (Helion traces ``t``/``transpose``/``.T``
+    as ``permute``), if statically known."""
+    if not (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target is aten.permute.default
+    ):
         return None
-    rank = _rank(node)
-    kind = node.target if node.op == "call_method" else node.target.overloadpacket
-    if kind in ("permute", aten.permute):
-        dims = node.args[1:] if node.op == "call_method" else node.args[1]
-        if node.op == "call_method" and len(dims) == 1:
-            dims = dims[0]
-        if not isinstance(dims, (list, tuple)):
-            return None
-        return [int(dim) for dim in dims]
-    if rank is None:
-        return None
-    if kind in ("t", aten.t):
-        return [1, 0] if rank == 2 else None
-    if len(node.args) < 3:
-        return None
-    first, second = int(node.args[1]) % rank, int(node.args[2]) % rank
-    permutation = list(range(rank))
-    permutation[first], permutation[second] = second, first
-    return permutation
+    dims = node.args[1]
+    return [int(dim) for dim in dims] if isinstance(dims, (list, tuple)) else None
 
 
 def _rank(node: object) -> int | None:

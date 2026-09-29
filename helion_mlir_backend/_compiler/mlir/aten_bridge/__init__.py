@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from .helpers import ORIGINAL_ARGS
 from .helpers import AtenHelperTable
 from .helpers import call_helper
 from .helpers import infer_results
 from .helpers import is_aten_op
 from .helpers import lower_via_aten_helper
-from .helpers import original_args
+from .original_args import ORIGINAL_ARGS
+from .original_args import original_args
 
 __all__ = [
     "ORIGINAL_ARGS",

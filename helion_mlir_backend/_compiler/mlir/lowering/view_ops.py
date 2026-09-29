@@ -1,4 +1,5 @@
-"""Views and reshapes without an ATen helper round-trip, and ``hl.split``/``hl.join``."""
+"""Views and reshapes without an ATen helper round-trip, ``hl.subscript``, and
+``hl.split``/``hl.join``."""
 
 from __future__ import annotations
 
@@ -9,6 +10,9 @@ from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 import torch
 
+from ..support import UnsupportedOperationError
+from ..support import ValueNotFoundError
+from ..support import static_dim
 from . import emit
 from .registry import NOT_APPLICABLE
 from .registry import lowers
@@ -34,7 +38,6 @@ def view(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     ``?`` types cannot tell sizes apart, the other dims' size symbols must match.
     """
     from ..aten_bridge import infer_results
-    from ..aten_bridge.helpers import static_dim
 
     source = node.args[0]
     value = ctx.get_value(source)
@@ -52,6 +55,26 @@ def view(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
 def _non_unit_sizes(ctx: BuildContext, node: torch.fx.Node) -> list[sympy.Expr]:
     sizes = (ctx.sizes.expr(size) for size in node.meta["val"].shape)
     return [size for size in sizes if size != 1]
+
+
+@lowers(helion_view_ops.subscript)
+def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
+    """``x[None, :]``: ``x`` with a unit dim at each ``None`` (Helion only admits
+    ``None`` and ``:`` here)."""
+    source_node, index = node.args[:2]
+    value = ctx.get_value(source_node)
+    if value is None:
+        raise ValueNotFoundError(source_node, context="subscripted tensor")
+    dims = iter(ir.RankedTensorType(value.type).shape)
+    shape = []
+    for item in index:
+        if item is None:
+            shape.append(1)
+        elif item == slice(None):
+            shape.append(next(dims))
+        else:
+            raise UnsupportedOperationError("subscript", reason=f"index {item!r}")
+    return reshape(value, shape)
 
 
 @lowers(helion_view_ops.split)

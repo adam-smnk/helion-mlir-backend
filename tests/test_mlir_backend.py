@@ -514,7 +514,7 @@ class TestAdvancedOperations:
         assert "func.func" in ir_str
         assert "linalg.generic" in ir_str
 
-    def test_call_method_alias_ops_supported(self):
+    def test_host_alias_ops_supported(self):
         """contiguous and same-shape view should lower as pure aliases."""
 
         @helion.kernel(static_shapes=True)

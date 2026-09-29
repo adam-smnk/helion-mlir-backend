@@ -15,6 +15,7 @@ import torch
 from ..support import NodeLoweringError
 from ..support import ValueNotFoundError
 from ..support import block_id_from_key
+from ..support import resolve_index_descriptor
 from ..support import torch_dtype_to_mlir
 from .registry import lowers
 
@@ -79,7 +80,7 @@ def lower_tile_index(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     if not node.args:
         return None
 
-    block_id = ctx.infer_block_id_from_index(node.args[0])
+    block_id = resolve_index_descriptor(ctx, node.args[0]).block_id
     if block_id is None or block_id not in ctx.geometry.blocks:
         raise NodeLoweringError(node, reason="cannot resolve the tile's block id")
     base = ctx.block_id_to_iv.get(block_id)
@@ -168,16 +169,9 @@ def lower_tile_scalar_op(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     """Lower ``tile.begin`` / ``tile.end`` / ``tile.id`` / ``tile.count``."""
     kind = _SCALAR_KINDS[node.target]
     info = ctx.node_symbol_info(node)
-    block_id = info[0] if info is not None else None
-
-    if block_id is None and node.args:
-        tile_argument = node.args[0]
-        if isinstance(tile_argument, torch.fx.Node) and tile_argument.args:
-            block_id = block_id_from_key(tile_argument.args[0])
-        if block_id is None:
-            block_id = ctx.infer_block_id_from_index(tile_argument)
-    if block_id is None:
+    if info is None:
         raise NodeLoweringError(node, reason="cannot resolve the tile's block id")
+    block_id = info[0]
 
     value = scalar_tile_value(ctx, block_id, kind)
     if value is None:

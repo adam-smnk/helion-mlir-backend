@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Literal
 
+from mlir.dialects import arith as arith_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 import torch
@@ -239,7 +240,7 @@ def tile_window(
             "tile index", reason=f"block_id {block_id} is used outside its loop"
         )
     if bias:
-        offset = ir.ops.arith.addi(offset, ctx.index_const(bias))
+        offset = arith_d.addi(offset, ctx.index_const(bias))
     size = ctx.block_id_to_valid.get(block_id, tile)
     begin, end = ctx.block_id_to_bounds[block_id]
     if bias < 0 and not (isinstance(begin, int) and begin + bias >= 0):

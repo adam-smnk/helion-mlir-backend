@@ -15,7 +15,6 @@ from ..support import UnsupportedOperationError
 from ..support import ValueNotFoundError
 from . import emit
 from .registry import lowers
-from .subscript_ops import gather
 from .view_ops import reshape
 
 if TYPE_CHECKING:
@@ -62,7 +61,7 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             )
         reduced = plan.reduced_dims()
         position = dimension - sum(1 for dim in reduced if dim < dimension)
-        loaded = gather(ctx, node, loaded, [slice(None)] * position + [index])
+        loaded = _gather(ctx, node, loaded, position, index)
     if None in index_nodes:
         loaded = reshape(loaded, _with_new_axes(loaded, index_nodes, plan))
     if extra_mask is None:
@@ -70,6 +69,18 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     return call_helper(
         ctx, node, torch.ops.aten.where.ScalarOther, (extra_mask, loaded, 0), {}
     )
+
+
+def _gather(
+    ctx: BuildContext, node: torch.fx.Node, loaded: ir.Value, dim: int, index: ir.Value
+) -> ir.Value:
+    """``loaded`` indexed along ``dim`` by the ``index`` tensor, via ``aten.index.Tensor``.
+
+    The index is widened to ``i64``: torch-mlir fails on narrower ones.
+    """
+    wide = emit.cast_tensor(index, ir.IntegerType.get_signless(64))
+    indices = [None] * dim + [wide]
+    return call_helper(ctx, node, torch.ops.aten.index.Tensor, (loaded, indices), {})
 
 
 def _with_new_axes(

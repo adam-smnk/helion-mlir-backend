@@ -283,20 +283,17 @@ def _resolve_loop_bound(
     node: torch.fx.Node,
     source: object,
 ) -> int | ir.Value:
-    """Resolve a ``_for_loop`` begin/end to a static int or an index value.
+    """Resolve a ``_for_loop`` begin/end (an int or an FX node) to a static int
+    or an index value.
 
-    A size (a ``SymInt``, or a runtime scalar carrying one) resolves through
-    ``ctx.sizes``, so a loop over a tensor's extent shares that extent's value.
+    A runtime scalar carrying a size resolves through ``ctx.sizes``, so a loop
+    over a tensor's extent shares that extent's value.
     """
     if isinstance(source, int):
-        return int(source)
-    if isinstance(source, torch.SymInt):
-        return ctx.sizes.value(source)
-    value: ir.Value | None = None
+        return source
+    value = None
     if isinstance(source, torch.fx.Node):
         meta_val = source.meta.get("val")
-        if isinstance(meta_val, int):
-            return int(meta_val)
         if (
             source.target is tracing_ops._get_symnode
             and source.args[0] in ctx.scalars
@@ -304,8 +301,6 @@ def _resolve_loop_bound(
         ):
             return ctx.sizes.value(meta_val)
         value = ctx.get_value(source)
-    elif isinstance(source, ir.Value):
-        value = source
     if value is None:
         raise NodeLoweringError(
             node,

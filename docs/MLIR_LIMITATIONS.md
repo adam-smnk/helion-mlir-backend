@@ -199,8 +199,10 @@ Limits:
   the call; two written tensors that share memory are rejected.
 - Written tensors are identified by their host expression: two host names for
   one storage (a host-side view of a written tensor) are separate arguments and
-  are rejected by the overlap check. Read-only views of a declared parameter are
-  fine (they lower to a reshape of it).
+  are rejected by the overlap check. Read-only reshapes of a declared parameter
+  lower to a reshape of it; other read-only host views (`x[:, 2:]`, `x[::2]`,
+  `x.t()`) are inputs of their own, computed by the host code (so `execute_mlir`
+  rejects them).
 - A host tensor whose shape is computed from block sizes
   (`torch.zeros((m, n // block_n))` with `block_n = hl.register_block_size(n)`)
   takes the config's block sizes, as the host code does; a shape depending on

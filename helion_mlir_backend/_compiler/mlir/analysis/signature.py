@@ -4,7 +4,9 @@ A tensor ref is named by its ``_host_tensor`` name, which is the host expression
 that produces it (``x``, ``out``, ``self.weight``). Refs are ordered declared tensor
 parameters first (declaration order), then other host tensors in first-use order.
 A ref written anywhere is ``inout``; every other ref is ``in``. A read-only host
-view of a declared parameter is not a ref: it lowers to a reshape of that parameter.
+view of a declared parameter holding the same elements in the same order (a
+reshape) is not a ref: it lowers to a reshape of that parameter. Any other view
+(a slice, a transpose) is a ref of its own, which the host code computes.
 
 Runtime scalars are symbolic ints/floats with a host origin (non-constexpr scalar
 parameters); Helion keys them by type only, so their values are call arguments.
@@ -19,6 +21,7 @@ import helion.language._tracing_ops as tracing_ops
 import helion.language.memory_ops as memory_ops
 import torch
 import torch.fx
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ..support.block_ids import block_id_from_key
 from ..support.block_ids import symbol_origin_info
@@ -66,7 +69,7 @@ class KernelSignature:
     refs: dict[str, TensorRef]
     scalars: dict[str, ScalarArg]
     aliases: dict[str, str]
-    """Read-only host views of a declared parameter -> that parameter."""
+    """Read-only host reshapes of a declared parameter -> that parameter."""
     phases: tuple[PhaseSignature, ...]
 
     @property
@@ -111,6 +114,7 @@ class KernelSignature:
             if name not in tensor_params
             and name not in written
             and (base := _declared_base(hf, effects.fakes[name], tensor_params))
+            and _same_elements(effects.fakes[name], hf.params.arguments[base])
         }
         ordered = [
             name for name in tensor_params if name in used or name in aliases.values()
@@ -201,3 +205,24 @@ def _declared_base(
             return origin.host_str()
         current = getattr(current, "_base", None)
     return None
+
+
+def _same_elements(view: torch.Tensor, base: torch.Tensor) -> bool:
+    """Whether ``view`` provably holds all of ``base``'s elements in row-major order."""
+    return (
+        statically_known_true(view.storage_offset() == 0)
+        and statically_known_true(view.numel() == base.numel())
+        and _row_major(view)
+        and _row_major(base)
+    )
+
+
+def _row_major(tensor: torch.Tensor) -> bool:
+    expected: int | torch.SymInt = 1
+    for size, stride in reversed(list(zip(tensor.shape, tensor.stride(), strict=True))):
+        if not statically_known_true(size == 1) and not statically_known_true(
+            stride == expected
+        ):
+            return False
+        expected = expected * size
+    return True

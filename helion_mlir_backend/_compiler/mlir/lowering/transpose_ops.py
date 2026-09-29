@@ -1,4 +1,4 @@
-"""Lowering for tile transpose / permute operations."""
+"""Lowering of ``permute`` (Helion traces every transpose as one)."""
 
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ if TYPE_CHECKING:
 aten = torch.ops.aten
 
 
-@lowers(aten.permute.default, aten.transpose.int, aten.t.default)
+@lowers(aten.permute.default)
 def lower_transpose(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
-    """A permute/transpose to ``linalg.transpose`` (none if folded into a contraction)."""
+    """A permute to ``linalg.transpose`` (none if folded into a contraction)."""
     if node in ctx.contractions.absorbed:
         return None
     source = ctx.get_value(node.args[0])

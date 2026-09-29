@@ -70,7 +70,8 @@ def owned_dims(
     """Dims every access indexes with the same grid block id, in the same form."""
     candidates: dict[int, OwnedDim | None] = {}
     for node in accesses:
-        index_nodes = list(node.args[1])
+        # ``None`` adds an axis to the loaded value, not a dim of the tensor.
+        index_nodes = [item for item in node.args[1] if item is not None]
         for dim in range(rank):
             index = index_nodes[dim] if dim < len(index_nodes) else slice(None)
             candidate = _owner(ctx, index, grid_block_ids)

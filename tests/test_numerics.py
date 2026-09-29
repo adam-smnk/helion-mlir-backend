@@ -258,3 +258,68 @@ def test_block_size_sweep(case: str, pattern: list[int]) -> None:
         atol=1e-4,
         rtol=1e-4,
     )
+
+
+def forward_difference(x: torch.Tensor) -> torch.Tensor:
+    n = x.size(0) - 1
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(n):
+        out[tile] = x[tile.index + 1] - x[tile]
+    return out
+
+
+def shifted_columns(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty([m, n - 2], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n - 2]):
+        out[tm, tn] = x[tm, tn.index + 2] + x[tm, tn]
+    return out
+
+
+def backward_difference(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile in hl.tile(1, x.size(0)):
+        out[tile] = x[tile] - x[tile.index - 1]
+    return out
+
+
+def runtime_shift(x: torch.Tensor, shift: int) -> torch.Tensor:
+    n = x.size(0) - shift
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(n):
+        out[tile] = x[tile.index + shift]
+    return out
+
+
+@pytest.mark.parametrize("static", [True, False], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    ("fn", "reference", "shape", "block_sizes"),
+    [
+        (forward_difference, lambda x: x[1:] - x[:-1], (17,), [4]),
+        (shifted_columns, lambda x: x[:, 2:] + x[:, :-2], (5, 11), [2, 4]),
+        (
+            backward_difference,
+            lambda x: torch.cat([x[:1] * 0, x[1:] - x[:-1]]),
+            (17,),
+            [4],
+        ),
+    ],
+    ids=["forward", "columns", "backward"],
+)
+def test_tile_index_plus_constant(
+    fn: object,
+    reference: object,
+    shape: tuple[int, ...],
+    block_sizes: list[int],
+    static: bool,
+) -> None:
+    check_kernel(
+        _configured(fn, block_sizes, static=static), reference, [torch.randn(*shape)]
+    )
+
+
+def test_tile_index_plus_runtime_offset_is_rejected() -> None:
+    from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+
+    with pytest.raises(UnsupportedOperationError, match="runtime offset"):
+        _configured(runtime_shift, [4])(torch.randn(17), 3)

@@ -221,3 +221,59 @@ def test_execute_mlir_writes_declared_parameters_in_place() -> None:
         result = MLIRBackend().execute_mlir(module, a, b, kernel_name="copy_plus_one")
     assert result is b
     torch.testing.assert_close(b, expected)
+
+
+def offset_columns(x: torch.Tensor) -> torch.Tensor:
+    y = x[:, 2:]
+    out = torch.empty(y.size(), dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile(y.size()):
+        out[tm, tn] = y[tm, tn] * 2.0
+    return out
+
+
+def even_rows(x: torch.Tensor) -> torch.Tensor:
+    y = x[::2]
+    out = torch.empty(y.size(), dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile(y.size()):
+        out[tm, tn] = y[tm, tn] + 1.0
+    return out
+
+
+def transposed_view(x: torch.Tensor) -> torch.Tensor:
+    y = x.t()
+    out = torch.empty(y.size(), dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile(y.size()):
+        out[tm, tn] = y[tm, tn] + 1.0
+    return out
+
+
+def leading_columns(x: torch.Tensor) -> torch.Tensor:
+    y = x[:, :3]
+    out = torch.empty(y.size(), dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile(y.size()):
+        out[tm, tn] = y[tm, tn] - 1.0
+    return out
+
+
+@pytest.mark.parametrize("static", [True, False], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    ("fn", "reference"),
+    [
+        (offset_columns, lambda x: x[:, 2:] * 2.0),
+        (even_rows, lambda x: x[::2] + 1.0),
+        (transposed_view, lambda x: x.t() + 1.0),
+        (leading_columns, lambda x: x[:, :3] - 1.0),
+    ],
+    ids=["offset_columns", "even_rows", "transposed", "leading_columns"],
+)
+def test_host_views_that_are_not_reshapes(fn, reference, static: bool) -> None:
+    """Only a reshape aliases its parameter; other views are inputs of their own."""
+    kernel = helion.kernel(
+        fn,
+        backend="mlir",
+        static_shapes=static,
+        config=_cfg(4, 4),
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    x = torch.randn(6, 7)
+    torch.testing.assert_close(run_direct(kernel, [x]), reference(x))

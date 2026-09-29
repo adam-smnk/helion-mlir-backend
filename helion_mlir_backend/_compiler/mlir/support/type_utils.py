@@ -45,3 +45,11 @@ def torch_dtype_to_mlir(dtype: torch.dtype) -> ir.Type:
         )
         raise UnsupportedOperationError(f"dtype {dtype}", reason=reason)
     return ir.Type.parse(name)
+
+
+def static_dim(size: int | torch.SymInt) -> int:
+    """A tensor dim as an MLIR dim: the dynamic size sentinel if it is symbolic."""
+    if isinstance(size, torch.SymInt):
+        expr = size.node.expr
+        return ir.ShapedType.get_dynamic_size() if expr.free_symbols else int(expr)
+    return int(size)

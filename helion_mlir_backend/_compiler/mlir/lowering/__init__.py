@@ -13,9 +13,7 @@ from . import host_tensor_ops as host_tensor_ops
 from . import load_slice_ops as load_slice_ops
 from . import loops as loops
 from . import memory_ops as memory_ops
-from . import method_ops as method_ops
 from . import scalar_ops as scalar_ops
-from . import subscript_ops as subscript_ops
 from . import tensor_creation_ops as tensor_creation_ops
 from . import tile_index_ops as tile_index_ops
 from . import transpose_ops as transpose_ops

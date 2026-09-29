@@ -16,7 +16,6 @@ from .lowering.tensor_state import TensorState
 from .sizes import Sizes
 from .support import DynamicShapeError
 from .support import block_id_from_key
-from .support.index_meta import resolve_index_descriptor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -78,23 +77,13 @@ class BuildContext:
         self.sizes = Sizes(self)
 
     def get_value(self, node_or_value: object) -> ir.Value | None:
-        """Look up an MLIR value for an FX node or scalar literal."""
+        """The MLIR value of an FX node, or an ``index`` constant for an int."""
         import torch.fx
 
         if isinstance(node_or_value, torch.fx.Node):
             return self.node_to_value.get(node_or_value)
         if isinstance(node_or_value, int):
-            index_type = ir.IndexType.get()
-            return arith_d.ConstantOp(
-                index_type,
-                ir.IntegerAttr.get(index_type, node_or_value),
-            ).result
-        if isinstance(node_or_value, float):
-            float_type = ir.F32Type.get()
-            return arith_d.ConstantOp(
-                float_type,
-                ir.FloatAttr.get(float_type, node_or_value),
-            ).result
+            return self.index_const(node_or_value)
         return None
 
     def set_value(self, node: torch.fx.Node, value: ir.Value) -> None:
@@ -140,9 +129,6 @@ class BuildContext:
             if isinstance(shape_node, int):
                 shape.append(shape_node)
                 continue
-            if isinstance(shape_node, torch.SymInt):
-                shape.append(self.sizes.value(shape_node))
-                continue
             if isinstance(shape_node, torch.fx.Node):
                 if shape_node.target is tracing_ops._get_symnode:
                     block_id = block_id_from_key(shape_node.args[0])
@@ -181,21 +167,14 @@ class BuildContext:
             return None
         return self.symbol_info(value)
 
-    def infer_block_id_from_index(self, index_node: object) -> int | None:
-        """Infer the block id represented by an index expression."""
-        return resolve_index_descriptor(self, index_node).block_id
-
-    def lower_graph(self, graph: torch.fx.Graph) -> ir.Value | None:
+    def lower_graph(self, graph: torch.fx.Graph) -> None:
         """Lower an FX graph through the builder callback."""
         if self.lower_node_callback is None:
             raise RuntimeError("BuildContext.lower_node_callback is not configured")
-        last_value: ir.Value | None = None
         for node in graph.nodes:
             value = self.lower_node_callback(node)
             if value is not None:
                 self.set_value(node, value)
-                last_value = value
-        return last_value
 
     def reset_for_new_function(self) -> None:
         """Clear per-function state before building another ``func.func``.
@@ -235,7 +214,10 @@ class BuildContext:
         begin: int | ir.Value,
         end: int | ir.Value,
     ) -> int | ir.Value | None:
-        """``min(tile, end - offset)``, or ``None`` if every tile is full."""
+        """``min(tile, end - offset)``, or ``None`` if every tile is full.
+
+        The tile is at most ``end - begin`` wide (``BlockGeometry.tile_extent``).
+        """
         from .lowering import emit
 
         if self.geometry.is_grid(block_id):
@@ -245,8 +227,6 @@ class BuildContext:
         if isinstance(begin, int) and isinstance(end, int):
             if end <= begin or (end - begin) % size == 0:
                 return None
-            if end - begin < size:
-                return end - begin
             return emit.affine_min(
                 [ir.AffineConstantExpr.get(size), ir.AffineConstantExpr.get(end) - d0],
                 [offset],

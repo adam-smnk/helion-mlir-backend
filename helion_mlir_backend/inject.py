@@ -17,7 +17,7 @@ def install() -> bool:
         from helion._compiler.backend_registry import register_compiler_backend
         from helion.runtime.kernel import BoundKernel
 
-        from helion_mlir_backend._compiler.mlir.aten_bridge.helpers import (
+        from helion_mlir_backend._compiler.mlir.aten_bridge.original_args import (
             install_original_args_capture,
         )
         from helion_mlir_backend._compiler.mlir.backend import MLIRBackend

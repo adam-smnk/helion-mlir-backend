@@ -16,6 +16,7 @@ import helion.language._tracing_ops as tracing_ops
 from .block_ids import OFFSET_SYMBOL_KINDS
 from .block_ids import SCALAR_SYMBOL_KINDS
 from .block_ids import block_id_from_key
+from .errors import UnsupportedOperationError
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
@@ -45,17 +46,16 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
 
     Resolution order (all authoritative, no name/heuristic matching):
     1. Literal int -> scalar constant offset.
-    2. ``meta['tile_with_offset']`` -> block id + offset, set for every
-       backend by Helion's own ``add_tile_with_offset_metadata`` pass.
+    2. ``meta['tile_with_offset']`` (``tile.index + k``) -> block id + constant
+       offset, set for every backend by Helion's ``add_tile_with_offset_metadata``.
     3. Symbol origin (``HostFunction.expr_to_origin`` via
        ``BuildContext.symbol_info``) -> block id, plus whether it denotes a
        scalar grid/tile position or a tile extent.
     4. ``_get_symnode('block_size_N')`` key -> block id directly; a constant
        key names the active tile loop whose block size Helion specialized to
        it (``hl.register_block_size`` of a size-1 dim).
-    5. ``sym_size.int(tensor, dim)`` -> the referenced tensor dimension's own
-       symbol origin.
     """
+    import torch
     import torch.fx
 
     if isinstance(index_node, int):
@@ -65,10 +65,16 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
 
     tile_meta = index_node.meta.get("tile_with_offset")
     if tile_meta is not None:
-        block_id = tile_meta.get("block_id")
         offset = tile_meta.get("offset", 0)
-        bias = offset if isinstance(offset, int) else 0
-        return IndexDescriptor(block_id=block_id, bias=bias, is_scalar=False)
+        if isinstance(offset, torch.SymInt) and not offset.node.expr.free_symbols:
+            offset = int(offset.node.expr)
+        if not isinstance(offset, int):
+            raise UnsupportedOperationError(
+                "tile index", reason=f"tile.index plus the runtime offset {offset}"
+            )
+        return IndexDescriptor(
+            block_id=tile_meta.get("block_id"), bias=offset, is_scalar=False
+        )
 
     symbol_info = ctx.symbol_info(index_node.meta.get("val"))
     if symbol_info is not None:
@@ -88,23 +94,6 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
             block_id = _specialized_block(ctx, key)
         if block_id is not None:
             return IndexDescriptor(block_id=block_id, bias=0, is_scalar=False)
-
-    if target is torch.ops.aten.sym_size.int and len(index_node.args) >= 2:
-        tensor_node, dimension_index = index_node.args[0], index_node.args[1]
-        if isinstance(tensor_node, torch.fx.Node) and isinstance(dimension_index, int):
-            tensor_value = tensor_node.meta.get("val")
-            if isinstance(tensor_value, torch.Tensor) and (
-                0 <= dimension_index < len(tensor_value.shape)
-            ):
-                dimension_info = ctx.symbol_info(tensor_value.shape[dimension_index])
-                if dimension_info is not None:
-                    block_id, kind = dimension_info
-                    return IndexDescriptor(
-                        block_id=block_id,
-                        bias=0,
-                        is_scalar=kind in SCALAR_SYMBOL_KINDS,
-                        kind=kind,
-                    )
 
     return _UNRESOLVED
 
