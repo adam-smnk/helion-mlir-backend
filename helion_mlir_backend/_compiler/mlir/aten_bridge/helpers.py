@@ -61,7 +61,7 @@ def _fake_mode() -> FakeTensorMode:
 
 
 def _mode_for(samples: list[object]) -> contextlib.AbstractContextManager:
-    if any(isinstance(sample, FakeTensor) for sample in samples):
+    if any(isinstance(sample, (FakeTensor, torch.SymInt)) for sample in samples):
         return _fake_mode()
     return contextlib.nullcontext()
 
@@ -269,7 +269,9 @@ def _bind(
 ) -> tuple[tuple, dict, list[ir.Value], list[object]]:
     """Replace inputs by literals or operand markers; collect operand values.
 
-    A runtime scalar where ``target``'s schema takes a tensor is a 0-d tensor.
+    A runtime scalar where ``target``'s schema takes a tensor is a 0-d tensor;
+    one where it takes a ``SymInt`` (a size) is sampled as a fresh size symbol,
+    so the sizes it determines stay dynamic.
     """
     values: list[ir.Value] = []
     samples: list[object] = []
@@ -314,7 +316,11 @@ def _bind(
                 ir.RankedTensorType.get([], scalar.type), [scalar]
             ).result
             samples[arg.index] = _sample(values[arg.index].type)
-    if any(isinstance(sample, FakeTensor) for sample in samples):
+        elif _takes_sym_int(argument.real_type):
+            for operand in _operands(arg):
+                if not isinstance(values[operand.index].type, ir.RankedTensorType):
+                    samples[operand.index] = _size_symbol()
+    if any(isinstance(sample, (FakeTensor, torch.SymInt)) for sample in samples):
         # One mode for every tensor operand of the op.
         samples = [
             _sample(value.type, fake=True)
@@ -323,6 +329,29 @@ def _bind(
             for value, sample in zip(values, samples, strict=True)
         ]
     return bound_args, bound_kwargs, values, samples
+
+
+def _takes_sym_int(schema_type: torch.Type) -> bool:
+    """A ``SymInt``, ``SymInt?`` or ``SymInt[]`` schema argument."""
+    if isinstance(schema_type, torch.OptionalType):
+        schema_type = schema_type.getElementType()
+    if isinstance(schema_type, torch.ListType):
+        schema_type = schema_type.getElementType()
+    return isinstance(schema_type, torch.SymIntType)
+
+
+def _operands(structure: object) -> list[_Operand]:
+    if isinstance(structure, _Operand):
+        return [structure]
+    if isinstance(structure, (list, tuple)):
+        return [operand for item in structure for operand in _operands(item)]
+    return []
+
+
+def _size_symbol() -> torch.SymInt:
+    size = _fake_mode().shape_env.create_unbacked_symint()
+    torch._check(size >= 0)
+    return size
 
 
 def _substitute(structure: object, samples: list[object]) -> object:
@@ -343,7 +372,7 @@ def _sample(value_type: ir.Type, *, fake: bool = False) -> object:
         dtype = (
             torch.int64
             if isinstance(element, ir.IndexType)
-            else mlir_dtype_to_torch(str(element), default=None)
+            else mlir_dtype_to_torch(str(element))
         )
         if dtype is None:
             raise UnsupportedOperationError(

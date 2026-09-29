@@ -101,30 +101,3 @@ class TensorEffects:
             )
             self._writes[graph_id] = tuple(dict.fromkeys(names))
         return self._writes[graph_id]
-
-    def reads(self, graph_id: int) -> set[str]:
-        return {
-            accessed_tensor(node)
-            for node in self.accesses(graph_id)
-            if node.target is memory_ops.load
-        }
-
-    def written_in(self, graphs: list[torch.fx.Graph]) -> list[str]:
-        """Host tensors stored directly in ``graphs``, in scan order."""
-        names = (
-            accessed_tensor(node)
-            for graph in graphs
-            for node in graph.nodes
-            if node.op == "call_function" and node.target is memory_ops.store
-        )
-        return [name for name in dict.fromkeys(names) if name is not None]
-
-    def read_in(self, graphs: list[torch.fx.Graph]) -> set[str]:
-        return {
-            name
-            for graph in graphs
-            for node in graph.nodes
-            if node.op == "call_function"
-            and node.target is memory_ops.load
-            and (name := accessed_tensor(node)) is not None
-        }

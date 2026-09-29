@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from mlir.dialects import affine as affine_d
 from mlir.dialects import arith as arith_d
@@ -12,11 +13,8 @@ import mlir.ir as ir
 
 from ..support.errors import UnsupportedOperationError
 
-
-def zero_attr(element_type: ir.Type) -> ir.Attribute:
-    if isinstance(element_type, ir.FloatType):
-        return ir.FloatAttr.get(element_type, 0.0)
-    return ir.IntegerAttr.get(element_type, 0)
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 def constant(element_type: ir.Type, value: float) -> ir.Value:
@@ -147,6 +145,20 @@ def affine_min(results: list[ir.AffineExpr], operands: list[ir.Value]) -> ir.Val
     return affine_d.AffineMinOp(
         ir.AffineMap.get(len(operands), 0, results), operands
     ).result
+
+
+def reassociation(rank: int, dropped: Iterable[int]) -> list[list[int]]:
+    """``collapse_shape``/``expand_shape`` groups of a rank-``rank`` shape without
+    its unit ``dropped`` dims: each joins the next kept dim, or the last kept one
+    at the end. Empty if every dim is dropped."""
+    dropped = set(dropped)
+    kept = [dim for dim in range(rank) if dim not in dropped]
+    if not kept:
+        return []
+    groups = {dim: [dim] for dim in kept}
+    for dim in sorted(dropped):
+        groups[next((k for k in kept if k > dim), kept[-1])].append(dim)
+    return [sorted(groups[dim]) for dim in kept]
 
 
 def _mixed(sizes: list[Size]) -> tuple[list[ir.Value], list[int]]:

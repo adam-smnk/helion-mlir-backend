@@ -3,9 +3,10 @@
 Instead of re-deriving geometry from sizes/extents or heuristics, a SlicePlan
 captures what each index position actually means (block id, scalar, full slice)
 and gives one canonical (offsets, sizes) pair for tensor extract/insert
-operations. A tile has a static extent (see ``BlockGeometry.tile_extent``); at the
-end of its loop or tensor only its first ``size`` elements are real (loads
-zero-pad the rest, stores drop it).
+operations. A tile has a static extent (see ``BlockGeometry.tile_extent``), or
+the runtime extent of a full slice of a runtime-sized dim; at the end of its
+loop or tensor only its first ``size`` elements are real (loads zero-pad the
+rest, stores drop it).
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ class SlicePlan:
         return [dim.size for dim in self.dims]
 
     def tile_shape(self) -> list[int]:
-        """Static shape of the tile at full rank."""
+        """Shape of the tile at full rank (``?`` for a runtime extent)."""
         return [dim.tile for dim in self.dims]
 
     def value_shape(self) -> list[int]:
@@ -109,6 +110,7 @@ def plan_slice(
     - Scalar index (grid/tile.begin) → scalar: block_id from symbol, size 1, reduces.
     - Tile index (block_id) → tile: block_id from symbol, tile-extent wide.
     - Literal int → scalar constant offset, size 1, reduces.
+    - Scalar computed at run time (``n - 1``) → scalar at that offset, reduces.
     - Index tensor → gather: the whole dimension, gathered after slicing.
 
     ``owned`` marks dims where ``base`` is only the current iteration's region
@@ -128,7 +130,9 @@ def plan_slice(
     def full(dimension: int, index: slice) -> DimSlice:
         extent = base_shape[dimension]
         if ir.ShapedType.is_dynamic_size(extent):
-            return _dynamic_full(ctx, index, ctx.extent(base, dimension, name), extent)
+            return _dynamic_full(
+                ctx, index, ctx.sizes.extent(base, dimension, name), extent
+            )
         start, stop = _static_slice_bounds(index, extent)
         return DimSlice("full", ctx.index_const(start), stop - start, stop - start)
 
@@ -183,10 +187,15 @@ def plan_slice(
         block_id, bias = descriptor.block_id, descriptor.bias
         index = ctx.get_value(index_node) if block_id is None else None
         if index is not None and isinstance(index.type, ir.RankedTensorType):
-            size = ctx.extent(base, dimension, name)
+            size = ctx.sizes.extent(base, dimension, name)
             dims.append(
                 DimSlice("gather", ctx.index_const(0), size, extent, index=index)
             )
+            continue
+        if index is not None:
+            # A position computed from runtime sizes, e.g. ``n - 1``.
+            offset = ctx.cast_to_index(index)
+            dims.append(DimSlice("scalar", offset, 1, 1, reduces=True))
             continue
         if block_id is None:
             raise NodeLoweringError(
@@ -200,7 +209,7 @@ def plan_slice(
                 reason=f"Tile index at dimension {dimension} names unknown block_id {block_id}",
             )
         offset, size, tile = tile_window(
-            ctx, block_id, bias, ctx.extent(base, dimension, name)
+            ctx, block_id, bias, ctx.sizes.extent(base, dimension, name)
         )
         dims.append(DimSlice("tile", offset, size, tile, block_id))
 

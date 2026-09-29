@@ -50,7 +50,9 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
     3. Symbol origin (``HostFunction.expr_to_origin`` via
        ``BuildContext.symbol_info``) -> block id, plus whether it denotes a
        scalar grid/tile position or a tile extent.
-    4. ``_get_symnode('block_size_N')`` key -> block id directly.
+    4. ``_get_symnode('block_size_N')`` key -> block id directly; a constant
+       key names the active tile loop whose block size Helion specialized to
+       it (``hl.register_block_size`` of a size-1 dim).
     5. ``sym_size.int(tensor, dim)`` -> the referenced tensor dimension's own
        symbol origin.
     """
@@ -80,7 +82,10 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
 
     target = index_node.target
     if target is tracing_ops._get_symnode and index_node.args:
-        block_id = block_id_from_key(index_node.args[0])
+        key = index_node.args[0]
+        block_id = block_id_from_key(key)
+        if block_id is None and key.isdigit():
+            block_id = _specialized_block(ctx, key)
         if block_id is not None:
             return IndexDescriptor(block_id=block_id, bias=0, is_scalar=False)
 
@@ -102,3 +107,17 @@ def resolve_index_descriptor(ctx: BuildContext, index_node: object) -> IndexDesc
                     )
 
     return _UNRESOLVED
+
+
+def _specialized_block(ctx: BuildContext, key: str) -> int | None:
+    """The one active tile loop whose block size symbol is the constant ``key``."""
+    import torch
+
+    matches = [
+        info.block_id
+        for info in ctx.env.block_sizes
+        if isinstance(info.var, torch.SymInt)
+        and str(info.var.node.expr) == key
+        and info.block_id in ctx.block_id_to_bounds
+    ]
+    return matches[0] if len(matches) == 1 else None

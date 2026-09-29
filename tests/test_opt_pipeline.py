@@ -78,6 +78,23 @@ def opt_row_max_kernel(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     backend="mlir",
     static_shapes=True,
+    config=helion.Config(block_sizes=[1, 32, 32, 32]),
+)
+def opt_ragged_k_bmm_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    batch, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([batch, m, n], dtype=x.dtype, device=x.device)
+    for tb, tm, tn in hl.tile([batch, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.baddbmm(acc, x[tb, tm, tk], y[tb, tk, tn])
+        out[tb, tm, tn] = acc
+    return out
+
+
+@helion.kernel(
+    backend="mlir",
+    static_shapes=True,
     config=helion.Config(block_sizes=[32, 128, 128]),
 )
 def opt_online_softmax_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -106,6 +123,7 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
     batch_a, batch_b = torch.randn(2, 64, 96), torch.randn(2, 96, 128)
     layer = torch.nn.Linear(192, 160)
     rows, ragged_rows = torch.randn(64, 1024), torch.randn(64, 1000)
+    ragged_a, ragged_b = torch.randn(2, 32, 40), torch.randn(2, 40, 32)
     return {
         "matmul": (lambda: cpu.matmul(a, b), lambda: a @ b),
         "matmul_bias_relu": (
@@ -137,6 +155,11 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
             lambda: opt_online_softmax_kernel(ragged_rows),
             lambda: ragged_rows.softmax(-1),
         ),
+        # Padded batch_matmul operands take the scalar pipeline (opt miscompiles them).
+        "ragged_k_bmm": (
+            lambda: opt_ragged_k_bmm_kernel(ragged_a, ragged_b),
+            lambda: ragged_a @ ragged_b,
+        ),
     }
 
 
@@ -153,6 +176,7 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
         "row_sum_loop",
         "row_max_ragged",
         "online_softmax",
+        "ragged_k_bmm",
     ],
 )
 def test_optimizing_pipeline_f32(case: str) -> None:

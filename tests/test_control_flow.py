@@ -93,6 +93,20 @@ def while_doubling_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@_kernel(8)
+def while_invariant_step_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile in hl.tile(x.size(0)):
+        v = x[tile]
+        step = y[tile]
+        total = v.sum()
+        while total < 100.0:
+            v = v + step
+            total = v.sum()
+        out[tile] = v
+    return out
+
+
 def _if_value_reference(x: torch.Tensor) -> torch.Tensor:
     out = x.clone()
     out[8:24] *= 2.0
@@ -161,3 +175,20 @@ def test_data_dependent_while() -> None:
 
     torch.manual_seed(0)
     check_kernel(while_doubling_kernel, reference, [torch.rand(24) + 0.1])
+
+
+def test_while_with_invariant_input() -> None:
+    def reference(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        chunks = []
+        for v, step in zip(x.split(8), y.split(8), strict=True):
+            while v.sum() < 100.0:
+                v = v + step
+            chunks.append(v)
+        return torch.cat(chunks)
+
+    torch.manual_seed(0)
+    check_kernel(
+        while_invariant_step_kernel,
+        reference,
+        [torch.rand(24) + 0.1, torch.rand(24) + 0.5],
+    )

@@ -56,6 +56,8 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
   - `BuildContext.geometry`: `KernelGeometry` (block sizes, spans, loop bounds)
   - `BuildContext.block_id_to_iv`: Maps block IDs to the current tile offset
   - `BuildContext.param_to_value`: Maps parameters to function arguments
+  - `BuildContext.sizes`: static or `index` values of sizes (`sizes.py`, see
+    Runtime sizes)
   - `BuildContext.effects` / `BuildContext.tensors`: host tensors each graph
     loads/stores (`analysis/tensor_effects.py`) and the current SSA value of every
     written host tensor (`lowering/tensor_state.py`). A store is an `insert_slice`
@@ -80,8 +82,13 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 - `registry.py`: `@lowers(target)` dispatch keyed by target identity (Helion API
   functions, ATen `OpOverload`s, or an `OpOverloadPacket` with an overload filter);
   each node is lowered inside its `meta["location"]` so errors name the kernel line
-- `control_flow.py`: outer `scf.forall`, nested `scf.for`, `scf.if` for `_if`
-  and `scf.while` for `_while_loop`, each carrying the tensors its body writes
+- `loops.py`: one `scf.forall` (or sequential `scf.for` nest) per root graph and
+  one `scf.for` per block id of a nested `_for_loop`, carrying the variables the
+  body assigns and the tensors it writes
+- `control_flow.py`: `scf.if` for `_if` and `scf.while` for `_while_loop`, each
+  carrying the tensors its body writes; `_phi`/`_new_var`; the subgraph and
+  loop-carried value helpers shared with `loops.py` (loop outputs are matched
+  to their variables through `_phi(before, getitem(loop, i))`)
 - `scalar_ops.py`: arithmetic, comparisons and `_and`/`_or`/`_not` of scalar
   (`SymInt`) values, e.g. `if` conditions
 - `combine_ops.py`: `hl.reduce` and `hl.associative_scan`/`torch.cumsum` with a
@@ -283,7 +290,8 @@ keep static sizes.
 #### Runtime sizes
 
 With `static_shapes=False`, a size with free symbols after substituting the
-config's block sizes is `?` in the types. `BuildContext.size(expr)` turns it into
+config's block sizes is `?` in the types. `ctx.sizes.value(expr)` (`mlir/sizes.py`)
+turns it into
 an `index` value: a size symbol is `tensor.dim` of the first host tensor
 argument with that size, or the runtime scalar that carries it; compound
 expressions (`s0 // 2`) are `index` arithmetic. The values are emitted at the

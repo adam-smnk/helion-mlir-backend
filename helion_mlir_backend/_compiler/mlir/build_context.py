@@ -5,19 +5,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
-from functools import reduce
 from typing import TYPE_CHECKING
 
 import helion.language._tracing_ops as tracing_ops
 from mlir.dialects import arith as arith_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
-import sympy
-import torch
-import torch.fx
-from torch.utils._sympy import functions as sympy_functions
 
 from .lowering.tensor_state import TensorState
+from .sizes import Sizes
 from .support import DynamicShapeError
 from .support import block_id_from_key
 from .support.index_meta import resolve_index_descriptor
@@ -29,6 +25,7 @@ if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
     from helion.runtime.config import Config
+    import torch.fx
 
     from .analysis.contractions import ContractionPlan
     from .analysis.geometry import KernelGeometry
@@ -50,7 +47,7 @@ class BuildContext:
 
     geometry: KernelGeometry | None = None
 
-    # Written directly once per outer grid block id (control_flow._bind_grid_iv) then
+    # Written directly once per outer grid block id (loops._bind_grid_iv) then
     # save/restored per nested scf.for level via enter_for_loop(); read
     # everywhere a block id's current induction variable is needed. The value is
     # the tile's absolute offset (``begin + trip * step``).
@@ -75,14 +72,10 @@ class BuildContext:
     aten_helpers: AtenHelperTable | None = None
     contractions: ContractionPlan | None = None
     lower_node_callback: Callable[[torch.fx.Node], ir.Value | None] | None = None
+    sizes: Sizes = field(init=False)
 
-    # Size values of the current function by expression (see ``size``).
-    size_values: dict[sympy.Expr, ir.Value] = field(default_factory=dict)
-    _size_block: ir.Block | None = None
-    _size_setup: int = 0
-    _size_anchor: ir.Operation | None = None
-    _block_symbols: dict | None = None
-    _ref_sizes: dict[str, list[sympy.Expr]] = field(default_factory=dict)
+    def __post_init__(self) -> None:
+        self.sizes = Sizes(self)
 
     def get_value(self, node_or_value: object) -> ir.Value | None:
         """Look up an MLIR value for an FX node or scalar literal."""
@@ -148,13 +141,13 @@ class BuildContext:
                 shape.append(shape_node)
                 continue
             if isinstance(shape_node, torch.SymInt):
-                shape.append(self.size(shape_node))
+                shape.append(self.sizes.value(shape_node))
                 continue
             if isinstance(shape_node, torch.fx.Node):
                 if shape_node.target is tracing_ops._get_symnode:
                     block_id = block_id_from_key(shape_node.args[0])
                     if block_id is not None and block_id in self.geometry.blocks:
-                        shape.append(self.tile_size(block_id))
+                        shape.append(self.sizes.tile(block_id))
                         continue
                 value = self.get_value(shape_node)
                 owner = value.owner if value is not None else None
@@ -163,152 +156,12 @@ class BuildContext:
                     continue
                 meta = shape_node.meta.get("val")
                 if isinstance(meta, torch.SymInt):
-                    shape.append(self.size(meta))
+                    shape.append(self.sizes.value(meta))
                     continue
             raise DynamicShapeError(
                 shape_nodes, symbol_name=f"{shape_node} in {operation_name}"
             )
         return shape
-
-    def tile_size(self, block_id: int) -> int | ir.Value:
-        """The static tile extent of ``block_id``, or the runtime span of a whole tile."""
-        block = self.geometry.block(block_id)
-        return self.size(block.span_expr) if block.whole else block.tile_extent
-
-    # ------------------------------------------------------------------
-    # Sizes
-    # ------------------------------------------------------------------
-
-    def begin_function(self, block: ir.Block) -> None:
-        """Size values of the function with entry ``block`` go after its current ops."""
-        self.size_values.clear()
-        self._size_block = block
-        self._size_setup = len(block.operations)
-        self._size_anchor = None
-
-    def size_expr(self, value: object) -> sympy.Expr:
-        """``value`` (int, ``SymInt`` or expression) over size symbols only: the
-        shape env's replacements applied and block sizes substituted."""
-        if isinstance(value, torch.SymInt):
-            value = value.node.expr
-        expr = self.env.shape_env.replace(sympy.sympify(value))
-        return expr.xreplace(self._block_size_symbols())
-
-    def size(self, value: object) -> int | ir.Value:
-        """A size as a static int or an ``index`` value, never its example value.
-
-        A size symbol is ``tensor.dim`` of the first host tensor argument with
-        that size, else the runtime scalar that carries it; compound expressions
-        are ``index`` arithmetic. Values are emitted at the start of the current
-        function (so they dominate every use) and shared by equal expressions.
-        """
-        expr = self.size_expr(value)
-        if not expr.free_symbols:
-            return int(expr)
-        return self._size_value(expr)
-
-    def ref_sizes(self, name: str) -> list[sympy.Expr]:
-        """The size expressions of host tensor ``name``'s dims."""
-        if name not in self._ref_sizes:
-            fake = self.signature.refs[name].fake
-            self._ref_sizes[name] = [self.size_expr(size) for size in fake.shape]
-        return self._ref_sizes[name]
-
-    def extent(
-        self, value: ir.Value, dim: int, name: str | None = None
-    ) -> int | ir.Value:
-        """Size of ``value``'s dimension ``dim``. For the full extent of host tensor
-        ``name`` it comes from :meth:`size`, so equal sizes are the same value."""
-        size = ir.RankedTensorType(value.type).shape[dim]
-        if not ir.ShapedType.is_dynamic_size(size):
-            return size
-        if name is not None and name in self.signature.refs:
-            return self.size(self.ref_sizes(name)[dim])
-        return tensor_d.DimOp(value, self.index_const(dim)).result
-
-    def _block_size_symbols(self) -> dict:
-        if self._block_symbols is None:
-            replace = self.env.shape_env.replace
-            self._block_symbols = {
-                info.var.node.expr: replace(block.span_expr)
-                if block.whole
-                else sympy.Integer(block.block_size)
-                for info in self.env.block_sizes
-                if (block := self.geometry.blocks.get(info.block_id)) is not None
-                and isinstance(info.var, torch.SymInt)
-            }
-        return self._block_symbols
-
-    def _size_value(self, expr: sympy.Expr) -> ir.Value:
-        value = self.size_values.get(expr)
-        if value is None:
-            with self._size_insertion_point():
-                value = self._emit_size(expr)
-            self.size_values[expr] = value
-            if self._size_anchor is None:
-                self._size_setup = len(self._size_block.operations)
-        return value
-
-    def _size_insertion_point(self) -> ir.InsertionPoint:
-        if self._size_anchor is None:
-            operations = list(self._size_block.operations)
-            if len(operations) == self._size_setup:
-                return ir.InsertionPoint(self._size_block)
-            self._size_anchor = operations[self._size_setup]
-        return ir.InsertionPoint(self._size_anchor)
-
-    def _emit_size(self, expr: sympy.Expr) -> ir.Value:
-        source = self._size_source(expr)
-        if source is not None:
-            return source
-        operands = [
-            self.index_const(int(arg)) if arg.is_Integer else self._size_value(arg)
-            for arg in expr.args
-        ]
-        combine = None
-        if isinstance(expr, sympy.Add):
-            combine = arith_d.addi
-        elif isinstance(expr, sympy.Mul):
-            combine = arith_d.muli
-        elif isinstance(expr, (sympy.Max, sympy_functions.Max)):
-            combine = arith_d.maxsi
-        elif isinstance(expr, (sympy.Min, sympy_functions.Min)):
-            combine = arith_d.minsi
-        elif isinstance(expr, sympy_functions.FloorDiv):
-            combine = arith_d.floordivsi
-        elif isinstance(expr, (sympy_functions.Mod, sympy_functions.PythonMod)):
-            combine = arith_d.remsi
-        if combine is None or not operands:
-            raise DynamicShapeError(expr, symbol_name=self._describe(expr))
-        return reduce(combine, operands)
-
-    def _size_source(self, expr: sympy.Expr) -> ir.Value | None:
-        for name in self.signature.refs:
-            value = self.param_to_value.get(name)
-            if value is None:
-                continue
-            for dim, size in enumerate(self.ref_sizes(name)):
-                if size == expr:
-                    return tensor_d.DimOp(value, self.index_const(dim)).result
-        for key, scalar in self.signature.scalars.items():
-            if (
-                key in self.scalars
-                and scalar.expr is not None
-                and self.size_expr(scalar.expr) == expr
-            ):
-                return self.cast_to_index(self.scalars[key])
-        return None
-
-    def _describe(self, expr: sympy.Expr) -> str:
-        origins = {
-            str(symbol): origin.origin
-            for symbol in expr.free_symbols
-            if (origin := self.host_function.expr_to_origin.get(symbol)) is not None
-        }
-        return (
-            f"size {expr} (origins {origins}), which no host tensor argument or "
-            "runtime scalar of this function provides"
-        )
 
     def symbol_info(self, value: object) -> tuple[int, str] | None:
         """Resolve a SymInt to ``(block_id, kind)`` using Helion symbol origins."""
@@ -359,7 +212,6 @@ class BuildContext:
         self.block_id_to_trip_iv.clear()
         self.tensors.clear()
         self.scalars.clear()
-        self.size_values.clear()
 
     def bind_loop(
         self,
@@ -391,7 +243,7 @@ class BuildContext:
         size = self.geometry.tile_extent(block_id)
         d0, d1 = ir.AffineDimExpr.get(0), ir.AffineDimExpr.get(1)
         if isinstance(begin, int) and isinstance(end, int):
-            if (end - begin) % size == 0:
+            if end <= begin or (end - begin) % size == 0:
                 return None
             if end - begin < size:
                 return end - begin

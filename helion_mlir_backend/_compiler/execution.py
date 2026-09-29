@@ -115,6 +115,11 @@ def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:
     for arg_type, attrs in zip(arg_types, ir.ArrayAttr(arg_attrs), strict=True):
         attrs = ir.DictAttr(attrs)
         memref = ir.MemRefType(arg_type)
+        dtype = mlir_dtype_to_torch(str(memref.element_type))
+        if dtype is None:
+            raise ValueError(
+                f"'{entry}' takes a memref of unsupported {memref.element_type}"
+            )
         args.append(
             EntryArg(
                 ir.StringAttr(attrs["helion.name"]).value,
@@ -126,7 +131,7 @@ def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:
                     -1 if ir.ShapedType.is_dynamic_size(size) else size
                     for size in memref.shape
                 ),
-                mlir_dtype_to_torch(str(memref.element_type)),
+                dtype,
             )
         )
     return tuple(args)
@@ -161,11 +166,8 @@ def _compile_entry(
     with _stage("inlining"):
         inline_module(module)
     _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
-    if pipeline == "opt" and (op := _dynamic_linalg_op(module)) is not None:
-        # The opt pipeline vectorizes without vector sizes (plan I32).
-        log.debug(
-            "'%s' uses the scalar pipeline: %s has runtime-sized operands", entry, op
-        )
+    if pipeline == "opt" and (reason := _opt_pipeline_blocker(module)) is not None:
+        log.debug("'%s' uses the scalar pipeline: %s", entry, reason)
         pipeline = "scalar"
     descriptor = pipeline_descriptor(pipeline)
     with (
@@ -191,19 +193,30 @@ def _stage(what: str) -> Iterator[None]:
         raise
 
 
-def _dynamic_linalg_op(module: ir.Module) -> str | None:
-    """The name of the first linalg op with a runtime-sized tensor operand or result."""
+def _opt_pipeline_blocker(module: ir.Module) -> str | None:
+    """Why the opt pipeline cannot compile ``module`` correctly, if it cannot.
+
+    It vectorizes without vector sizes, so it cannot handle runtime-sized linalg
+    operands (plan I32), and it miscompiles a ``linalg.batch_matmul`` of padded
+    tiles (``scripts/lighthouse_padded_batch_matmul_repro.py``).
+    """
     found: list[str] = []
 
     def visit(op: ir.Operation) -> ir.WalkResult:
-        if op.name.startswith("linalg.") and any(
+        if not op.name.startswith("linalg."):
+            return ir.WalkResult.ADVANCE
+        if any(
             isinstance(value.type, ir.RankedTensorType)
             and not ir.RankedTensorType(value.type).has_static_shape
             for value in [*op.operands, *op.results]
         ):
-            found.append(op.name)
-            return ir.WalkResult.INTERRUPT
-        return ir.WalkResult.ADVANCE
+            found.append(f"{op.name} has runtime-sized operands")
+        elif op.name == "linalg.batch_matmul" and any(
+            isinstance(value.owner, ir.OpView) and value.owner.name == "tensor.pad"
+            for value in op.operands
+        ):
+            found.append(f"{op.name} has padded operands")
+        return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
 
     module.operation.walk(visit)
     return found[0] if found else None

@@ -1,5 +1,4 @@
-"""Static views and reshapes without an ATen helper round-trip (keeps shapes
-static), and ``hl.split``/``hl.join``."""
+"""Views and reshapes without an ATen helper round-trip, and ``hl.split``/``hl.join``."""
 
 from __future__ import annotations
 
@@ -15,20 +14,44 @@ from .registry import NOT_APPLICABLE
 from .registry import lowers
 
 if TYPE_CHECKING:
+    import sympy
+
     from ..build_context import BuildContext
 
 aten = torch.ops.aten
 
 
 @lowers(aten.view.default, aten.reshape.default)
-def lower_static_reshape(ctx: BuildContext, node: torch.fx.Node) -> object:
+def lower_view(ctx: BuildContext, node: torch.fx.Node) -> object:
+    reshaped = view(ctx, node)
+    return NOT_APPLICABLE if reshaped is None else reshaped
+
+
+def view(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
+    """``node``'s view or reshape of its first argument without a helper, else ``None``.
+
+    With runtime (``?``) dims only unit dims may be added or removed, and since
+    ``?`` types cannot tell sizes apart, the other dims' size symbols must match.
+    """
     from ..aten_bridge import infer_results
     from ..aten_bridge.helpers import static_dim
 
-    value = ctx.get_value(node.args[0])
+    source = node.args[0]
+    value = ctx.get_value(source)
     (result,) = infer_results(ctx, node)
-    reshaped = static_reshape(value, [static_dim(dim) for dim in result.shape])
-    return NOT_APPLICABLE if reshaped is None else reshaped
+    shape = [static_dim(dim) for dim in result.shape]
+    dynamic = any(
+        ir.ShapedType.is_dynamic_size(dim)
+        for dim in [*ir.RankedTensorType(value.type).shape, *shape]
+    )
+    if dynamic and _non_unit_sizes(ctx, source) != _non_unit_sizes(ctx, node):
+        return None
+    return reshape(value, shape)
+
+
+def _non_unit_sizes(ctx: BuildContext, node: torch.fx.Node) -> list[sympy.Expr]:
+    sizes = (ctx.sizes.expr(size) for size in node.meta["val"].shape)
+    return [size for size in sizes if size != 1]
 
 
 @lowers(helion_view_ops.split)
@@ -74,12 +97,13 @@ def put(
     sizes[dim] = 1
     shape[dim] = 1
     # Not rank-reducing: that trips an MLIR assertion (areEquivalentSlices) in the opt pipeline.
-    return emit.insert_slice(static_reshape(item, shape), dest, offsets, sizes)
+    return emit.insert_slice(reshape(item, shape), dest, offsets, sizes)
 
 
-def static_reshape(value: ir.Value, result_shape: list[int]) -> ir.Value | None:
+def reshape(value: ir.Value, result_shape: list[int]) -> ir.Value | None:
     """``value`` reshaped without a helper, else ``None``: a ``tensor.reshape`` for
-    static shapes; with runtime (``?``) dims, only unit dims may be added or removed."""
+    static shapes; with runtime (``?``) dims, only unit dims may be added or
+    removed, and the other dims keep their sizes (the caller knows they do)."""
     source_type = ir.RankedTensorType(value.type)
     if list(source_type.shape) == list(result_shape):
         return value
@@ -135,17 +159,9 @@ def _unit_dim_reshape(value: ir.Value, result_shape: list[int]) -> ir.Value | No
 
 
 def _unit_groups(shape: list[int]) -> list[list[int]]:
-    """Reassociation of ``shape`` onto its non-unit dims: each unit dim joins the
-    next non-unit dim, or the previous one at the end (none if all are unit)."""
-    kept = [dim for dim, size in enumerate(shape) if size != 1]
-    if not kept:
-        return []
-    groups: dict[int, list[int]] = {dim: [dim] for dim in kept}
-    for dim, size in enumerate(shape):
-        if size == 1:
-            target = next((k for k in kept if k > dim), kept[-1])
-            groups[target].append(dim)
-    return [sorted(groups[dim]) for dim in kept]
+    return emit.reassociation(
+        len(shape), [dim for dim, size in enumerate(shape) if size == 1]
+    )
 
 
 def _numel(shape: object) -> int:

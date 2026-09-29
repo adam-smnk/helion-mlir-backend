@@ -25,7 +25,7 @@ from . import emit
 from .control_flow import lower_subgraph
 from .registry import lowers
 from .view_ops import put
-from .view_ops import static_reshape
+from .view_ops import reshape
 from .view_ops import take
 
 if TYPE_CHECKING:
@@ -71,7 +71,7 @@ def lower_reduce(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if keep_dims:
         shape = list(ir.RankedTensorType(value.type).shape)
         shape[dim] = 1
-        result = static_reshape(result, shape)
+        result = reshape(result, shape)
     return result
 
 

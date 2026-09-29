@@ -109,13 +109,8 @@ def test_rank_mismatch_broadcast_add():
 def test_multi_output_kernel_within_one_phase():
     """A kernel returning two tensors, both written by the same hl.tile() loop.
 
-    Regression test for the multi-output generalization: `OutputTensorResolver`
-    now returns every distinct non-input store target (`resolve_all`) instead
-    of raising for 2+, `codegen._build_function`/`control_flow.build_kernel_body`
-    build one MLIR result per output tensor and route each store's
-    `tensor.parallel_insert_slice` to the matching `shared_outs` entry by
-    destination-tensor identity. Single-output kernels are unaffected (the
-    routing is skipped entirely when there is only one output).
+    Every tensor a loop writes is threaded through it as an SSA value and
+    returned from the phase function (`lowering/loops.py`).
     """
 
     @helion.kernel(static_shapes=True)

@@ -7,32 +7,21 @@ from __future__ import annotations
 
 from . import combine_ops as combine_ops
 from . import contraction_ops as contraction_ops
+from . import control_flow as control_flow
 from . import elementwise_ops as elementwise_ops
+from . import host_tensor_ops as host_tensor_ops
+from . import load_slice_ops as load_slice_ops
+from . import loops as loops
+from . import memory_ops as memory_ops
+from . import method_ops as method_ops
 from . import scalar_ops as scalar_ops
+from . import subscript_ops as subscript_ops
+from . import tensor_creation_ops as tensor_creation_ops
+from . import tile_index_ops as tile_index_ops
+from . import transpose_ops as transpose_ops
 from . import unsupported_ops as unsupported_ops
 from . import view_ops as view_ops
-from .control_flow import build_phase_body
-from .control_flow import lower_nested_for_loop
-from .host_tensor_ops import lower_host_tensor
-from .load_slice_ops import lower_load
-from .memory_ops import lower_store
+from .loops import build_phase_body
 from .registry import lower_node
-from .subscript_ops import lower_subscript
-from .tensor_creation_ops import lower_full
-from .tile_index_ops import lower_tile_index
-from .tile_index_ops import scalar_tile_value
-from .transpose_ops import lower_transpose
 
-__all__ = [
-    "build_phase_body",
-    "lower_full",
-    "lower_host_tensor",
-    "lower_load",
-    "lower_nested_for_loop",
-    "lower_node",
-    "lower_store",
-    "lower_subscript",
-    "lower_tile_index",
-    "lower_transpose",
-    "scalar_tile_value",
-]
+__all__ = ["build_phase_body", "lower_node"]

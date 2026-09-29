@@ -41,7 +41,13 @@ def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         if block_id not in ctx.geometry.blocks:
             raise ValueNotFoundError(node, context=f"unknown block key: {key!r}")
         # The tile's size, as in every shape built from this symbol.
-        return ctx.as_index(ctx.tile_size(block_id))
+        return ctx.as_index(ctx.sizes.tile(block_id))
+    value = node.meta.get("val")
+    if isinstance(value, torch.SymInt) and not value.node.expr.free_symbols:
+        value = int(value.node.expr)
+    if isinstance(value, int):
+        # A symbol Helion specialized to a constant.
+        return ctx.index_const(value)
     # ``hl.grid`` and tile position symbols have no ``block_size_`` key; they resolve
     # to a scalar index through their Helion symbol origin.
     info = ctx.node_symbol_info(node)
@@ -138,7 +144,7 @@ def scalar_tile_value(ctx: BuildContext, block_id: int, kind: str) -> ir.Value |
         return offset
 
     if kind == "tile_end":
-        valid = ctx.block_id_to_valid.get(block_id, ctx.tile_size(block_id))
+        valid = ctx.block_id_to_valid.get(block_id, ctx.sizes.tile(block_id))
         return arith_d.AddIOp(offset, ctx.as_index(valid)).result
 
     if kind == "tile_id":

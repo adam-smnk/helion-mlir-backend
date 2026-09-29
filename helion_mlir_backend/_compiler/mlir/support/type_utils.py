@@ -5,8 +5,6 @@ from __future__ import annotations
 import mlir.ir as ir
 import torch
 
-# Mapping from torch dtype to MLIR type factory lambda (called inside an
-# ir.Context).
 _DTYPE_TO_MLIR: dict[torch.dtype, str] = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",
@@ -24,9 +22,9 @@ _MLIR_TO_DTYPE: dict[str, torch.dtype] = {
 }
 
 
-def mlir_dtype_to_torch(name: str, default: torch.dtype = torch.float32) -> torch.dtype:
-    """Convert an MLIR scalar type name to a PyTorch dtype."""
-    return _MLIR_TO_DTYPE.get(name, default)
+def mlir_dtype_to_torch(name: str) -> torch.dtype | None:
+    """The PyTorch dtype of an MLIR scalar type name, if it has one."""
+    return _MLIR_TO_DTYPE.get(name)
 
 
 def torch_dtype_to_mlir(dtype: torch.dtype) -> ir.Type:
@@ -46,25 +44,4 @@ def torch_dtype_to_mlir(dtype: torch.dtype) -> ir.Type:
             else "no MLIR element type mapping"
         )
         raise UnsupportedOperationError(f"dtype {dtype}", reason=reason)
-
-    # Use ir.Type.parse for simple construction without individual factory calls.
     return ir.Type.parse(name)
-
-
-def torch_tensor_to_mlir_type(fake_tensor: torch.Tensor) -> ir.Type:
-    """Convert a fake/concrete :class:`torch.Tensor` to an MLIR RankedTensorType.
-
-    Dynamic dimensions (``torch.SymInt``) are mapped to ``?`` (dynamic extent).
-    Concrete integer dimensions are used as-is.
-
-    Must be called while an ``mlir.ir.Context`` is active.
-    """
-
-    elem_ty = torch_dtype_to_mlir(fake_tensor.dtype)
-    shape: list[int] = []
-    for dim in fake_tensor.shape:
-        if isinstance(dim, torch.SymInt):
-            shape.append(ir.ShapedType.get_dynamic_size())
-        else:
-            shape.append(int(dim))
-    return ir.RankedTensorType.get(shape, elem_ty)

@@ -29,9 +29,10 @@ Current behavior:
 - Runtime sizes the kernel assumes equal (one symbol) or computes (`n // 2`) are
   checked on each call.
 - The optimizing pipeline is only used when every linalg op of the inlined module
-  is statically shaped (a tiled matmul); otherwise the kernel falls back to the
-  scalar pipeline (debug log). Lighthouse vectorizes without vector sizes, so it
-  cannot vectorize ops on runtime-sized tiles.
+  is statically shaped (a tiled matmul) and no `linalg.batch_matmul` has padded
+  operands (section 14); otherwise the kernel falls back to the scalar pipeline
+  (debug log). Lighthouse vectorizes without vector sizes, so it cannot vectorize
+  ops on runtime-sized tiles.
 - A size no host tensor argument or runtime scalar provides raises a
   `DynamicShapeError`.
 - `execute_mlir` (no host code) cannot create host tensors of runtime shape.
@@ -72,6 +73,12 @@ Examples validated in current tests include:
   index tensor into a 1-D tensor. Stores indexed by a tensor (scatter) are
   rejected.
 
+Write a cumulative sum as `torch.cumsum(x, dim)` (Helion replaces it with
+`hl.cumsum`). The method form `x.cumsum(dim)` reaches Inductor's CPU lowering
+inside Helion's frontend, which fails before the backend runs
+(`InductorLoweringError: 'NullHandler' object does not support the context
+manager protocol`).
+
 ### `torch.einsum`
 
 A two-operand einsum is captured before PyTorch's dispatcher decomposes it and
@@ -99,18 +106,15 @@ decomposes to `aten.diagonal`, which Helion's shared lowering pass rejects.
 Reduction-free equations (`"ij,ij->ij"`, `"m,n->mn"`) are excluded from the
 direct path on purpose so they keep their elementwise lowering.
 
-## 5) Nested Reduction Semantics Are Sensitive
+## 5) Loop-Carried Values
 
-Known constraint:
-- In nested `scf.forall` + `scf.for` reductions, loop-carried accumulator semantics are strict.
-
-Current backend behavior:
-- Custom lowerings are used for common accumulation forms to preserve iter-arg/yield equivalence:
-  - `aten.addmm` accumulation form.
-  - `acc + matmul(...)` accumulation form.
-
-Consequence:
-- Equivalent high-level math can succeed or fail depending on the lowered intermediate form.
+Every variable a nested loop (or `while`) assigns is carried through its `scf.for`
+(`scf.while`), matched to the variable through Helion's `_phi(before, getitem(loop, i))`;
+loop inputs that are only read (e.g. a tile loaded before the loop) are not carried. Any
+update form works (`acc + x`, `torch.maximum(acc, x)`, `addmm`/`baddbmm`, several
+carried values as in online softmax or attention). Lighthouse bufferizes carried values
+with `allow-return-allocs-from-loops` (section 15), and `in_place.py` rewrites common
+updates to write into the carried buffer.
 
 ## 6) Result Shapes Come From the Lowered Operands
 
@@ -272,6 +276,15 @@ Workaround until lighthouse is fixed: use block sizes of at least 32 for kernels
 through the optimizing pipeline. The scalar pipeline is unaffected. The autotuner does this
 itself: a search under the optimizing pipeline only tries tiles of at least 32 (where the
 dimension allows); given configs are not changed.
+
+With tiles of at least 32, lighthouse's transforms still reject (a Python `ValueError`:
+"Failed to apply named transform sequence", or "mixed static/dynamic
+offset/sizes/strides requires explicit result type" from `move_offsets_to_subview`)
+many ops over tiles larger than their dimension, over ragged tiles, and over full
+slices whose extent is not a multiple of 32 (a 33x65 softmax row, a 64x40 layer norm).
+A `linalg.batch_matmul` of padded (ragged) tiles is miscompiled to NaNs
+(`scripts/lighthouse_padded_batch_matmul_repro.py`), so a module with one takes the
+scalar pipeline instead, as a module with runtime-sized linalg operands does.
 
 ## 15) Lighthouse Pipeline Deviations
 

@@ -11,7 +11,7 @@ Nested loops carry their own bounds on the ``_for_loop(graph_id, begin, end, arg
 ``_for_loop_step(..., step)`` node, and their block ids on ``ForLoopGraphInfo.block_ids``.
 
 Sizes are never specialized to their example values: a span or bound with free
-symbols stays an expression (``BuildContext.size`` resolves it at run time).
+symbols stays an expression (``mlir/sizes.py`` resolves it at run time).
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@ from ..support import UnsupportedOperationError
 from ..support import torch_dtype_to_mlir
 from . import emit
 from .transpose_ops import lower_transpose
-from .view_ops import static_reshape
+from .view_ops import view
 
 if TYPE_CHECKING:
     import mlir.ir as ir
@@ -44,14 +44,11 @@ def lower_call_method(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     if method in ("t", "permute", "transpose"):
         return lower_transpose(ctx, node)
     if method in ("view", "reshape"):
-        from ..aten_bridge import infer_results
-
-        (result,) = infer_results(ctx, node)
-        reshaped = static_reshape(base, [int(dim) for dim in result.shape])
+        reshaped = view(ctx, node)
         if reshaped is None:
             raise UnsupportedOperationError(
                 f"Tensor.{method}",
-                reason="only statically shaped view/reshape operations are supported",
+                reason="only static shapes, or adding or removing unit dims, are supported",
             )
         return reshaped
     raise UnsupportedOperationError(f"Tensor.{method}", reason="method not lowered")

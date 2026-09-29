@@ -69,37 +69,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_shared_mlir_context: ir.Context | None = None
-_context_construction_count = 0
 
-
+@functools.cache
 def _get_shared_mlir_context() -> ir.Context:
-    """Return a process-wide ``mlir.ir.Context``, created lazily on first use.
+    """The process-wide ``mlir.ir.Context``, created on first use.
 
-    Constructing a fresh ``ir.Context()`` per compile is unsafe: the native
-    bindings spawn a background thread pool and load every dialect on each
-    construction, and repeated create/destroy cycles across kernel compiles
-    (e.g. one process compiling many configs) have been observed to segfault
-    when a still-shutting-down context's threads race with a newly
-    constructed one. MLIR contexts are designed to host many independent
-    modules, so reusing a single one for the process avoids the race.
+    Creating and destroying contexts per compile races their background thread
+    pools and has segfaulted; one context hosts every module instead.
     """
-    global _shared_mlir_context, _context_construction_count
-    if _shared_mlir_context is None:
-        _context_construction_count += 1
-        if _context_construction_count > 1:
-            # A second construction means _shared_mlir_context was reset to
-            # None by something other than this function -- exactly the
-            # crash pattern this cache exists to prevent (see docstring).
-            raise RuntimeError(
-                "The process-wide shared mlir.ir.Context was reconstructed. "
-                "This previously caused segfaults from racing background "
-                "thread pools across kernel compiles. Route all MLIR context "
-                "access through _get_shared_mlir_context() and never "
-                "construct ir.Context() directly."
-            )
-        _shared_mlir_context = ir.Context()
-    return _shared_mlir_context
+    return ir.Context()
 
 
 class MLIRModuleBuilder:
@@ -180,7 +158,7 @@ class MLIRModuleBuilder:
             ctx.param_to_value.update(zip(refs, args[: len(refs)], strict=True))
             for key, arg in zip(phase.scalars, args[len(refs) :], strict=True):
                 ctx.scalars[key] = tensor_d.ExtractOp(arg, []).result
-            ctx.begin_function(entry)
+            ctx.sizes.begin_function(entry)
             results = build_phase_body(ctx, list(phase.root_positions), phase.inouts)
             func_d.ReturnOp(results)
         return fn
@@ -237,7 +215,7 @@ class MLIRModuleBuilder:
         fake = self.context.signature.refs[name].fake
         shape = [
             ir.ShapedType.get_dynamic_size() if size.free_symbols else int(size)
-            for size in self.context.ref_sizes(name)
+            for size in self.context.sizes.ref(name)
         ]
         return ir.RankedTensorType.get(shape, torch_dtype_to_mlir(fake.dtype))
 

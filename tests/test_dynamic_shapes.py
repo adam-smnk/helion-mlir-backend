@@ -218,6 +218,25 @@ def transpose_rows(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@_kernel(1)
+def swap_sizes_view(x: torch.Tensor) -> torch.Tensor:
+    b, m, n = x.size()
+    out = torch.empty([b, n, m], dtype=x.dtype, device=x.device)
+    for tb in hl.tile(b):
+        v = x[tb, :, :]
+        out[tb, :, :] = v.reshape([v.size(0), v.size(2), v.size(1)])
+    return out
+
+
+@_kernel(8)
+def last_column(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        out[tm] = x[tm, n - 1]
+    return out
+
+
 def _matmul_inputs() -> list[list[torch.Tensor]]:
     shapes = [((64, 64), (64, 64)), ((70, 100), (100, 50)), ((33, 129), (129, 65))]
     return [[torch.randn(*a), torch.randn(*b)] for a, b in shapes]
@@ -290,6 +309,12 @@ def test_matmul_host_tensors_are_dynamic() -> None:
             [[(40, 20), (20, 70)], [(9, 5), (5, 33)]],
         ),
         (transpose_rows, lambda x: x.t(), [[(40, 20)], [(70, 33)]]),
+        (
+            swap_sizes_view,
+            lambda x: x.reshape(x.size(0), x.size(2), x.size(1)),
+            [[(2, 3, 5)], [(3, 4, 6)]],
+        ),
+        (last_column, lambda x: x[:, x.size(1) - 1], [[(13, 17)], [(9, 5)]]),
     ],
     ids=[
         "add_1d",
@@ -306,6 +331,8 @@ def test_matmul_host_tensors_are_dynamic() -> None:
         "matmul_full_k",
         "matmul_runtime_rows",
         "transpose",
+        "swap_sizes_view",
+        "runtime_index",
     ],
 )
 def test_dynamic_kernel(kernel: object, reference, shapes: list) -> None:

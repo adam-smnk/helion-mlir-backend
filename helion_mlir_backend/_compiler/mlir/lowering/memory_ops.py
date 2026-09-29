@@ -21,7 +21,7 @@ from .load_slice_ops import load_tile
 from .registry import lowers
 from .slice_plan import SlicePlan
 from .slice_plan import plan_slice
-from .view_ops import static_reshape
+from .view_ops import reshape
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
@@ -49,6 +49,9 @@ def lower_mask_to(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     """
     source, other = node.args
     value = ctx.get_value(source)
+    if value is None:
+        # A mask of an Inductor-internal buffer (``_inductor_lowering_extra``).
+        return None
     bounds = {}
     for dim, size in enumerate(source.meta["val"].shape):
         block_id = ctx.env.resolve_block_id(size)
@@ -96,7 +99,7 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
         return
     value = _store_value(value, element_type, plan)
     if extra_mask is not None or plan.is_partial():
-        value = static_reshape(value, plan.value_shape())
+        value = reshape(value, plan.value_shape())
     if extra_mask is not None:
         current = load_tile(state, plan)
         value = call_helper(

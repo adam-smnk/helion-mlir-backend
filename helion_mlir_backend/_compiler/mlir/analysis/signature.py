@@ -175,6 +175,7 @@ def _runtime_scalar(hf: HostFunction, node: torch.fx.Node) -> ScalarArg | None:
     value = node.meta.get("val")
     if (
         not isinstance(value, (torch.SymInt, torch.SymFloat))
+        or not value.node.expr.free_symbols
         or block_id_from_key(key) is not None
         or symbol_origin_info(hf, value) is not None
     ):

@@ -55,22 +55,6 @@ class TestTypeConversions:
             result = torch_dtype_to_mlir(torch.int32)
             assert "i32" in str(result)
 
-    def test_tensor_type_conversion(self, mlir_context):
-        """Test tensor shape + dtype conversion."""
-        from helion_mlir_backend._compiler.mlir.support.type_utils import (
-            torch_tensor_to_mlir_type,
-        )
-
-        tensor = torch.randn(256, 512, dtype=torch.float32)
-        with mlir_context:
-            loc = ir.Location.unknown(mlir_context)
-            with loc:
-                mlir_type = torch_tensor_to_mlir_type(tensor)
-                mlir_str = str(mlir_type)
-                assert "256" in mlir_str
-                assert "512" in mlir_str
-                assert "f32" in mlir_str
-
     def test_unsupported_dtype_raises(self, mlir_context):
         """Test that unsupported dtypes raise error."""
         from helion_mlir_backend._compiler.mlir.support.errors import (
@@ -118,11 +102,11 @@ class TestBackendStructure:
     def test_extracted_helpers_are_available_from_facades(self):
         from helion_mlir_backend._compiler.mlir.aten_bridge import call_helper
         from helion_mlir_backend._compiler.mlir.aten_bridge import lower_via_aten_helper
-        from helion_mlir_backend._compiler.mlir.lowering import lower_tile_index
+        from helion_mlir_backend._compiler.mlir.lowering import build_phase_body
 
         assert callable(call_helper)
         assert callable(lower_via_aten_helper)
-        assert callable(lower_tile_index)
+        assert callable(build_phase_body)
 
 
 class TestExtractedHelpers:

@@ -67,7 +67,7 @@ def compile_kernel(
             hf, builder.context.geometry.block_size, config
         )
         sizes = {
-            name: builder.context.ref_sizes(name)
+            name: builder.context.sizes.ref(name)
             for name in builder.context.signature.refs
         }
     entry = compile_entry(module, hf.name, pipeline=pipeline)

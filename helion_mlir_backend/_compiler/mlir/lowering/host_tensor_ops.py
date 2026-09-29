@@ -61,19 +61,19 @@ def materialize_host_tensor_alias_shape(
     produces a ``_host_tensor`` node that resolves to the *base* parameter's
     SSA value, which still carries the base shape. Emit the shape change so
     downstream slices see the alias's real geometry instead of silently
-    using the base type. Runtime sizes come from ``ctx.size``.
+    using the base type. Runtime sizes come from ``ctx.sizes``.
     """
 
     base_type = base_value.type
     if not isinstance(base_type, ir.RankedTensorType):
         return None
     element_type = base_type.element_type
-    alias_sizes = [ctx.size_expr(size) for size in alias_node.meta["val"].shape]
+    alias_sizes = [ctx.sizes.expr(size) for size in alias_node.meta["val"].shape]
     base_name = next(
         (name for name, value in ctx.param_to_value.items() if value == base_value),
         None,
     )
-    if base_name is not None and alias_sizes == ctx.ref_sizes(base_name):
+    if base_name is not None and alias_sizes == ctx.sizes.ref(base_name):
         return base_value
     dynamic = ir.ShapedType.get_dynamic_size()
     base_shape = list(base_type.shape)
@@ -81,7 +81,7 @@ def materialize_host_tensor_alias_shape(
     if base_shape == alias_shape and dynamic not in alias_shape:
         return base_value
     if base_name is not None:
-        base_numel = sympy.prod(ctx.ref_sizes(base_name))
+        base_numel = sympy.prod(ctx.sizes.ref(base_name))
     elif dynamic not in base_shape:
         base_numel = sympy.prod([sympy.Integer(size) for size in base_shape])
     else:
@@ -111,7 +111,7 @@ def materialize_host_tensor_alias_shape(
         flat_value = tensor_d.CollapseShapeOp(
             flat_type, base_value, [list(range(len(base_shape)))]
         ).result
-    output = [ctx.size(size) for size in alias_sizes]
+    output = [ctx.sizes.value(size) for size in alias_sizes]
     return tensor_d.ExpandShapeOp(
         result_type,
         flat_value,

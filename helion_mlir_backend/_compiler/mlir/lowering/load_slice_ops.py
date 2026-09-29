@@ -16,7 +16,7 @@ from ..support import ValueNotFoundError
 from . import emit
 from .registry import lowers
 from .subscript_ops import gather
-from .view_ops import static_reshape
+from .view_ops import reshape
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
@@ -64,7 +64,7 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         position = dimension - sum(1 for dim in reduced if dim < dimension)
         loaded = gather(ctx, node, loaded, [slice(None)] * position + [index])
     if None in index_nodes:
-        loaded = static_reshape(loaded, _with_new_axes(loaded, index_nodes, plan))
+        loaded = reshape(loaded, _with_new_axes(loaded, index_nodes, plan))
     if extra_mask is None:
         return loaded
     return call_helper(
@@ -102,7 +102,8 @@ def load_tile(tensor: ir.Value, plan: SlicePlan) -> ir.Value:
         return loaded
     element_type = ir.RankedTensorType(tensor.type).element_type
     result_type = ir.RankedTensorType.get(plan.value_shape() or [1], element_type)
-    reassociation = _collapse_reassociation(len(plan.dims), reduced_dims)
+    rank = len(plan.dims)
+    reassociation = emit.reassociation(rank, reduced_dims) or [list(range(rank))]
     return tensor_d.CollapseShapeOp(result_type, loaded, reassociation).result
 
 
@@ -110,25 +111,3 @@ def _arg(node: torch.fx.Node, position: int, name: str) -> object:
     if len(node.args) > position:
         return node.args[position]
     return node.kwargs.get(name)
-
-
-def _collapse_reassociation(rank: int, reduced_dims: set[int]) -> list[list[int]]:
-    """Build a ``tensor.collapse_shape`` reassociation dropping ``reduced_dims``.
-
-    Each reduced (guaranteed extent-1) dim is merged into the nearest kept
-    dim's group, preferring the next kept dim to its right, falling back to
-    the previous one. Unambiguous by construction (explicit index grouping,
-    not size-based inference).
-    """
-    kept = [d for d in range(rank) if d not in reduced_dims]
-    if not kept:
-        return [list(range(rank))]
-    groups: dict[int, list[int]] = {k: [k] for k in kept}
-    for d in range(rank):
-        if d not in reduced_dims:
-            continue
-        target = next((k for k in kept if k > d), None)
-        if target is None:
-            target = max(k for k in kept if k < d)
-        groups[target].append(d)
-    return [sorted(groups[k]) for k in sorted(groups)]

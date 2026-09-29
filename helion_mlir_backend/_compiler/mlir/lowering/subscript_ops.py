@@ -14,7 +14,7 @@ from ..support import UnsupportedOperationError
 from ..support import ValueNotFoundError
 from . import emit
 from .registry import lowers
-from .view_ops import static_reshape
+from .view_ops import reshape
 
 if TYPE_CHECKING:
     from ..build_context import BuildContext
@@ -72,7 +72,7 @@ def lower_subscript(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
             static_sizes=sizes,
             static_strides=[1] * len(offsets),
         ).result
-    reshaped = static_reshape(source, result_shape)
+    reshaped = reshape(source, result_shape)
     assert reshaped is not None
     return reshaped
 

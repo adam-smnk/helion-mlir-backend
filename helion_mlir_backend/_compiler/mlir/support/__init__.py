@@ -23,7 +23,6 @@ from .index_meta import IndexDescriptor
 from .index_meta import resolve_index_descriptor
 from .type_utils import mlir_dtype_to_torch
 from .type_utils import torch_dtype_to_mlir
-from .type_utils import torch_tensor_to_mlir_type
 
 __all__ = [
     "SCALAR_SYMBOL_KINDS",
@@ -39,5 +38,4 @@ __all__ = [
     "resolve_index_descriptor",
     "symbol_origin_info",
     "torch_dtype_to_mlir",
-    "torch_tensor_to_mlir_type",
 ]
