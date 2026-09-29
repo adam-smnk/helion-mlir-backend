@@ -1,0 +1,90 @@
+{
+  "add": {
+    "detail": "",
+    "status": "pass"
+  },
+  "bmm": {
+    "detail": "",
+    "status": "pass"
+  },
+  "broadcast_matmul": {
+    "detail": "",
+    "status": "pass"
+  },
+  "concat2d_dim1": {
+    "detail": "",
+    "status": "pass"
+  },
+  "cross_entropy": {
+    "detail": "",
+    "status": "pass"
+  },
+  "embedding": {
+    "detail": "",
+    "status": "pass"
+  },
+  "exp": {
+    "detail": "",
+    "status": "pass"
+  },
+  "gather_gemv": {
+    "detail": "",
+    "status": "pass"
+  },
+  "geglu": {
+    "detail": "",
+    "status": "pass"
+  },
+  "layer_norm": {
+    "detail": "",
+    "status": "pass"
+  },
+  "longsum": {
+    "detail": "",
+    "status": "pass"
+  },
+  "longsum_manual": {
+    "detail": "",
+    "status": "pass"
+  },
+  "longsum_w_red_loop": {
+    "detail": "",
+    "status": "pass"
+  },
+  "matmul": {
+    "detail": "",
+    "status": "pass"
+  },
+  "matmul_layernorm": {
+    "detail": "",
+    "status": "pass"
+  },
+  "rms_norm": {
+    "detail": "",
+    "status": "pass"
+  },
+  "softmax": {
+    "detail": "",
+    "status": "pass"
+  },
+  "softmax_decomposed": {
+    "detail": "",
+    "status": "pass"
+  },
+  "softmax_two_pass": {
+    "detail": "",
+    "status": "pass"
+  },
+  "sum": {
+    "detail": "",
+    "status": "pass"
+  },
+  "swiglu": {
+    "detail": "",
+    "status": "pass"
+  },
+  "welford": {
+    "detail": "",
+    "status": "pass"
+  }
+}
