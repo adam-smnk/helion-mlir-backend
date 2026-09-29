@@ -32,20 +32,21 @@ for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
 kernel and an inline `linalg.pack`. Three backend changes made this work:
 
 - **The opt pipeline's wrong results.** The partial load is a `tensor.pad`,
-  which bufferizes to a temporary that is filled, copied into, and then copied
-  into the destination. Lighthouse's `vectorization.py[gen=vectorize_all]`
-  (upstream `vectorize_children_and_apply_patterns`) forwards the source copy
-  into a `vector.transfer_read` whose padding is poison. That drops the fill, so
-  the padded rows hold garbage. Section 1's multi-phase failure and the padded
-  `batch_matmul` NaNs (`docs/MLIR_LIMITATIONS.md` section 14) probably belong to
-  the same family.
-  - Fix: `lower_store` (`lowering/memory_ops.py`) now stores a zero-padded load
-    directly when the store covers its whole slice, with no temporary.
-  - The store is an `scf.if`. A tile the operand covers is a static copy. An
-    edge tile reads its real rows with masked row-wise `vector.transfer_read`s
-    and writes zero rows after them.
-  - A destination of runtime size is filled with zeros, and the real part is
-    then inserted.
+  which bufferizes to a temporary that is zeroed, partly copied into, and then
+  read. Lighthouse's `vectorization.py[gen=vectorize_all]` (upstream
+  `vectorize_children_and_apply_patterns`, its `LinalgCopyVTRForwardingPattern`)
+  forwards the read to the copy source with poison padding, ignoring the
+  zeroing, so the padded rows hold garbage. Padded reductions and the padded
+  `batch_matmul` NaNs were the same bug.
+  - Fix: the opt pipeline's `vectorize_pads` stage (`_compiler/helion_transforms.py`)
+    rewrites each static `tensor.pad` into a vector read of its source padded with
+    the pad value, before bufferization, so no such temporary exists for any consumer.
+  - Speed: tile extents are runtime values, so that read may be out of bounds for
+    every tile and lowers to masked loads. The pipeline's `split_transfers` stage
+    (upstream `vector.split_transfer_full_partial`) adds an in-bounds fast path,
+    so only edge tiles are masked. f32 padded packing matches a hand-written
+    backend fast path; bf16 edge tiles stay slower on CPUs without AVX512_BF16,
+    where LLVM scalarizes masked bf16 loads.
 - **`tile.id` store indices.** A store indexed by `tile.id` is now an owned
   (parallel) dimension, so the block loop is an `scf.forall` and no longer a
   sequential `scf.for`.
@@ -55,14 +56,9 @@ kernel and an inline `linalg.pack`. Three backend changes made this work:
 
 Remaining limits:
 
-- The transposed kernels (`pack_a_t`, `pack_b_t`) pad before `linalg.transpose`,
-  so they do not get the direct store. For small padded operands they are
-  slower than eager.
-- A store whose tile the loop end cuts short (block 64 over an extent of 4000)
-  is partial, so it does not get the direct store either. It stays correct but
-  slow. Iterating over the padded extent with 32x32 blocks avoids this.
-- A pad consumed by an op other than a store (such as `batch_matmul`) still goes
-  through the temporary.
+- The transposed kernels (`pack_a_t`, `pack_b_t`) pad before `linalg.transpose`;
+  their padded reads have a permutation map, which the split skips, so every
+  tile is masked. For small padded operands they are slower than eager.
 
 Sections 1 to 3 below are the original findings.
 

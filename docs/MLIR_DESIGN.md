@@ -102,10 +102,7 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 - `load_slice_ops.py`: tile loads; a 1-D index tensor in one dimension gathers
   through the `aten.index.Tensor` helper
 - `memory_ops.py`: getitem, `_mask_to` and stores (tensor-indexed stores are
-  rejected; a size-1 dim of the value is broadcast into the destination). A
-  zero-padded load stored into a whole destination slice skips its `tensor.pad`:
-  a static copy when the source covers the tile, masked vector reads and zero
-  rows otherwise (a bufferized pad temporary is misvectorized by the opt pipeline)
+  rejected; a size-1 dim of the value is broadcast into the destination)
 - `contraction_ops.py`: the single lowering for `mm`/`bmm`/`matmul`/`addmm`/
   `baddbmm`, `hl.dot`, captured einsum and `acc + contraction`, matched by
   `analysis/contractions.py`

@@ -11,10 +11,13 @@ from typing import TYPE_CHECKING
 
 import helion
 import helion.language as hl
+from mlir import ir
 import pytest
 import torch
 
 from tests.harness import opt_pipeline
+
+from helion_mlir_backend._compiler.helion_transforms import split_transfers
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -93,6 +96,31 @@ def opt_ragged_k_bmm_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(
+    backend="mlir", static_shapes=True, config=helion.Config(block_sizes=[32, 32])
+)
+def opt_col_sum_kernel(x: torch.Tensor) -> torch.Tensor:
+    k, n = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tn in hl.tile(n):
+        acc = hl.zeros([tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = acc + x[tk, tn].sum(dim=0)
+        out[tn] = acc
+    return out
+
+
+@helion.kernel(
+    backend="mlir", static_shapes=True, config=helion.Config(block_sizes=[32])
+)
+def opt_tile_sums_kernel(x: torch.Tensor) -> torch.Tensor:
+    n = x.size(0)
+    out = torch.ones([(n + 31) // 32, x.size(1)], dtype=x.dtype, device=x.device)
+    for t in hl.tile(n):
+        out[t.id, :] = out[t.id, :] + x[t, :].sum(0)
+    return out
+
+
+@helion.kernel(
     backend="mlir",
     static_shapes=True,
     config=helion.Config(block_sizes=[32, 128, 128]),
@@ -124,6 +152,7 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
     layer = torch.nn.Linear(192, 160)
     rows, ragged_rows = torch.randn(64, 1024), torch.randn(64, 1000)
     ragged_a, ragged_b = torch.randn(2, 32, 40), torch.randn(2, 40, 32)
+    ragged_cols = torch.randn(70, 64)
     return {
         "matmul": (lambda: cpu.matmul(a, b), lambda: a @ b),
         "matmul_bias_relu": (
@@ -155,10 +184,24 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
             lambda: opt_online_softmax_kernel(ragged_rows),
             lambda: ragged_rows.softmax(-1),
         ),
-        # Padded batch_matmul operands take the scalar pipeline (opt miscompiles them).
+        # Padded batch_matmul operands (miscompiled to NaNs without vectorize_pads).
         "ragged_k_bmm": (
             lambda: opt_ragged_k_bmm_kernel(ragged_a, ragged_b),
             lambda: ragged_a @ ragged_b,
+        ),
+        # Reductions over padded tiles (wrong without vectorize_pads).
+        "col_sum_ragged": (
+            lambda: opt_col_sum_kernel(ragged_cols),
+            lambda: ragged_cols.sum(0),
+        ),
+        "tile_sums_ragged": (
+            lambda: opt_tile_sums_kernel(ragged_cols),
+            lambda: (
+                1
+                + torch.nn.functional.pad(ragged_cols, (0, 0, 0, 26))
+                .reshape(-1, 32, 64)
+                .sum(1)
+            ),
         ),
     }
 
@@ -177,6 +220,8 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
         "row_max_ragged",
         "online_softmax",
         "ragged_k_bmm",
+        "col_sum_ragged",
+        "tile_sums_ragged",
     ],
 )
 def test_optimizing_pipeline_f32(case: str) -> None:
@@ -185,3 +230,27 @@ def test_optimizing_pipeline_f32(case: str) -> None:
     with opt_pipeline():
         actual = run()
     torch.testing.assert_close(actual, reference(), atol=1e-3, rtol=1e-3)
+
+
+RANK_REDUCING_TRANSFERS = """
+func.func @f(%m: memref<?x?xf32>, %i: index, %v: vector<32xf32>) -> vector<32xf32> {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : f32
+  %read = vector.transfer_read %m[%i, %c0], %pad : memref<?x?xf32>, vector<32xf32>
+  vector.transfer_write %v, %m[%i, %c0] : vector<32xf32>, memref<?x?xf32>
+  return %read : vector<32xf32>
+}
+"""
+
+
+def test_split_transfers_rank_reducing() -> None:
+    """Upstream's full/partial split loops forever on these unless their rank is
+    expanded first."""
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.parse(RANK_REDUCING_TRANSFERS)
+        schedule = split_transfers()
+        schedule.body.operations[0].apply(module.operation)
+        module.operation.verify()
+        text = str(module)
+    # The read and the write, each on its in-bounds path.
+    assert text.count("in_bounds = [true, true]") == 2

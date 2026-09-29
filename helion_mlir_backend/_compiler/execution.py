@@ -197,8 +197,7 @@ def _opt_pipeline_blocker(module: ir.Module) -> str | None:
     """Why the opt pipeline cannot compile ``module`` correctly, if it cannot.
 
     It vectorizes without vector sizes, so it cannot handle runtime-sized linalg
-    operands (plan I32), and it miscompiles a ``linalg.batch_matmul`` of padded
-    tiles (``scripts/lighthouse_padded_batch_matmul_repro.py``).
+    operands (plan I32).
     """
     found: list[str] = []
 
@@ -211,11 +210,6 @@ def _opt_pipeline_blocker(module: ir.Module) -> str | None:
             for value in [*op.operands, *op.results]
         ):
             found.append(f"{op.name} has runtime-sized operands")
-        elif op.name == "linalg.batch_matmul" and any(
-            isinstance(value.owner, ir.OpView) and value.owner.name == "tensor.pad"
-            for value in op.operands
-        ):
-            found.append(f"{op.name} has padded operands")
         return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
 
     module.operation.walk(visit)

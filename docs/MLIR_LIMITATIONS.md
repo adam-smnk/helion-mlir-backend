@@ -292,9 +292,6 @@ With tiles of at least 32, lighthouse's transforms still reject (a Python `Value
 offset/sizes/strides requires explicit result type" from `move_offsets_to_subview`)
 many ops over tiles larger than their dimension, over ragged tiles, and over full
 slices whose extent is not a multiple of 32 (a 33x65 softmax row, a 64x40 layer norm).
-A `linalg.batch_matmul` of padded (ragged) tiles is miscompiled to NaNs
-(`scripts/lighthouse_padded_batch_matmul_repro.py`), so a module with one takes the
-scalar pipeline instead, as a module with runtime-sized linalg operands does.
 
 ## 15) Lighthouse Pipeline Deviations
 
@@ -304,6 +301,26 @@ The local lighthouse checkout carries these pipeline changes (to be upstreamed):
   failed with "Yield operand #0 is not equivalent to the corresponding iter bbArg").
 - `scalar-lowering.yaml` includes `bufferization-cleanup.yaml` to deallocate the buffers that
   option allows inside loops.
+- `move_offsets_to_subview` skips transfers on memrefs with a dynamic shape or dynamic
+  strides, whose subview result type the Python helper cannot infer.
+
+The backend's opt pipeline adds two stages from `_compiler/helion_transforms.py`:
+
+- `vectorize_pads`, before the tensor-level vectorization: each statically shaped
+  `tensor.pad` becomes a vector read of its source (padded with the pad value) written
+  into an empty tensor. Bufferized as is, a pad is a temporary zeroed and then partly
+  copied into, and upstream `vectorize_children_and_apply_patterns` (lighthouse's
+  `vectorize_all`) forwards reads of that temporary to the copy source with poison
+  padding (`LinalgCopyVTRForwardingPattern` ignores the temporary's zeroing): padded
+  reductions and `batch_matmul`s of padded tiles gave garbage or NaNs.
+- `split_transfers`, after bufferization and before OpenMP (the split needs an
+  allocation scope around each transfer): tile extents are runtime values, so every
+  tile's vector transfer may be out of bounds and lowers to masked accesses. Upstream's
+  full/partial split (`vector.split_transfer_full_partial`) guards each with an
+  in-bounds check, so only edge tiles take the masked path (padded bf16 packing was
+  2-4x slower without it). Upstream loops forever on a rank-reducing transfer (vector
+  rank below the memref's: it creates the check, then fails), so these first get
+  leading unit dims. Transfers with a permutation map (transposed tiles) are not split.
 
 ## 16) Autotuning
 

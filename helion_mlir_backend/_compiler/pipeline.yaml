@@ -52,12 +52,16 @@ Pipeline:
   - include: x86_64/unroll-register.yaml
   - include: cleanup.yaml
 
+  ## Pads as vector reads of their source: no padded temporary to bufferize.
+  - schedule: "helion_transforms.py[gen=vectorize_pads]"
   - include: x86_64/vectorize.yaml
 
   ## x86_64/lower.yaml, plus the vector.multi_reduction lowering that
   ## convert-vector-to-llvm no longer includes (reductions fail to JIT without it).
   - include: bufferization.yaml
   - include: bufferization-cleanup.yaml
+  # Before OpenMP: the split's slow path needs an allocation scope around the transfer.
+  - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
   - schedule: "x86/amx_move_offsets.py[gen=amx_move_offsets]"
   - schedule: "vectorization.py[gen=x86_vectorization]"
