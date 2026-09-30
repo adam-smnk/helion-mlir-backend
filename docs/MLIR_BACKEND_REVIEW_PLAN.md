@@ -1444,7 +1444,7 @@ Work items:
 | I29 | Host-side Helion API calls (`hl.specialize`) not evaluated in host code | 7 | sweep `matmul_layernorm` |
 | I30 | Dynamic shapes fail, or are specialized to the example sizes via `int(SymInt)` | 9 | `tests/test_dynamic_shapes.py`, `conformance_sweep.py --dynamic` |
 | I31 | Lighthouse `move_offsets_to_subview` breaks on dynamic memrefs | 9 (local guard), upstream | `test_dynamic_batch_matmul_on_the_optimizing_pipeline` |
-| I32 | Optimizing pipeline cannot vectorize linalg ops on dynamic shapes | 9 (scalar fallback), upstream | `test_runtime_sized_linalg_ops_fall_back_to_the_scalar_pipeline` |
+| I32 | Optimizing pipeline cannot vectorize linalg ops on dynamic shapes | resolved in the pipeline (masked vectorization, `_compiler/helion_transforms.py`) | `test_runtime_sized_linalg_ops_on_the_optimizing_pipeline` |
 | I33 | Per-iteration allocations of carried values; sequential reduce/scan | 8 | `tests/test_in_place_updates.py`, known-combiner tests in `tests/test_language_ops.py` |
 
 ---
@@ -1512,12 +1512,12 @@ Items to report or fix upstream:
   Reproducer: `temp/phase9/spike_dynamic.py opt batch_matmul`.
 - **Padded `linalg.batch_matmul`:** the optimizing pipeline returns NaNs for a
   `batch_matmul` whose operands are `tensor.pad`-ed partial tiles; plain `matmul` is
-  correct. Reproducer: `scripts/lighthouse_padded_batch_matmul_repro.py batch`. The
-  backend routes such modules to the scalar pipeline.
+  correct. Reproducer: `scripts/lighthouse_padded_batch_matmul_repro.py batch`.
+  Fixed by the opt pipeline's `vectorize_pads` stage (see `docs/MLIR_LIMITATIONS.md`, §15).
 - **Vectorization of dynamic shapes** (I32): the schedule vectorizes without vector sizes,
-  so a linalg op on a dynamic tile fails ("Attempted to vectorize, but failed").
-  Reproducer: `temp/phase9/spike_dynamic.py opt row_sum32`. Masked vectorization with
-  vector sizes (or peeling) would let dynamic kernels use the optimizing pipeline.
+  so a linalg op on a dynamic tile fails ("Attempted to vectorize, but failed"), and
+  register unrolling fails on loops of runtime trip count. Resolved in the opt pipeline:
+  masked vectorization with the tile bounds as vector sizes, and those loops left rolled.
 - **Rank-reducing `insert_slice` in a loop** (Phase 8): with an
   `insert_slice tensor<32xf32> into tensor<32x1024xf32>[0, %i] [32, 1]` carried by an
   `scf.for`, `x86_64/vectorize.yaml` aborts in

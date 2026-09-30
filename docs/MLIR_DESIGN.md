@@ -372,7 +372,6 @@ linalg.generic with custom compute block:
 - `if` on a tensor of more than one element
 - Atomics, `hl.rand`, inline assembly/Triton and `device_print` (rejected with
   the reason)
-- Vectorized (optimizing-pipeline) code for ops on runtime-sized tiles
 
 ## Compilation Flow Example
 
@@ -481,10 +480,8 @@ See [tests/test_mlir_backend.py](../tests/test_mlir_backend.py) for test suite.
 1. **Layer Normalization**: Add custom linalg operation or linalg.normalize
 2. **Softmax**: Implement as fused reduction + exponential
 3. **Attention**: Matmul-based building blocks
-4. **Dynamic Shapes on the optimizing pipeline**: masked vectorization of ops on
-   runtime-sized tiles
-5. **Bufferization**: Option to generate memref-based IR
-6. **Custom Dialects**: Support for domain-specific operations
+4. **Bufferization**: Option to generate memref-based IR
+5. **Custom Dialects**: Support for domain-specific operations
 
 ## References
 

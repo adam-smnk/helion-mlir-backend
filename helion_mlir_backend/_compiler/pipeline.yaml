@@ -54,7 +54,10 @@ Pipeline:
 
   ## Pads as vector reads of their source: no padded temporary to bufferize.
   - schedule: "helion_transforms.py[gen=vectorize_pads]"
-  - include: x86_64/vectorize.yaml
+  ## x86_64/vectorize.yaml, vectorizing ops of runtime shape with masks.
+  - schedule: "helion_transforms.py[gen=vectorize_linalg]"
+  - schedule: "hoisting.py[gen=hoist_loops]"
+  - schedule: "vectorization.py[gen=simplify_vector_ops]"
 
   ## x86_64/lower.yaml, plus the vector.multi_reduction lowering that
   ## convert-vector-to-llvm no longer includes (reductions fail to JIT without it).
@@ -66,6 +69,8 @@ Pipeline:
   - schedule: "x86/amx_move_offsets.py[gen=amx_move_offsets]"
   - schedule: "vectorization.py[gen=x86_vectorization]"
   - schedule: "vectorization.py[gen=vectorize_all]"
+  # Ops of runtime shape without evident bounds stay linalg until here.
+  - pass: "func.func(convert-linalg-to-loops)"
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
   - pass: "func.func(lower-vector-multi-reduction)"
   - include: llvm-lowering.yaml

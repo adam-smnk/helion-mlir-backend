@@ -12,7 +12,6 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
-import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -32,8 +31,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import torch
-
-log = logging.getLogger(__name__)
 
 PIPELINES = ("scalar", "opt")
 _JIT_CACHE: OrderedDict[tuple[str, str], CompiledEntry] = OrderedDict()
@@ -166,9 +163,6 @@ def _compile_entry(
     with _stage("inlining"):
         inline_module(module)
     _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
-    if pipeline == "opt" and (reason := _opt_pipeline_blocker(module)) is not None:
-        log.debug("'%s' uses the scalar pipeline: %s", entry, reason)
-        pipeline = "scalar"
     descriptor = pipeline_descriptor(pipeline)
     with (
         _stage(f"lowering with the lighthouse '{pipeline}' pipeline"),
@@ -191,26 +185,3 @@ def _stage(what: str) -> Iterator[None]:
     except Exception as exc:
         exc.add_note(f"Helion MLIR backend: failed while {what}")
         raise
-
-
-def _opt_pipeline_blocker(module: ir.Module) -> str | None:
-    """Why the opt pipeline cannot compile ``module`` correctly, if it cannot.
-
-    It vectorizes without vector sizes, so it cannot handle runtime-sized linalg
-    operands (plan I32).
-    """
-    found: list[str] = []
-
-    def visit(op: ir.Operation) -> ir.WalkResult:
-        if not op.name.startswith("linalg."):
-            return ir.WalkResult.ADVANCE
-        if any(
-            isinstance(value.type, ir.RankedTensorType)
-            and not ir.RankedTensorType(value.type).has_static_shape
-            for value in [*op.operands, *op.results]
-        ):
-            found.append(f"{op.name} has runtime-sized operands")
-        return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
-
-    module.operation.walk(visit)
-    return found[0] if found else None

@@ -243,10 +243,16 @@ def _matmul_inputs() -> list[list[torch.Tensor]]:
 
 
 def _check_one_compile(
-    kernel: object, runs: list[list[torch.Tensor]], reference
+    kernel: object, runs: list[list[torch.Tensor]], reference, *, opt: bool = False
 ) -> None:
     for args in runs:
-        check_kernel(kernel, reference, args, atol=1e-4, rtol=1e-4)
+        if opt:
+            # check_kernel forces the scalar pipeline.
+            with opt_pipeline():
+                actual = kernel(*[arg.clone() for arg in args])
+            torch.testing.assert_close(actual, reference(*args), atol=1e-4, rtol=1e-4)
+        else:
+            check_kernel(kernel, reference, args, atol=1e-4, rtol=1e-4)
     (bound,) = kernel._bound_kernels.values()
     assert len(bound._compile_cache) == 1
 
@@ -395,8 +401,7 @@ def test_execute_mlir_rejects_host_created_dynamic_tensors() -> None:
 def test_matmul_on_the_optimizing_pipeline() -> None:
     torch.manual_seed(0)
     matmul_addmm.reset()
-    with opt_pipeline():
-        _check_one_compile(matmul_addmm, _matmul_inputs(), torch.matmul)
+    _check_one_compile(matmul_addmm, _matmul_inputs(), torch.matmul, opt=True)
 
 
 @pytest.mark.isolated
@@ -404,14 +409,49 @@ def test_dynamic_batch_matmul_on_the_optimizing_pipeline() -> None:
     torch.manual_seed(0)
     batch_matmul.reset()
     runs = [[torch.randn(b, 64, 64), torch.randn(b, 64, 64)] for b in (3, 8, 2)]
-    with opt_pipeline():
-        _check_one_compile(batch_matmul, runs, torch.bmm)
+    _check_one_compile(batch_matmul, runs, torch.bmm, opt=True)
+
+
+@_kernel(32)
+def row_softmax_32(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        row = x[tm, :]
+        e = torch.exp(row - row.amax(dim=-1, keepdim=True))
+        out[tm, :] = e / e.sum(dim=-1, keepdim=True)
+    return out
+
+
+@_kernel(32)
+def layer_norm_32(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        row = x[tm, :]
+        mean = row.mean(dim=-1, keepdim=True)
+        var = ((row - mean) ** 2).mean(dim=-1, keepdim=True)
+        out[tm, :] = (row - mean) * torch.rsqrt(var + 1e-5) * w[None, :] + b[None, :]
+    return out
 
 
 @pytest.mark.isolated
-def test_runtime_sized_linalg_ops_fall_back_to_the_scalar_pipeline() -> None:
+def test_runtime_sized_linalg_ops_on_the_optimizing_pipeline() -> None:
+    """Ops over a full slice of a runtime dim are vectorized with masks."""
     torch.manual_seed(0)
-    row_softmax.reset()
-    with opt_pipeline():
-        for shape in ((20, 33), (21, 40)):
-            check_kernel(row_softmax, lambda x: x.softmax(-1), [torch.randn(*shape)])
+    row_softmax_32.reset()
+    runs = [[torch.randn(*shape)] for shape in ((64, 96), (70, 45), (33, 200))]
+    _check_one_compile(row_softmax_32, runs, lambda x: x.softmax(-1), opt=True)
+    matmul_full_k.reset()
+    runs = [
+        [torch.randn(64, 48), torch.randn(48, 64)],
+        [torch.randn(70, 45), torch.randn(45, 33)],
+    ]
+    _check_one_compile(matmul_full_k, runs, torch.matmul, opt=True)
+    # `** 2` is a vector math.fpowi once vectorized.
+    layer_norm_32.reset()
+    runs = [[torch.randn(64, n), torch.randn(n), torch.randn(n)] for n in (96, 45)]
+    _check_one_compile(
+        layer_norm_32,
+        runs,
+        lambda x, w, b: torch.nn.functional.layer_norm(x, [x.size(1)], w, b, 1e-5),
+        opt=True,
+    )

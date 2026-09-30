@@ -28,11 +28,9 @@ Current behavior:
   the end of the loop as for ragged static shapes.
 - Runtime sizes the kernel assumes equal (one symbol) or computes (`n // 2`) are
   checked on each call.
-- The optimizing pipeline is only used when every linalg op of the inlined module
-  is statically shaped (a tiled matmul) and no `linalg.batch_matmul` has padded
-  operands (section 14); otherwise the kernel falls back to the scalar pipeline
-  (debug log). Lighthouse vectorizes without vector sizes, so it cannot vectorize
-  ops on runtime-sized tiles.
+- The optimizing pipeline vectorizes ops on runtime-sized tiles with masks (section 15).
+  A runtime extent that tiling leaves without a constant bound is tiled by 32 first;
+  an op that cannot be tiled (e.g. a `keepdim` reduction) is lowered to scalar loops.
 - A size no host tensor argument or runtime scalar provides raises a
   `DynamicShapeError`.
 - `execute_mlir` (no host code) cannot create host tensors of runtime shape.
@@ -303,16 +301,31 @@ The local lighthouse checkout carries these pipeline changes (to be upstreamed):
   option allows inside loops.
 - `move_offsets_to_subview` skips transfers on memrefs with a dynamic shape or dynamic
   strides, whose subview result type the Python helper cannot infer.
+- `tile_and_unroll_annotated` (`x86_64/unroll-register.yaml`) leaves loops of runtime
+  trip count rolled instead of failing ("failed to fully unroll").
+- `llvm-lowering.yaml` expands `math.fpowi` of constant exponent (`math-expand-ops`):
+  vector `fpowi` has no LLVM lowering, as LLVM's `powi` takes a scalar exponent.
 
-The backend's opt pipeline adds two stages from `_compiler/helion_transforms.py`:
-
-- `vectorize_pads`, before the tensor-level vectorization: each statically shaped
-  `tensor.pad` becomes a vector read of its source (padded with the pad value) written
-  into an empty tensor. Bufferized as is, a pad is a temporary zeroed and then partly
-  copied into, and upstream `vectorize_children_and_apply_patterns` (lighthouse's
-  `vectorize_all`) forwards reads of that temporary to the copy source with poison
-  padding (`LinalgCopyVTRForwardingPattern` ignores the temporary's zeroing): padded
-  reductions and `batch_matmul`s of padded tiles gave garbage or NaNs.
+The backend's opt pipeline replaces or adds these stages, from
+`_compiler/helion_transforms.py`:
+- `vectorize_pads`, before the tensor-level vectorization: each `tensor.pad` whose
+  runtime extents have evident constant bounds becomes a vector read of its source
+  (padded with the pad value) written into an empty tensor. Bufferized as is, a pad is a
+  temporary zeroed and then partly copied into, and upstream `vectorize_children_and_apply_patterns`
+  (lighthouse's `vectorize_all`) forwards reads of that temporary to the copy source with
+  poison padding (`LinalgCopyVTRForwardingPattern` ignores the temporary's zeroing):
+  padded reductions and `batch_matmul`s of padded tiles gave garbage or NaNs.
+- `vectorize_linalg` (lighthouse's, from `x86_64/vectorize.yaml`) vectorizes ops of
+  runtime shape with masks. Lighthouse vectorizes without vector sizes, which fails for
+  them. Tiling bounds a runtime extent by an `affine.min` with a constant; the bounds,
+  traced through slices, pads and loops, are the vector sizes. Other runtime extents
+  are tiled by 32 first, and so are bounds above 32 that are not multiples of 32 and all
+  extents of an op whose masked vectors would exceed 4096 elements (LLVM otherwise spends
+  seconds to minutes on them). A masked add-contraction becomes an unmasked one of
+  operands zeroed where masked off (upstream's x86 contraction patterns rewrite inside
+  `vector.mask` regions, which the verifier rejects). Ops that cannot be tiled or that
+  masked vectorization rejects (e.g. argmax, gathers) are lowered to loops
+  (`convert-linalg-to-loops`).
 - `split_transfers`, after bufferization and before OpenMP (the split needs an
   allocation scope around each transfer): tile extents are runtime values, so every
   tile's vector transfer may be out of bounds and lowers to masked accesses. Upstream's
