@@ -338,8 +338,9 @@ pipeline, with these stages from `_compiler/helion_transforms.py` replacing or a
   config keys; others raise `InvalidConfig`). The pipeline is not searched: a search uses
   the default pipeline (`HELION_MLIR_PIPELINE`, else `opt`).
 - Candidates run in the tuning process (no precompile subprocess), timed by wall clock.
-  A candidate the backend or lighthouse rejects with an error is skipped, but a native
-  abort inside MLIR ends the process.
+  A candidate the backend or lighthouse rejects with an error is skipped, and so is one
+  whose lighthouse lowering runs past the compile timeout or aborts natively (lowering
+  runs in a forked process). A native abort in the LLVM JIT still ends the process.
 - Compiling on the optimizing pipeline is slower than on the scalar one (a 256x1024
   softmax: about 1 s for any row block size). Tiles of several rows over very wide rows
   are the exception: 2-row tiles of 16384-column rows take about 4 minutes, nearly all in

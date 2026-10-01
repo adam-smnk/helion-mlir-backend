@@ -75,9 +75,13 @@ def _get_shared_mlir_context() -> ir.Context:
     """The process-wide ``mlir.ir.Context``, created on first use.
 
     Creating and destroying contexts per compile races their background thread
-    pools and has segfaulted; one context hosts every module instead.
+    pools and has segfaulted; one context hosts every module instead. It runs no
+    threads (a module has one function once inlined), so a forked lowering can
+    use it.
     """
-    return ir.Context()
+    context = ir.Context()
+    context.enable_multithreading(False)
+    return context
 
 
 class MLIRModuleBuilder:

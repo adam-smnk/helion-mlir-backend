@@ -2,8 +2,10 @@
 
 :func:`compile_entry` returns a :class:`CompiledEntry` that takes the entry's
 buffers in argument order. Failures keep their exception type and get a note
-naming the stage. Compiled entries are cached in-process by module text and
-pipeline, so equal modules (e.g. configs that clamp to the same tiles) JIT once.
+naming the stage. Lighthouse lowering runs in a forked process, killed after the
+compile timeout; only the lowered module comes back. Compiled entries are cached
+in-process by module text and pipeline, so equal modules (e.g. configs that clamp
+to the same tiles) JIT once.
 """
 
 from __future__ import annotations
@@ -11,9 +13,16 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
+import gc
 import hashlib
+import io
+import logging
+import multiprocessing
 import os
+import pickle
+import tempfile
 from typing import TYPE_CHECKING
+import warnings
 
 from lighthouse.execution.runner import Runner
 from lighthouse.ingress.torch.compile import TorchMemoryManager
@@ -25,13 +34,19 @@ from mlir.passmanager import PassManager
 from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
 from helion_mlir_backend._compiler.mlir.support.debug import PIPELINES
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
+from helion_mlir_backend._compiler.mlir.support.debug import compile_timeout
 from helion_mlir_backend._compiler.mlir.support.debug import default_pipeline
+from helion_mlir_backend._compiler.mlir.support.errors import CompileTimeoutError
 from helion_mlir_backend._compiler.mlir.support.type_utils import mlir_dtype_to_torch
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from multiprocessing.connection import Connection
+    from typing import BinaryIO
 
     import torch
+
+log = logging.getLogger(__name__)
 
 _PIPELINE_FILES = {"opt": "./pipeline.yaml", "scalar": "./scalar.yaml"}
 _JIT_CACHE: OrderedDict[tuple[str, str], CompiledEntry] = OrderedDict()
@@ -162,19 +177,102 @@ def _compile_entry(
     with _stage("inlining"):
         inline_module(module)
     _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
-    descriptor = pipeline_descriptor(pipeline)
-    with (
-        _stage(f"lowering with the lighthouse '{pipeline}' pipeline"),
-        module.context,
-        ir.Location.unknown(),
-    ):
-        driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
-        driver.add_stage(descriptor)
-        lowered = driver.apply(module)
+    with _stage(f"lowering with the lighthouse '{pipeline}' pipeline"):
+        lowered = _lower(module, entry, pipeline)
     _dump_if(debug.dump_lowered, "MLIR after lighthouse lowering", lowered)
     with _stage("JIT compilation"):
         runner = Runner(lowered, mem_manager_cls=TorchMemoryManager, shared_libs=[])
     return CompiledEntry(entry, args, runner)
+
+
+def _lower(module: ir.Module, entry: str, pipeline: str) -> ir.Module:
+    """Lower ``module`` with lighthouse, in a forked process under the compile
+    timeout: native passes cannot be interrupted, only killed with their process."""
+    with module.context, ir.Location.unknown():
+        driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
+        driver.add_stage(pipeline_descriptor(pipeline))
+        timeout = compile_timeout()
+        if timeout is None or "fork" not in multiprocessing.get_all_start_methods():
+            return driver.apply(module)
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    with _anonymous_file() as stderr:
+        child = multiprocessing.get_context("fork").Process(
+            target=_lower_in_child,
+            args=(driver, module, sender, stderr.fileno()),
+            daemon=True,
+        )
+        with warnings.catch_warnings():
+            # The child uses only the module's context, which runs no threads.
+            warnings.filterwarnings("ignore", "This process .* is multi-threaded")
+            child.start()
+        sender.close()
+        error: Exception | None = None
+        try:
+            if receiver.poll(timeout):
+                ok, result = receiver.recv()
+                if not ok:
+                    error = result
+            else:
+                child.kill()
+                error = CompileTimeoutError(pipeline, timeout)
+        except EOFError:
+            error = RuntimeError("lighthouse lowering process died")
+        finally:
+            receiver.close()
+            child.join()
+        stderr.seek(0)
+        output = stderr.read().decode(errors="replace").strip()
+    if error is not None:
+        if child.exitcode and not isinstance(error, CompileTimeoutError):
+            error.add_note(f"exit code {child.exitcode}")
+        if output:
+            error.add_note(f"lighthouse output:\n{output}")
+        raise error
+    if output:
+        log.debug("lighthouse output:\n%s", output)
+    return ir.Module.parse(result, context=module.context)
+
+
+def _anonymous_file() -> BinaryIO:
+    """A file with no name, in memory where the OS supports it (Linux)."""
+    if hasattr(os, "memfd_create"):
+        return os.fdopen(os.memfd_create("lighthouse-stderr"), "w+b")
+    return tempfile.TemporaryFile()
+
+
+def _lower_in_child(
+    driver: BackendDriver, module: ir.Module, sender: Connection, stderr: int
+) -> None:
+    """Forked: apply the parent's driver to the parent's module (both copied on
+    write) and send back the lowered module as bytecode. What lighthouse prints
+    goes to ``stderr``: diagnostics of a lowering that succeeds are not errors."""
+    os.dup2(stderr, 2)
+    # Freeing an MLIR context whose threads did not survive the fork waits forever.
+    gc.disable()
+    try:
+        with module.context, ir.Location.unknown():
+            lowered = driver.apply(module)
+        sender.send((True, _bytecode(lowered)))
+    except Exception as exc:
+        sender.send((False, _picklable(exc)))
+    finally:
+        sender.close()
+
+
+def _bytecode(module: ir.Module) -> bytes:
+    buffer = io.BytesIO()
+    module.operation.write_bytecode(buffer)
+    return buffer.getvalue()
+
+
+def _picklable(exc: Exception) -> Exception:
+    try:
+        return pickle.loads(pickle.dumps(exc))
+    except Exception:
+        fallback = RuntimeError(f"{type(exc).__name__}: {exc}")
+        for note in getattr(exc, "__notes__", ()):
+            fallback.add_note(note)
+        return fallback
 
 
 @contextmanager

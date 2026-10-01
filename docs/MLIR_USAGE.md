@@ -219,6 +219,15 @@ Compiled modules are cached in-process by their text and pipeline, so compiling
 the same module again (another shape bucket with equal static sizes, a repeated
 config) skips lighthouse and the JIT.
 
+Lighthouse lowering runs in a forked process, killed after
+`HELION_MLIR_COMPILE_TIMEOUT` seconds (default 30; `0` lowers in-process with no
+limit) with a `CompileTimeoutError`, which autotuning treats as a failed config. A
+lowering that slow usually means poor tiling decisions for those block sizes. The LLVM
+JIT that follows runs in-process and is not limited. What the lowering prints goes to
+the `helion_mlir_backend` debug log when it succeeds (e.g. upstream MLIR reports each
+keepdim reduction lighthouse's tile-and-fuse cannot fuse as an error, then carries on),
+and into the exception's notes when it fails, times out or crashes.
+
 Tests and the conformance sweep set `HELION_DISALLOW_AUTOTUNING=1` and give every
 kernel a fixed config.
 

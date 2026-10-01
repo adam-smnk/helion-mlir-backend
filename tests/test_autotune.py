@@ -18,6 +18,7 @@ from helion_mlir_backend._compiler import execution
 from helion_mlir_backend._compiler.mlir.autotune import cpu_name
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
 from helion_mlir_backend._compiler.mlir.backend import raise_block_minimums
+from helion_mlir_backend._compiler.mlir.support import CompileTimeoutError
 from helion_mlir_backend.api import _compile
 
 
@@ -141,13 +142,13 @@ def test_block_size_prior_prefers_divisors() -> None:
 def test_config_selects_the_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HELION_MLIR_PIPELINE", "scalar")
     chosen: list[str] = []
-    original = execution.pipeline_descriptor
+    original = execution._lower
 
-    def record(pipeline: str | None = None) -> object:
+    def record(module: object, entry: str, pipeline: str) -> object:
         chosen.append(pipeline)
-        return original("scalar")
+        return original(module, entry, "scalar")
 
-    monkeypatch.setattr(execution, "pipeline_descriptor", record)
+    monkeypatch.setattr(execution, "_lower", record)
     monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
     x, y = torch.randn(64, 64), torch.randn(64, 64)
     config = helion.Config(block_sizes=[32, 32], mlir_pipeline="opt")
@@ -182,3 +183,64 @@ def test_identical_modules_are_compiled_once(monkeypatch: pytest.MonkeyPatch) ->
         run = compile_mlir(kernel, [x, y], config=config)
         torch.testing.assert_close(run(x, y), x * 2.0 + y)
     assert compiled == ["axpy"]
+
+
+@pytest.mark.parametrize("timeout", ["0", "60"], ids=["in_process", "forked"])
+def test_lowering_with_and_without_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeout: str
+) -> None:
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", timeout)
+    monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
+    x, y = torch.randn(40, 40), torch.randn(40, 40)
+    config = helion.Config(block_sizes=[32, 32])
+    run = compile_mlir(helion.kernel(backend="mlir")(axpy), [x, y], config=config)
+    torch.testing.assert_close(run(x, y), x * 2.0 + y)
+
+
+def test_lowering_past_the_timeout_is_skipped_by_autotuning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0.001")
+    monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
+    x, y = torch.randn(40, 40), torch.randn(40, 40)
+    config = helion.Config(block_sizes=[32, 32])
+    with pytest.raises(CompileTimeoutError) as error:
+        compile_mlir(helion.kernel(backend="mlir")(axpy), [x, y], config=config)
+    assert MLIRBackend().classify_autotune_exception(error.value) is not None
+
+
+def test_lowering_errors_keep_their_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
+
+    def fail(*_: object) -> None:
+        raise ValueError("lighthouse failed")
+
+    monkeypatch.setattr(execution.BackendDriver, "apply", fail)
+    x, y = torch.randn(40, 40), torch.randn(40, 40)
+    config = helion.Config(block_sizes=[32, 32])
+    with pytest.raises(ValueError, match="lighthouse failed") as error:
+        compile_mlir(helion.kernel(backend="mlir")(axpy), [x, y], config=config)
+    assert any("lowering with the lighthouse" in note for note in error.value.__notes__)
+
+
+def keepdim_softmax(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        row = x[tm, :]
+        e = torch.exp(row - row.amax(-1, keepdim=True))
+        out[tm, :] = e / e.sum(-1, keepdim=True)
+    return out
+
+
+def test_successful_lowering_prints_nothing(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Lighthouse's tile-and-fuse makes upstream MLIR report a keepdim reduction
+    it cannot fuse; the lowering still succeeds, so that goes to the debug log."""
+    monkeypatch.setenv("HELION_MLIR_PIPELINE", "opt")
+    monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
+    config = helion.Config(block_sizes=[32])
+    kernel = helion.kernel(backend="mlir", config=config)(keepdim_softmax)
+    x = torch.randn(64, 256)
+    torch.testing.assert_close(kernel(x), torch.softmax(x, -1))
+    assert "Diagnostic" not in capfd.readouterr().err

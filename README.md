@@ -123,6 +123,14 @@ stdout at the corresponding pipeline stage.
 | `HELION_MLIR_DUMP_PRE_LOWERING` | After inlining / all pre-passes, immediately before the lighthouse lowering schedule |
 | `HELION_MLIR_DUMP_LOWERED` | After lighthouse lowering (LLVM dialect, expanded memref descriptors) |
 
+## Compile Timeout
+
+`HELION_MLIR_COMPILE_TIMEOUT` bounds the lighthouse lowering of each kernel, in seconds
+(default `30`; `0` disables the limit). The lowering runs in a forked process that is
+killed on timeout, raising `CompileTimeoutError`; autotuning skips such configs. A
+lowering that slow usually points at poor tiling decisions for the chosen block sizes.
+The LLVM JIT that follows is not limited. See `docs/MLIR_USAGE.md` for details.
+
 ## Development
 
 This repo uses pre-commit + Ruff rules aligned with Helion style.

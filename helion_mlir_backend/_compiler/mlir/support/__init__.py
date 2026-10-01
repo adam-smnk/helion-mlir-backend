@@ -13,6 +13,7 @@ from __future__ import annotations
 from .block_ids import SCALAR_SYMBOL_KINDS
 from .block_ids import block_id_from_key
 from .block_ids import symbol_origin_info
+from .errors import CompileTimeoutError
 from .errors import DynamicShapeError
 from .errors import MLIRBackendError
 from .errors import NodeLoweringError
@@ -27,6 +28,7 @@ from .type_utils import torch_dtype_to_mlir
 
 __all__ = [
     "SCALAR_SYMBOL_KINDS",
+    "CompileTimeoutError",
     "DynamicShapeError",
     "IndexDescriptor",
     "MLIRBackendError",

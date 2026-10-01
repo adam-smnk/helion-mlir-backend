@@ -41,3 +41,11 @@ def default_pipeline() -> str:
             f"HELION_MLIR_PIPELINE={pipeline!r}; expected one of {PIPELINES}"
         )
     return pipeline
+
+
+def compile_timeout() -> float | None:
+    """Seconds a lighthouse lowering may take: ``HELION_MLIR_COMPILE_TIMEOUT``,
+    30 if unset; ``None`` (no limit) for 0."""
+    value = os.environ.get("HELION_MLIR_COMPILE_TIMEOUT", "").strip()
+    timeout = float(value) if value else 30.0
+    return timeout if timeout > 0 else None

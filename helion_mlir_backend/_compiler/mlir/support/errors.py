@@ -103,3 +103,15 @@ class NodeLoweringError(MLIRBackendError):
         self.node = node
         self.reason = reason
         self.recovery_hint = recovery_hint
+
+
+class CompileTimeoutError(MLIRBackendError):
+    """Raised when lowering a module takes longer than the compile timeout."""
+
+    def __init__(self, pipeline: str, timeout: float) -> None:
+        super().__init__(
+            f"Lowering with the lighthouse '{pipeline}' pipeline took over "
+            f"{timeout:g} s (HELION_MLIR_COMPILE_TIMEOUT); try other block sizes"
+        )
+        self.pipeline = pipeline
+        self.timeout = timeout
