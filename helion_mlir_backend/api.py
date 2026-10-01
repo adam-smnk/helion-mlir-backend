@@ -42,7 +42,8 @@ def compile_mlir(
 
     The callable has the kernel's signature and Helion semantics: it runs the
     kernel's host code on each call and returns the kernel's return value.
-    ``pipeline`` is ``"scalar"`` or ``"opt"`` (default: ``HELION_MLIR_PIPELINE``).
+    ``pipeline`` is ``"opt"`` or ``"scalar"`` (default: ``HELION_MLIR_PIPELINE``,
+    else ``"opt"``).
     """
     from helion_mlir_backend._compiler.mlir.driver import compile_kernel
 

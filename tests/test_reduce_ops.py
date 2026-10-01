@@ -1,5 +1,5 @@
 """Numerical tests for reduction & broadcast ATen ops routed through the
-generic torch-mlir helper path (Phase 5 of the MLIR backend cleanup)."""
+generic torch-mlir helper path."""
 
 from __future__ import annotations
 

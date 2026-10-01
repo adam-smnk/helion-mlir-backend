@@ -1,12 +1,13 @@
-"""Capture ``torch.einsum`` calls as a single FX node for direct MLIR lowering.
+"""A ``TorchFunctionMode`` around Helion's device-IR tracing.
 
+It records a ``torch.einsum`` expressible as ``linalg.contract`` as one custom op:
 PyTorch decomposes ``aten::einsum`` (a ``CompositeImplicitAutograd`` op) into
-``permute``/``view``/``bmm`` chains before Helion's ``make_fx`` tracer ever sees
-it, and torch-mlir's own einsum lowering is an equally indirect decomposition.
-To lower an einsum with its own semantics we intercept it one level higher --
-at the ``__torch_function__`` layer -- and record an opaque custom op instead,
-but only when the equation is actually expressible as ``linalg.contract``.
-Everything else keeps PyTorch's decomposition.
+``permute``/``view``/``bmm`` chains before Helion's ``make_fx`` tracer sees it, and
+torch-mlir's own einsum lowering is an equally indirect decomposition. Other
+equations keep PyTorch's decomposition.
+
+It also routes a tensor method that mirrors a ``torch`` function with a Helion
+device replacement (``x.cumsum(d)``) to that replacement.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ def is_einsum_node(node: torch.fx.Node) -> bool:
     return node.op == "call_function" and node.target is einsum_op_target()
 
 
-class CaptureEinsumMode(TorchFunctionMode):
+class TraceMode(TorchFunctionMode):
     """Rewrite contractible ``torch.einsum`` calls into ``helion_mlir::einsum``, and
     tensor methods with a Helion device replacement into that replacement."""
 
@@ -129,13 +130,13 @@ def _should_capture(equation: str, operands: list[torch.Tensor]) -> bool:
     )
 
 
-def install_einsum_capture() -> None:
-    """Patch Helion's device-IR lowering to trace under :class:`CaptureEinsumMode`."""
+def install_trace_mode() -> None:
+    """Patch Helion's device-IR lowering to trace under :class:`TraceMode`."""
     from helion._compiler.aten_lowering import aten_lowering_dispatch
     from helion._compiler.aten_lowering import register_lowering
     from helion._compiler.kernel_compiler import KernelCompiler
 
-    if getattr(KernelCompiler, "_helion_mlir_einsum_capture_patched", False):
+    if getattr(KernelCompiler, "_helion_mlir_trace_mode_patched", False):
         return
 
     # The MLIR backend consumes device IR directly and never runs this
@@ -151,8 +152,8 @@ def install_einsum_capture() -> None:
 
         if not isinstance(self.env.backend, MLIRBackend):
             return original_lower(self, hf)
-        with CaptureEinsumMode():
+        with TraceMode():
             return original_lower(self, hf)
 
     KernelCompiler.lower = _lower
-    KernelCompiler._helion_mlir_einsum_capture_patched = True
+    KernelCompiler._helion_mlir_trace_mode_patched = True

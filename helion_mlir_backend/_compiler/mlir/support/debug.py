@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import os
 
 _FALSE_VALUES = ("", "0", "false", "no")
+PIPELINES = ("opt", "scalar")
 PIPELINE_CONFIG_KEY = "mlir_pipeline"
-"""Config key naming the lighthouse pipeline (``scalar``/``opt``) of one config."""
+"""Config key naming the lighthouse pipeline (``opt``/``scalar``) of one config."""
 
 
 def _flag(name: str) -> bool:
@@ -32,6 +33,11 @@ class DebugOptions:
         )
 
 
-def use_optimizing_pipeline() -> bool:
-    """Whether ``HELION_MLIR_PIPELINE=1`` selects the optimizing pipeline."""
-    return os.environ.get("HELION_MLIR_PIPELINE", "").strip() == "1"
+def default_pipeline() -> str:
+    """``HELION_MLIR_PIPELINE`` (``opt`` or ``scalar``); ``opt`` if unset."""
+    pipeline = os.environ.get("HELION_MLIR_PIPELINE", "").strip() or "opt"
+    if pipeline not in PIPELINES:
+        raise ValueError(
+            f"HELION_MLIR_PIPELINE={pipeline!r}; expected one of {PIPELINES}"
+        )
+    return pipeline

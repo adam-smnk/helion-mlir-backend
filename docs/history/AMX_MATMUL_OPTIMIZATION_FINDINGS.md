@@ -16,7 +16,7 @@ A = [MB, KB, BM, BK]        C(blocked) = [MB, NB, BM, BN]
 B = [NB, KB, BK, BN]        C(merged)  = [MB, BM, NB, BN]  -> viewable as [M, N]
 ```
 
-`helion_matmul_bf16.py` already produces exactly this. `BM = BN = BK = 32`.
+`benchmarks/helion_matmul_bf16.py` already produces exactly this. `BM = BN = BK = 32`.
 
 Each section's minimal example is a starting point for a reproducer (the original
 probe scripts are not kept): run it with `HELION_MLIR_PIPELINE` unset for

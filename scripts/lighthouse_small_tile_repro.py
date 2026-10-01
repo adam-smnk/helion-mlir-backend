@@ -1,8 +1,8 @@
 """Minimal lighthouse reproducer: tile-and-fuse aborts when every dim of a fusion root is
 smaller than the cache tile size (32), because all of its tile sizes become 0.
 
-Expected with N < 32: assertion in LinalgTransformOps.cpp applyTilingToAll
-("Mismatched number of loops"). N >= 32 completes.
+Expected with N < 32 on lighthouse without the ``get_fusion_roots`` all-zero skip:
+assertion in LinalgTransformOps.cpp applyTilingToAll ("Mismatched number of loops").
 
     uv run python scripts/lighthouse_small_tile_repro.py 16
 """

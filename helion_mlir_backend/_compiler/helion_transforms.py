@@ -10,10 +10,18 @@ a vector read of the pad's source with the pad value past its end, written into
 an empty tensor, there is no such copy.
 
 ``split_transfers``: tile extents are runtime values, so every tile's transfer
-may be out of bounds and lowers to masked accesses. Upstream's full/partial
-split guards each with an in-bounds check, so only edge tiles take the masked
-path. Upstream loops forever on rank-reducing transfers, so these are first
-given the memref's rank.
+may be out of bounds and lowers to masked accesses. Each is split on an
+in-bounds check, so only edge tiles take the masked path. Upstream's
+``vector.split_transfer_full_partial`` stages n-D vectors through a stack buffer
+with ``vector.type_cast``, which overflows it when the inner vector dim is not a
+power of two in bytes, and loops forever on rank-reducing transfers.
+
+``legalize_for_llvm``: the vector ops upstream's LLVM lowering rejects or gets
+wrong become per-element scalar loads and stores: 0-d transfers (lowered only on
+memrefs of unit inner stride) and i1 transfers (LLVM packs i1 vectors into bits,
+while a memref holds one byte per i1). Contractions with operands narrower than
+the accumulator (folded extensions, for x86 dot-product and AMX patterns) that
+no x86 pattern took get their operands extended again.
 
 ``vectorize_linalg``: lighthouse vectorizes without vector sizes, which fails
 for ops of runtime shape. Tiling bounds each runtime extent (an ``affine.min``
@@ -21,7 +29,11 @@ with a constant), so such ops are vectorized with masks, the bounds as vector
 sizes. Masked contractions are unmasked for upstream's x86 contraction patterns.
 """
 
+from collections.abc import Callable
+from collections.abc import Iterator
 from collections.abc import Sequence
+from contextlib import contextmanager
+import itertools
 import math
 
 from lighthouse.dialects import DialectExtension
@@ -32,6 +44,7 @@ from mlir.dialects import affine
 from mlir.dialects import arith
 from mlir.dialects import ext
 from mlir.dialects import linalg
+from mlir.dialects import memref
 from mlir.dialects import scf
 from mlir.dialects import tensor
 from mlir.dialects import transform
@@ -43,6 +56,65 @@ from mlir.dialects.transform import vector as transform_vector
 
 class HelionTransformDialect(DialectExtension, name="helion_transform"):
     """Transform ops of the Helion MLIR backend's pipelines."""
+
+
+def _transform_op(*, modifies_payload: bool) -> Callable[[type], type]:
+    """Attach the interfaces of a transform op applied by its static ``run``.
+
+    An op modifying the payload produces no handles; others only read it.
+    """
+
+    def decorate(cls: type) -> type:
+        class Transform(transform.TransformOpInterface):
+            @staticmethod
+            def apply(
+                op: ir.OpView,
+                rewriter: transform.TransformRewriter,
+                results: transform.TransformResults,
+                state: transform.TransformState,
+            ) -> DiagnosedSilenceableFailure:
+                return cls.run(op, rewriter, results, state)
+
+            @staticmethod
+            def allow_repeated_handle_operands(_op: ir.OpView) -> bool:
+                return False
+
+        class Effects(ir.MemoryEffectsOpInterface):
+            @staticmethod
+            def get_effects(op: ir.OpView) -> list:
+                effects = transform.only_reads_handle(op.op_operands)
+                if modifies_payload:
+                    return effects + transform.modifies_payload()
+                return (
+                    effects
+                    + transform.produces_handle(op.results)
+                    + transform.only_reads_payload()
+                )
+
+        def attach_interface_impls(context: ir.Context | None = None) -> None:
+            Transform.attach(cls.OPERATION_NAME, context=context)
+            Effects.attach(cls.OPERATION_NAME, context=context)
+
+        cls.attach_interface_impls = staticmethod(attach_interface_impls)
+        return cls
+
+    return decorate
+
+
+def _payload_ops(
+    state: transform.TransformState, handle: ir.Value, op_types: type | tuple
+) -> list[ir.OpView]:
+    """The ``op_types`` ops nested in the payload of ``handle``, in pre-order."""
+    found: list[ir.OpView] = []
+
+    def collect(visited: ir.Operation) -> ir.WalkResult:
+        if isinstance(visited.opview, op_types):
+            found.append(visited.opview)
+        return ir.WalkResult.ADVANCE
+
+    for target in state.get_payload_ops(handle):
+        target.operation.walk(collect, ir.WalkOrder.PRE_ORDER)
+    return found
 
 
 def _pad_value(pad: tensor.PadOp) -> ir.Value | None:
@@ -109,52 +181,26 @@ def _vectorize(pad: tensor.PadOp, rewriter: transform.TransformRewriter) -> None
     rewriter.replace_op(pad, [written])
 
 
+@_transform_op(modifies_payload=True)
 class VectorizePadsOp(HelionTransformDialect.Operation, name="vectorize_pads"):
     """Vectorize every ``tensor.pad`` in the target with no low padding, a
     constant padding value and evident bounds of its runtime extents."""
 
     target: ext.Operand[transform.AnyOpType]
 
-    @classmethod
-    def attach_interface_impls(cls, context: ir.Context | None = None) -> None:
-        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-
-    class TransformOpInterfaceModel(transform.TransformOpInterface):
-        @staticmethod
-        def apply(
-            op: "VectorizePadsOp",
-            rewriter: transform.TransformRewriter,
-            _results: transform.TransformResults,
-            state: transform.TransformState,
-        ) -> DiagnosedSilenceableFailure:
-            pads: list[tensor.PadOp] = []
-
-            def collect(visited: ir.Operation) -> ir.WalkResult:
-                if isinstance(visited.opview, tensor.PadOp):
-                    pads.append(visited.opview)
-                return ir.WalkResult.ADVANCE
-
-            for target in state.get_payload_ops(op.target):
-                target.operation.walk(collect, ir.WalkOrder.PRE_ORDER)
-            for pad in pads:
-                _vectorize(pad, rewriter)
-            return DiagnosedSilenceableFailure.Success
-
-        @staticmethod
-        def allow_repeated_handle_operands(_op: "VectorizePadsOp") -> bool:
-            return False
-
-    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
-        @staticmethod
-        def get_effects(op: "VectorizePadsOp") -> list:
-            return (
-                transform.only_reads_handle(op.op_operands)
-                + transform.modifies_payload()
-            )
+    @staticmethod
+    def run(
+        op: "VectorizePadsOp",
+        rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for pad in _payload_ops(state, op.target, tensor.PadOp):
+            _vectorize(pad, rewriter)
+        return DiagnosedSilenceableFailure.Success
 
 
-def _expand_rank(
+def _split(
     transfer: vector.TransferReadOp | vector.TransferWriteOp,
     rewriter: transform.TransformRewriter,
 ) -> None:
@@ -168,90 +214,157 @@ def _expand_rank(
     rank, vector_rank = base_type.rank, vector_type.rank
     in_bounds = [ir.BoolAttr(flag).value for flag in transfer.in_bounds]
     minor_identity = ir.AffineMap.get_minor_identity(rank, vector_rank)
-    if (
-        not 0 < vector_rank < rank
-        or all(in_bounds)
-        or transfer.permutation_map.value != minor_identity
-    ):
+    if all(in_bounds) or transfer.permutation_map.value != minor_identity:
         return
-    unit_dims = rank - vector_rank
-    full_type = ir.VectorType.get(
-        [1] * unit_dims + vector_type.shape, vector_type.element_type
-    )
-    identity = ir.AffineMap.get_minor_identity(rank, rank)
-    # Dims outside the transfer are in bounds by definition.
-    full_in_bounds = [True] * unit_dims + in_bounds
+    index = ir.IndexType.get()
+    indices = list(transfer.indices)
     with ir.InsertionPoint(transfer), transfer.location:
-        if is_read:
-            read = vector.TransferReadOp(
-                full_type,
-                transfer.base,
-                transfer.indices,
-                identity,
-                transfer.padding,
-                full_in_bounds,
-            ).result
-            rewriter.replace_op(
-                transfer, [vector.ShapeCastOp(vector_type, read).result]
-            )
-        else:
-            value = vector.ShapeCastOp(full_type, transfer.valueToStore).result
-            vector.TransferWriteOp(
-                None, value, transfer.base, transfer.indices, identity, full_in_bounds
-            )
-            rewriter.erase_op(transfer)
+        fits = None
+        for dim, (size, flag) in enumerate(
+            zip(vector_type.shape, in_bounds, strict=True), rank - vector_rank
+        ):
+            if flag:
+                continue
+            end = arith.AddIOp(indices[dim], arith.ConstantOp(index, size)).result
+            extent = memref.DimOp(transfer.base, arith.ConstantOp(index, dim)).result
+            dim_fits = arith.CmpIOp(arith.CmpIPredicate.sle, end, extent).result
+            fits = dim_fits if fits is None else arith.AndIOp(fits, dim_fits).result
+        branch = scf.IfOp(fits, [vector_type] if is_read else [], has_else=True)
+        for block, flags in (
+            (branch.then_block, [True] * vector_rank),
+            (branch.else_block, in_bounds),
+        ):
+            with ir.InsertionPoint(block):
+                if is_read:
+                    read = vector.TransferReadOp(
+                        vector_type,
+                        transfer.base,
+                        indices,
+                        minor_identity,
+                        transfer.padding,
+                        flags,
+                    ).result
+                    scf.YieldOp([read])
+                else:
+                    vector.TransferWriteOp(
+                        None,
+                        transfer.valueToStore,
+                        transfer.base,
+                        indices,
+                        minor_identity,
+                        flags,
+                    )
+                    scf.YieldOp([])
+    if is_read:
+        rewriter.replace_op(transfer, list(branch.results))
+    else:
+        rewriter.erase_op(transfer)
 
 
-class ExpandTransferRankOp(
-    HelionTransformDialect.Operation, name="expand_transfer_rank"
-):
-    """Give every possibly out-of-bounds, minor-identity, unmasked memref transfer
-    in the target the memref's rank, through leading unit dims."""
+@_transform_op(modifies_payload=True)
+class SplitTransfersOp(HelionTransformDialect.Operation, name="split_transfers"):
+    """Guard every possibly out-of-bounds, minor-identity, unmasked memref transfer
+    in the target with an in-bounds check: an in-bounds transfer if it passes, the
+    original otherwise."""
 
     target: ext.Operand[transform.AnyOpType]
 
-    @classmethod
-    def attach_interface_impls(cls, context: ir.Context | None = None) -> None:
-        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-
-    class TransformOpInterfaceModel(transform.TransformOpInterface):
-        @staticmethod
-        def apply(
-            op: "ExpandTransferRankOp",
-            rewriter: transform.TransformRewriter,
-            _results: transform.TransformResults,
-            state: transform.TransformState,
-        ) -> DiagnosedSilenceableFailure:
-            transfers: list[vector.TransferReadOp | vector.TransferWriteOp] = []
-
-            def collect(visited: ir.Operation) -> ir.WalkResult:
-                if isinstance(
-                    visited.opview, (vector.TransferReadOp, vector.TransferWriteOp)
-                ):
-                    transfers.append(visited.opview)
-                return ir.WalkResult.ADVANCE
-
-            for target in state.get_payload_ops(op.target):
-                target.operation.walk(collect, ir.WalkOrder.PRE_ORDER)
-            for transfer in transfers:
-                _expand_rank(transfer, rewriter)
-            return DiagnosedSilenceableFailure.Success
-
-        @staticmethod
-        def allow_repeated_handle_operands(_op: "ExpandTransferRankOp") -> bool:
-            return False
-
-    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
-        @staticmethod
-        def get_effects(op: "ExpandTransferRankOp") -> list:
-            return (
-                transform.only_reads_handle(op.op_operands)
-                + transform.modifies_payload()
-            )
+    @staticmethod
+    def run(
+        op: "SplitTransfersOp",
+        rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        transfer_types = (vector.TransferReadOp, vector.TransferWriteOp)
+        for transfer in _payload_ops(state, op.target, transfer_types):
+            _split(transfer, rewriter)
+        return DiagnosedSilenceableFailure.Success
 
 
-def _constant(value: ir.Value) -> int | None:
+def _scalarize(
+    transfer: vector.TransferReadOp | vector.TransferWriteOp,
+    rewriter: transform.TransformRewriter,
+) -> None:
+    base_type = transfer.base.type
+    if not isinstance(base_type, ir.MemRefType):
+        return
+    is_read = isinstance(transfer, vector.TransferReadOp)
+    vector_type = ir.VectorType(
+        transfer.result.type if is_read else transfer.valueToStore.type
+    )
+    is_bool = vector_type.element_type == ir.IntegerType.get_signless(1)
+    minor_identity = ir.AffineMap.get_minor_identity(base_type.rank, vector_type.rank)
+    if (vector_type.rank != 0 and not is_bool) or (
+        transfer.permutation_map.value != minor_identity
+    ):
+        return
+    in_bounds = [ir.BoolAttr(flag).value for flag in transfer.in_bounds]
+    index = ir.IndexType.get()
+    leading = base_type.rank - vector_type.rank
+    with ir.InsertionPoint(transfer), transfer.location:
+        extents = {
+            dim: memref.DimOp(
+                transfer.base, arith.ConstantOp(index, leading + dim)
+            ).result
+            for dim, flag in enumerate(in_bounds)
+            if not flag
+        }
+        result = (
+            vector.BroadcastOp(vector_type, transfer.padding).result
+            if is_read
+            else None
+        )
+        for position in itertools.product(*map(range, vector_type.shape)):
+            indices = list(transfer.indices)
+            checks = []
+            for dim, offset in enumerate(position):
+                if offset:
+                    step = arith.ConstantOp(index, offset).result
+                    indices[leading + dim] = arith.AddIOp(
+                        indices[leading + dim], step
+                    ).result
+                if dim in extents:
+                    checks.append(
+                        arith.CmpIOp(
+                            arith.CmpIPredicate.slt,
+                            indices[leading + dim],
+                            extents[dim],
+                        ).result
+                    )
+            if transfer.mask is not None:
+                checks.append(vector.extract(transfer.mask, [], list(position)))
+            guard = None
+            for check in checks:
+                guard = check if guard is None else arith.AndIOp(guard, check).result
+            if is_read:
+                element = vector_type.element_type
+                if guard is None:
+                    scalar = memref.LoadOp(transfer.base, indices).result
+                else:
+                    branch = scf.IfOp(guard, [element], has_else=True)
+                    with ir.InsertionPoint(branch.then_block):
+                        scf.YieldOp([memref.LoadOp(transfer.base, indices).result])
+                    with ir.InsertionPoint(branch.else_block):
+                        scf.YieldOp([transfer.padding])
+                    scalar = branch.results[0]
+                result = vector.insert(scalar, result, [], list(position))
+            else:
+                scalar = vector.extract(transfer.valueToStore, [], list(position))
+                if guard is None:
+                    memref.StoreOp(scalar, transfer.base, indices)
+                else:
+                    branch = scf.IfOp(guard, [], has_else=False)
+                    with ir.InsertionPoint(branch.then_block):
+                        memref.StoreOp(scalar, transfer.base, indices)
+                        scf.YieldOp([])
+    if is_read:
+        rewriter.replace_op(transfer, [result])
+    else:
+        rewriter.erase_op(transfer)
+
+
+def _int_constant(value: ir.Value) -> int | None:
     if isinstance(value, ir.OpResult) and isinstance(
         value.owner.opview, arith.ConstantOp
     ):
@@ -268,7 +381,7 @@ def _min(bounds: Sequence[int | None]) -> int | None:
 
 def _size_bound(value: ir.Value, depth: int = 0) -> int | None:
     """A constant upper bound of the index ``value``, if one is evident."""
-    if (constant := _constant(value)) is not None:
+    if (constant := _int_constant(value)) is not None:
         return constant
     if depth > 16 or not isinstance(value, ir.OpResult):
         return None
@@ -292,7 +405,7 @@ def _size_bound(value: ir.Value, depth: int = 0) -> int | None:
     if isinstance(op, arith.AddIOp):
         bounds = [_size_bound(operand, depth + 1) for operand in op.operands]
         return None if None in bounds else sum(bounds)
-    if isinstance(op, tensor.DimOp) and (dim := _constant(op.index)) is not None:
+    if isinstance(op, tensor.DimOp) and (dim := _int_constant(op.index)) is not None:
         return _dim_bound(op.source, dim, depth + 1)
     return None
 
@@ -398,175 +511,124 @@ def _loop_bounds(op: ir.OpView) -> list[int | None] | None:
     return bounds
 
 
-def _runtime_tile_sizes(op: ir.OpView) -> list[int] | None:
-    """Tile sizes making a linalg op's loop ranges bounded, their bounds multiples
-    of ``_RUNTIME_TILE`` and its masked vectors at most ``_MAX_VECTOR_ELEMENTS``
-    (0: untiled)."""
+def _tile_sizes(op: ir.OpView) -> list[int] | None:
+    """Tile sizes making a linalg op's loop ranges bounded and its vectors at most
+    ``_MAX_VECTOR_ELEMENTS``, and those of an op of runtime shape multiples of
+    ``_TILE`` (0: untiled)."""
     bounds = _loop_bounds(op)
     if bounds is None:
         return None
     too_large = None not in bounds and math.prod(bounds) > _MAX_VECTOR_ELEMENTS
+    static = _has_static_shape(op)
     return [
-        _RUNTIME_TILE
+        _TILE
         if bound is None
-        or (bound > _RUNTIME_TILE and (too_large or bound % _RUNTIME_TILE))
+        or (bound > _TILE and (too_large or (not static and bound % _TILE)))
         else 0
         for bound in bounds
     ]
 
 
+def _has_static_shape(op: ir.OpView) -> bool:
+    return all(
+        ir.ShapedType(value.type).has_static_shape
+        for value in [*op.operands, *op.results]
+        if isinstance(value.type, ir.ShapedType)
+    )
+
+
 # Loop counts of the ops vectorize_linalg vectorizes with masks.
 _MAX_LOOPS = 8
-# Tile size of runtime extents without an evident bound, of odd bounds, and of all
-# extents of ops whose masked vectors would exceed _MAX_VECTOR_ELEMENTS: LLVM takes
-# many seconds on large or odd-width masked vectors.
-_RUNTIME_TILE = 32
+# Tile size of runtime extents without an evident bound, of odd runtime bounds, and
+# of all extents of ops whose vectors would exceed _MAX_VECTOR_ELEMENTS: LLVM takes
+# many seconds on large vectors and on odd-width masked ones.
+_TILE = 32
 _MAX_VECTOR_ELEMENTS = 4096
 
 
+@_transform_op(modifies_payload=False)
 class PartitionLinalgOp(HelionTransformDialect.Operation, name="partition_linalg"):
-    """Group the target's linalg ops: those of static shape; those of runtime
-    shape with evident loop bounds, by loop count (1 to ``_MAX_LOOPS``); and
-    those needing runtime tiling first (``_runtime_tile_sizes``)."""
+    """Group the target's linalg ops with loops: those needing tiling first
+    (``_tile_sizes``); the rest of static shape; and those of runtime shape with
+    evident loop bounds, by loop count (1 to ``_MAX_LOOPS``). Upstream vectorizes
+    a loop-free op reading with ``tensor.extract`` into invalid IR."""
 
     target: ext.Operand[transform.AnyOpType]
     groups: Sequence[ext.Result[transform.AnyOpType]]
 
-    @classmethod
-    def attach_interface_impls(cls, context: ir.Context | None = None) -> None:
-        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
+    @staticmethod
+    def run(
+        op: "PartitionLinalgOp",
+        _rewriter: transform.TransformRewriter,
+        results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        groups: list[list[ir.Operation]] = [[] for _ in op.groups]
 
-    class TransformOpInterfaceModel(transform.TransformOpInterface):
-        @staticmethod
-        def apply(
-            op: "PartitionLinalgOp",
-            _rewriter: transform.TransformRewriter,
-            results: transform.TransformResults,
-            state: transform.TransformState,
-        ) -> DiagnosedSilenceableFailure:
-            groups: list[list[ir.Operation]] = [[] for _ in op.groups]
-
-            def collect(visited: ir.Operation) -> ir.WalkResult:
-                bounds = _loop_bounds(visited.opview)
-                if bounds is None:
-                    return ir.WalkResult.ADVANCE
-                shaped = [
-                    ir.ShapedType(value.type)
-                    for value in [*visited.operands, *visited.results]
-                    if isinstance(value.type, ir.ShapedType)
-                ]
-                if all(value.has_static_shape for value in shaped):
-                    groups[0].append(visited)
-                elif any(_runtime_tile_sizes(visited.opview)):
-                    groups[-1].append(visited)
-                elif 0 < len(bounds) < len(groups) - 1:
-                    groups[len(bounds)].append(visited)
+        def collect(visited: ir.Operation) -> ir.WalkResult:
+            bounds = _loop_bounds(visited.opview)
+            if not bounds:
                 return ir.WalkResult.ADVANCE
+            if any(_tile_sizes(visited.opview)):
+                groups[-1].append(visited)
+            elif _has_static_shape(visited.opview):
+                groups[0].append(visited)
+            elif 0 < len(bounds) < len(groups) - 1:
+                groups[len(bounds)].append(visited)
+            return ir.WalkResult.ADVANCE
 
-            for target in state.get_payload_ops(op.target):
-                target.operation.walk(collect, ir.WalkOrder.PRE_ORDER)
-            for handle, ops in zip(op.groups, groups, strict=True):
-                results.set_ops(handle, ops)
-            return DiagnosedSilenceableFailure.Success
-
-        @staticmethod
-        def allow_repeated_handle_operands(_op: "PartitionLinalgOp") -> bool:
-            return False
-
-    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
-        @staticmethod
-        def get_effects(op: "PartitionLinalgOp") -> list:
-            return (
-                transform.only_reads_handle(op.op_operands)
-                + transform.produces_handle(op.results)
-                + transform.only_reads_payload()
-            )
+        for target in state.get_payload_ops(op.target):
+            target.operation.walk(collect, ir.WalkOrder.PRE_ORDER)
+        for handle, ops in zip(op.groups, groups, strict=True):
+            results.set_ops(handle, ops)
+        return DiagnosedSilenceableFailure.Success
 
 
+@_transform_op(modifies_payload=False)
 class LoopBoundsOp(HelionTransformDialect.Operation, name="loop_bounds"):
     """The constant upper bounds of one linalg op's loop ranges, one param each."""
 
     target: ext.Operand[transform.AnyOpType]
     bounds: Sequence[ext.Result[transform.AnyParamType]]
 
-    @classmethod
-    def attach_interface_impls(cls, context: ir.Context | None = None) -> None:
-        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-
-    class TransformOpInterfaceModel(transform.TransformOpInterface):
-        @staticmethod
-        def apply(
-            op: "LoopBoundsOp",
-            _rewriter: transform.TransformRewriter,
-            results: transform.TransformResults,
-            state: transform.TransformState,
-        ) -> DiagnosedSilenceableFailure:
-            targets = state.get_payload_ops(op.target)
-            bounds = _loop_bounds(targets[0].opview) if len(targets) == 1 else None
-            if bounds is None or None in bounds or len(bounds) != len(op.bounds):
-                return DiagnosedSilenceableFailure.SilenceableFailure
-            i64 = ir.IntegerType.get_signless(64)
-            for handle, bound in zip(op.bounds, bounds, strict=True):
-                results.set_params(handle, [ir.IntegerAttr.get(i64, bound)])
-            return DiagnosedSilenceableFailure.Success
-
-        @staticmethod
-        def allow_repeated_handle_operands(_op: "LoopBoundsOp") -> bool:
-            return False
-
-    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
-        @staticmethod
-        def get_effects(op: "LoopBoundsOp") -> list:
-            return (
-                transform.only_reads_handle(op.op_operands)
-                + transform.produces_handle(op.results)
-                + transform.only_reads_payload()
-            )
+    @staticmethod
+    def run(
+        op: "LoopBoundsOp",
+        _rewriter: transform.TransformRewriter,
+        results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        targets = state.get_payload_ops(op.target)
+        bounds = _loop_bounds(targets[0].opview) if len(targets) == 1 else None
+        if bounds is None or None in bounds or len(bounds) != len(op.bounds):
+            return DiagnosedSilenceableFailure.SilenceableFailure
+        i64 = ir.IntegerType.get_signless(64)
+        for handle, bound in zip(op.bounds, bounds, strict=True):
+            results.set_params(handle, [ir.IntegerAttr.get(i64, bound)])
+        return DiagnosedSilenceableFailure.Success
 
 
-class RuntimeTileSizesOp(HelionTransformDialect.Operation, name="runtime_tile_sizes"):
-    """The ``_runtime_tile_sizes`` of one linalg op, as one param."""
+@_transform_op(modifies_payload=False)
+class TileSizesOp(HelionTransformDialect.Operation, name="tile_sizes"):
+    """The ``_tile_sizes`` of one linalg op, as one param."""
 
     target: ext.Operand[transform.AnyOpType]
     sizes: ext.Result[transform.AnyParamType[()]] = ext.infer_result()
 
-    @classmethod
-    def attach_interface_impls(cls, context: ir.Context | None = None) -> None:
-        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-
-    class TransformOpInterfaceModel(transform.TransformOpInterface):
-        @staticmethod
-        def apply(
-            op: "RuntimeTileSizesOp",
-            _rewriter: transform.TransformRewriter,
-            results: transform.TransformResults,
-            state: transform.TransformState,
-        ) -> DiagnosedSilenceableFailure:
-            targets = state.get_payload_ops(op.target)
-            sizes = (
-                _runtime_tile_sizes(targets[0].opview) if len(targets) == 1 else None
-            )
-            if sizes is None:
-                return DiagnosedSilenceableFailure.SilenceableFailure
-            i64 = ir.IntegerType.get_signless(64)
-            results.set_params(op.sizes, [ir.IntegerAttr.get(i64, s) for s in sizes])
-            return DiagnosedSilenceableFailure.Success
-
-        @staticmethod
-        def allow_repeated_handle_operands(_op: "RuntimeTileSizesOp") -> bool:
-            return False
-
-    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
-        @staticmethod
-        def get_effects(op: "RuntimeTileSizesOp") -> list:
-            return (
-                transform.only_reads_handle(op.op_operands)
-                + transform.produces_handle(op.results)
-                + transform.only_reads_payload()
-            )
+    @staticmethod
+    def run(
+        op: "TileSizesOp",
+        _rewriter: transform.TransformRewriter,
+        results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        targets = state.get_payload_ops(op.target)
+        sizes = _tile_sizes(targets[0].opview) if len(targets) == 1 else None
+        if sizes is None:
+            return DiagnosedSilenceableFailure.SilenceableFailure
+        i64 = ir.IntegerType.get_signless(64)
+        results.set_params(op.sizes, [ir.IntegerAttr.get(i64, s) for s in sizes])
+        return DiagnosedSilenceableFailure.Success
 
 
 def _mask_sizes(mask: ir.Value) -> list[ir.Value | int] | None:
@@ -636,6 +698,7 @@ def _unmask_contraction(
     rewriter.replace_op(masked, [result])
 
 
+@_transform_op(modifies_payload=True)
 class UnmaskContractionsOp(
     HelionTransformDialect.Operation, name="unmask_contractions"
 ):
@@ -644,89 +707,127 @@ class UnmaskContractionsOp(
 
     target: ext.Operand[transform.AnyOpType]
 
-    @classmethod
-    def attach_interface_impls(cls, context: ir.Context | None = None) -> None:
-        cls.TransformOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
-        cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
+    @staticmethod
+    def run(
+        op: "UnmaskContractionsOp",
+        rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for masked in _payload_ops(state, op.target, vector.MaskOp):
+            _unmask_contraction(masked, rewriter)
+        return DiagnosedSilenceableFailure.Success
 
-    class TransformOpInterfaceModel(transform.TransformOpInterface):
-        @staticmethod
-        def apply(
-            op: "UnmaskContractionsOp",
-            rewriter: transform.TransformRewriter,
-            _results: transform.TransformResults,
-            state: transform.TransformState,
-        ) -> DiagnosedSilenceableFailure:
-            masks: list[vector.MaskOp] = []
 
-            def collect(visited: ir.Operation) -> ir.WalkResult:
-                if isinstance(visited.opview, vector.MaskOp):
-                    masks.append(visited.opview)
-                return ir.WalkResult.ADVANCE
-
-            for target in state.get_payload_ops(op.target):
-                target.operation.walk(collect, ir.WalkOrder.PRE_ORDER)
-            for masked in masks:
-                _unmask_contraction(masked, rewriter)
-            return DiagnosedSilenceableFailure.Success
-
-        @staticmethod
-        def allow_repeated_handle_operands(_op: "UnmaskContractionsOp") -> bool:
-            return False
-
-    class MemoryEffectsOpInterfaceModel(ir.MemoryEffectsOpInterface):
-        @staticmethod
-        def get_effects(op: "UnmaskContractionsOp") -> list:
-            return (
-                transform.only_reads_handle(op.op_operands)
-                + transform.modifies_payload()
+def _extend_contraction(
+    contract: vector.ContractionOp, rewriter: transform.TransformRewriter
+) -> None:
+    acc_type = contract.acc.type
+    element = (
+        ir.VectorType(acc_type).element_type
+        if isinstance(acc_type, ir.VectorType)
+        else acc_type
+    )
+    operand_types = [
+        ir.VectorType(value.type) for value in (contract.lhs, contract.rhs)
+    ]
+    if not isinstance(element, ir.FloatType) or all(
+        operand.element_type == element for operand in operand_types
+    ):
+        return
+    if not all(
+        isinstance(operand.element_type, ir.FloatType) for operand in operand_types
+    ):
+        return
+    with ir.InsertionPoint(contract), contract.location:
+        operands = [
+            value
+            if operand.element_type == element
+            else arith.ExtFOp(ir.VectorType.get(operand.shape, element), value).result
+            for value, operand in zip(
+                (contract.lhs, contract.rhs), operand_types, strict=True
             )
+        ]
+        result = vector.ContractionOp(
+            contract.result.type,
+            *operands,
+            contract.acc,
+            contract.indexing_maps,
+            contract.iterator_types,
+            kind=contract.kind,
+            fastmath=contract.fastmath,
+        ).result
+    rewriter.replace_op(contract, [result])
+
+
+@_transform_op(modifies_payload=True)
+class LegalizeForLLVMOp(HelionTransformDialect.Operation, name="legalize_for_llvm"):
+    """Rewrite every 0-d or i1 minor-identity memref transfer in the target as
+    per-element scalar loads or stores, and every floating-point contraction with
+    operands narrower than its accumulator as one of extended operands."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "LegalizeForLLVMOp",
+        rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        transfer_types = (vector.TransferReadOp, vector.TransferWriteOp)
+        for transfer in _payload_ops(state, op.target, transfer_types):
+            _scalarize(transfer, rewriter)
+        for contract in _payload_ops(state, op.target, vector.ContractionOp):
+            _extend_contraction(contract, rewriter)
+        return DiagnosedSilenceableFailure.Success
+
+
+@contextmanager
+def _suppressing(op: ir.Value) -> Iterator[ir.Value]:
+    """A sequence on ``op`` whose silenceable failures are ignored."""
+    sequence = transform.SequenceOp(transform.FailurePropagationMode.Suppress, [], op)
+    with ir.InsertionPoint(sequence.body):
+        yield sequence.bodyTarget
+        transform.yield_()
 
 
 def vectorize_linalg() -> ir.Module:
     """Schedule: lighthouse's ``vectorization.py[gen=vectorize_linalg]``, also
-    vectorizing ops of runtime shape, with masks. Their runtime extents without
-    an evident bound are first tiled; ops that cannot be are left to the loop
-    lowering."""
+    vectorizing ops of runtime shape, with masks. Runtime extents without an
+    evident bound and ops of too large vectors are first tiled. Ops that cannot
+    be tiled or vectorized (e.g. argmax, gathers) are left to the loop lowering."""
     HelionTransformDialect.load()
     groups = [transform.AnyOpType.get()] * (_MAX_LOOPS + 2)
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
-        unbounded = PartitionLinalgOp(target=funcs, groups=groups).groups[-1]
-        with lh_transform.foreach(unbounded) as op:
-            sizes = RuntimeTileSizesOp(target=op).sizes
-            # Tiling fails, changing nothing, on some ops (e.g. keepdim reductions).
-            sequence = transform.SequenceOp(
-                transform.FailurePropagationMode.Suppress, [], op
-            )
-            with ir.InsertionPoint(sequence.body):
-                structured.TileUsingForOp(sequence.bodyTarget, sizes=sizes)
-                transform.yield_()
+        to_tile = PartitionLinalgOp(target=funcs, groups=groups).groups[-1]
+        with lh_transform.foreach(to_tile) as op:
+            sizes = TileSizesOp(target=op).sizes
+            with _suppressing(op) as target:
+                structured.TileUsingForOp(target, sizes=sizes)
             transform.yield_()
         static, *dynamic, _ = PartitionLinalgOp(target=funcs, groups=groups).groups
         with lh_transform.foreach(static) as op:
-            structured.structured_vectorize(op, [], create_named_contraction=True)
+            with _suppressing(op) as target:
+                structured.structured_vectorize(
+                    target, [], create_named_contraction=True
+                )
             transform.yield_()
         for loops, group in enumerate(dynamic, 1):
             with lh_transform.foreach(group) as op:
-                # Ops masked vectorization rejects (e.g. argmax, gathers) stay for
-                # the loop lowering.
-                sequence = transform.SequenceOp(
-                    transform.FailurePropagationMode.Suppress, [], op
-                )
-                with ir.InsertionPoint(sequence.body):
+                with _suppressing(op) as target:
                     bounds = LoopBoundsOp(
-                        target=sequence.bodyTarget,
+                        target=target,
                         bounds=[transform.AnyParamType.get()] * loops,
                     ).bounds
                     structured.structured_vectorize(
-                        sequence.bodyTarget,
+                        target,
                         list(bounds),
                         static_vector_sizes=[ir.ShapedType.get_dynamic_size()] * loops,
                         scalable_sizes=[False] * loops,
                         create_named_contraction=True,
                     )
-                    transform.yield_()
                 transform.yield_()
         with ir.InsertionPoint(
             transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
@@ -758,16 +859,24 @@ def vectorize_pads() -> ir.Module:
 
 
 def split_transfers() -> ir.Module:
-    """Schedule: full/partial split of every function's out-of-bounds memref
-    transfers. Needs an allocation scope around each transfer."""
+    """Schedule: split every function's out-of-bounds memref transfers on an
+    in-bounds check."""
     HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
-        ExpandTransferRankOp(target=funcs)
-        with ir.InsertionPoint(transform.ApplyPatternsOp(funcs).patterns):
-            transform_vector.apply_patterns_vector_split_transfer_full_partial(
-                split_transfer_strategy=transform_vector.VectorTransferSplit.VectorTransfer
-            )
+        SplitTransfersOp(target=funcs)
+        lh_transform.cleanup(named_seq.bodyTarget)
+
+        transform.yield_()
+    return schedule
+
+
+def legalize_for_llvm() -> ir.Module:
+    """Schedule: legalize every function's vector ops for the LLVM lowering."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        LegalizeForLLVMOp(target=funcs)
         lh_transform.cleanup(named_seq.bodyTarget)
 
         transform.yield_()

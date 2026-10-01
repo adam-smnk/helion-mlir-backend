@@ -27,7 +27,7 @@ import torch
 import torch.fx
 
 from ..aten_bridge import original_args
-from ..einsum_capture import is_einsum_node
+from ..trace_mode import is_einsum_node
 
 aten = torch.ops.aten
 

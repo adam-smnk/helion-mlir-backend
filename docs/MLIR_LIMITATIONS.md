@@ -268,33 +268,31 @@ Note that `hl.grid()` loops are not tunable and consume no `block_sizes` slot;
 only `hl.tile()` loops do. Supplying a config sized for the grid loops silently
 assigns the wrong block size to the tiled loops.
 
-## 14) Optimizing Pipeline Requires Tiles of at Least 32
+## 14) Small Tiles on the Optimizing Pipeline
 
-Under `HELION_MLIR_PIPELINE=1`, lighthouse's cache-level tile-and-fuse assigns a zero tile
-size to every dimension smaller than its 32-element cache tile. An op whose tiled dimensions
-are all smaller than 32 then aborts the process inside upstream MLIR
-(`applyTilingToAll`: "Mismatched number of loops"). This is independent of the backend:
+Lighthouse's cache-level tile-and-fuse assigns a zero tile size to every dimension smaller
+than its 32-element cache tile. Upstream MLIR aborts the process when it fuses an op whose
+tile sizes are all zero (`applyTilingToAll`: "Mismatched number of loops");
 `scripts/lighthouse_small_tile_repro.py N` reproduces it with a single
-`linalg.elementwise` on `tensor<Nxf32>` (N < 32 aborts, N >= 32 completes).
+`linalg.elementwise` on `tensor<Nxf32>` (N < 32 aborts). The local lighthouse change of
+section 15 skips such fusion roots, so small tiles work on the optimizing pipeline.
 
-Workaround until lighthouse is fixed: use block sizes of at least 32 for kernels lowered
-through the optimizing pipeline. The scalar pipeline is unaffected. The autotuner does this
-itself: a search under the optimizing pipeline only tries tiles of at least 32 (where the
-dimension allows); given configs are not changed.
-
-With tiles of at least 32, the remaining failures are statically shaped ops that
-lighthouse's vectorization rejects on ragged tiles, e.g. `argmax` over 33x65 rows (a
-Python `ValueError`: "Failed to apply named transform sequence").
+An autotuning search under the optimizing pipeline tries tiles of at least 32 (where the
+dimension allows) except for the leading dim of each outermost loop, which may be any
+size: small outer tiles add parallel work and keep the code per tile small, while
+narrower inner tiles waste vector lanes. Given configs are not changed. On lighthouse's
+main branch, a small outer tile of a kernel without another tiled dim still aborts.
 
 ## 15) Lighthouse Pipeline Deviations
 
-The backend relies on one lighthouse change not yet on its main branch:
-`bufferization.yaml` runs one-shot bufferization with `allow-return-allocs-from-loops`,
-so loop-carried values need not be updated in place (otherwise such updates fail with
-"Yield operand #0 is not equivalent to the corresponding iter bbArg"; section 5).
+The backend relies on two lighthouse changes not yet on its main branch:
+- `bufferization.yaml` runs one-shot bufferization with `allow-return-allocs-from-loops`,
+  so loop-carried values need not be updated in place (otherwise such updates fail with
+  "Yield operand #0 is not equivalent to the corresponding iter bbArg"; section 5).
+- `get_fusion_roots` skips ops whose tile sizes are all zero (section 14).
 
-The optimizing pipeline (`_compiler/pipeline.yaml`) follows lighthouse's x86 pipeline,
-with these stages from `_compiler/helion_transforms.py` replacing or added to it:
+The optimizing pipeline (`_compiler/pipeline.yaml`, the default) follows lighthouse's x86
+pipeline, with these stages from `_compiler/helion_transforms.py` replacing or added to it:
 - `vectorize_pads`, before the tensor-level vectorization: each `tensor.pad` whose
   runtime extents have evident constant bounds becomes a vector read of its source
   (padded with the pad value) written into an empty tensor. Bufferized as is, a pad is a
@@ -306,33 +304,47 @@ with these stages from `_compiler/helion_transforms.py` replacing or added to it
   runtime shape with masks. Lighthouse vectorizes without vector sizes, which fails for
   them. Tiling bounds a runtime extent by an `affine.min` with a constant; the bounds,
   traced through slices, pads and loops, are the vector sizes. Other runtime extents
-  are tiled by 32 first, and so are bounds above 32 that are not multiples of 32 and all
-  extents of an op whose masked vectors would exceed 4096 elements (LLVM otherwise spends
-  seconds to minutes on them). A masked add-contraction becomes an unmasked one of
+  are tiled by 32 first, and so are bounds above 32 that are not multiples of 32. All
+  extents above 32 of any op, static or not, whose vectors would exceed 4096 elements
+  are tiled by 32 too (LLVM otherwise spends seconds to minutes on them: a 32-row
+  softmax tile of 1024 columns compiled in about 110 s, now about 1 s). A masked
+  add-contraction becomes an unmasked one of
   operands zeroed where masked off (upstream's x86 contraction patterns rewrite inside
   `vector.mask` regions, which the verifier rejects). Ops that cannot be tiled or that
-  masked vectorization rejects (e.g. argmax, gathers) are lowered to loops
-  (`convert-linalg-to-loops`).
-- `split_transfers`, after bufferization and before OpenMP (the split needs an
-  allocation scope around each transfer): tile extents are runtime values, so every
-  tile's vector transfer may be out of bounds and lowers to masked accesses. Upstream's
-  full/partial split (`vector.split_transfer_full_partial`) guards each with an
-  in-bounds check, so only edge tiles take the masked path (padded bf16 packing was
-  2-4x slower without it). Upstream loops forever on a rank-reducing transfer (vector
-  rank below the memref's: it creates the check, then fails), so these first get
-  leading unit dims. Transfers with a permutation map (transposed tiles) are not split.
+  vectorization rejects (e.g. argmax, gathers) are lowered to loops
+  (`convert-linalg-to-loops`). Loop-free (0-d) ops are not vectorized: upstream turns
+  one reading with `tensor.extract` into invalid IR.
+- `split_transfers`, after bufferization: tile extents are runtime values, so every
+  tile's vector transfer may be out of bounds and lowers to masked accesses. Each is
+  split on an in-bounds check into an in-bounds transfer and the original, so only edge
+  tiles take the masked path (padded bf16 packing was 2-4x slower without it). Upstream's
+  `vector.split_transfer_full_partial` is not used: it stages n-D vectors through a
+  stack buffer with `vector.type_cast`, which overflows the buffer when the inner
+  vector dim is not a power of two in bytes (LLVM pads each inner vector), and it loops
+  forever on rank-reducing transfers. Transfers with a permutation map (transposed
+  tiles) are not split.
+- `legalize_for_llvm`, before the LLVM lowering, rewrites what upstream's lowering
+  rejects or gets wrong. 0-d transfers (lowered upstream only on memrefs of unit inner
+  stride) and i1 transfers (LLVM packs an i1 vector into bits, while a memref holds
+  one byte per i1: bool tensors read and wrote garbage) become per-element scalar loads
+  and stores. Contractions with operands narrower than the accumulator (bf16 operands
+  folded into an f32 contraction for the x86 dot-product and AMX patterns) that no x86
+  pattern took get their operands extended again; without AMX or AVX512-BF16 they
+  otherwise fail to lower.
 
 ## 16) Autotuning
 
 - Only `block_sizes` are tuned (the backend accepts `block_sizes` and `mlir_pipeline`
   config keys; others raise `InvalidConfig`). The pipeline is not searched: a search uses
-  `HELION_MLIR_PIPELINE`'s pipeline.
+  the default pipeline (`HELION_MLIR_PIPELINE`, else `opt`).
 - Candidates run in the tuning process (no precompile subprocess), timed by wall clock.
   A candidate the backend or lighthouse rejects with an error is skipped, but a native
-  abort inside MLIR (e.g. the small-tile assertion above) ends the process.
-- Compiling on the optimizing pipeline is much slower than on the scalar one for wide
-  tiles (a 32x1024 softmax: about 2.5 s of lighthouse passes and 7 s of LLVM JIT), which
-  bounds how many configs a search can afford.
+  abort inside MLIR ends the process.
+- Compiling on the optimizing pipeline is slower than on the scalar one (a 256x1024
+  softmax: about 1 s for any row block size). Tiles of several rows over very wide rows
+  are the exception: 2-row tiles of 16384-column rows take about 4 minutes, nearly all in
+  one-shot bufferization's analysis of lighthouse's unrolled register tiles, while
+  1-row tiles compile in about a second.
 - Compiled entries are cached in-process only; lighthouse's `Runner` cannot load a dumped
   object file, so there is no on-disk cache of compiled code (best configs are cached on
   disk by Helion's autotune cache).

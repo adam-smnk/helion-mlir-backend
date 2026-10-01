@@ -1,6 +1,5 @@
 """Run curated upstream Helion examples through the MLIR backend on CPU.
 
-Tracks backend coverage across refactor phases (docs/MLIR_BACKEND_REVIEW_PLAN.md, Phase 0).
 Each case runs in its own subprocess and is classified pass / wrong / error / crash.
 
     uv run python scripts/conformance_sweep.py                    # compare to baseline

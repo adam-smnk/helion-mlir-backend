@@ -9,7 +9,7 @@ parameters.
 The direct `@helion.kernel(backend="mlir")` call (like `compile_mlir`) runs the
 kernel's host code on every call, so the host-computed `scale` reaches the
 compiled kernel. The explicit `generate_mlir()` + `execute_mlir()` flow runs no
-host code and rejects this kernel (see docs/MLIR_LIMITATIONS.md, item 11).
+host code and rejects this kernel.
 
 Why hl.barrier() is required (not optional, not CPU-specific):
 - Helion's frontend rejects a later top-level loop reading a tensor written
@@ -97,8 +97,7 @@ def main() -> None:
     print("- `scale` is a host-computed tensor (not a kernel parameter),")
     print("  recomputed by the host code on each call and passed to the entry.")
     print("- `mid` (phase 0's output) is threaded into phase 1 as an SSA value.")
-    print("- execute_mlir() runs no host code, so it rejects this kernel")
-    print("  (see docs/MLIR_LIMITATIONS.md, item 11).")
+    print("- execute_mlir() runs no host code, so it rejects this kernel.")
 
 
 if __name__ == "__main__":

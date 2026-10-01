@@ -1,5 +1,6 @@
-"""Helion language ops lowered directly (plan Phase 7): ``torch.tensor`` constants,
-``hl.reduce``, ``hl.associative_scan``/``torch.cumsum`` and ``hl.split``/``hl.join``."""
+"""Helion language ops lowered directly: ``torch.tensor`` constants, ``hl.reduce``,
+``hl.associative_scan``/``torch.cumsum`` (also as a tensor method) and
+``hl.split``/``hl.join``."""
 
 from __future__ import annotations
 
@@ -112,6 +113,14 @@ def cumsum_kernel(x: torch.Tensor) -> torch.Tensor:
 
 
 @_kernel(4)
+def scan_methods_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile, :] = x[tile, :].cumsum(-1) + x[tile, :].cumprod(dim=1)
+    return out
+
+
+@_kernel(4)
 def reverse_scan_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
@@ -194,6 +203,17 @@ def test_cumsum() -> None:
         [torch.randn(8, 16)],
         atol=1e-5,
         rtol=1e-5,
+    )
+
+
+def test_scan_methods() -> None:
+    torch.manual_seed(0)
+    check_kernel(
+        scan_methods_kernel,
+        lambda x: x.cumsum(-1) + x.cumprod(dim=1),
+        [torch.rand(8, 16) + 0.5],
+        atol=1e-4,
+        rtol=1e-4,
     )
 
 

@@ -12,7 +12,7 @@ which touches the operand's data twice (once to copy into the padded buffer,
 once to pack from it). The goal is to fold the zero-fill and the real-data copy
 into the kernel that does the packing, so padding-needed shapes get the same
 single-pass treatment as the aligned-shape path (see
-`docs/AMX_MATMUL_OPTIMIZATION_FINDINGS.md` for the packing-loop speedup).
+`docs/history/AMX_MATMUL_OPTIMIZATION_FINDINGS.md` for the packing-loop speedup).
 
 ## Status: padding fused into single-phase packing kernels
 
@@ -230,8 +230,9 @@ print("res[19:64] should be 0, is:", res[19:64])  # shows duplicated a[0:...] da
 
 ## 3) Unrelated: AMX Tile-And-Fuse Schedule Crashes on a Standalone 1D Elementwise Kernel
 
-**Status:** current, and not specific to padding: the optimizing pipeline aborts on
-ops whose tiled dims are all smaller than 32 (`docs/MLIR_LIMITATIONS.md`, section 14;
+**Status:** resolved by a local lighthouse change, and not specific to padding: the
+optimizing pipeline aborted on ops whose tiled dims are all smaller than 32
+(`docs/MLIR_LIMITATIONS.md`, section 14;
 `scripts/lighthouse_small_tile_repro.py`). It was found while investigating Finding 1,
 whose earlier version misattributed this crash to "cross-kernel state corruption".
 

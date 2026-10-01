@@ -1,4 +1,4 @@
-"""Ragged (boundary) tiles: a tile that extends past its loop or tensor (plan Phase 6).
+"""Ragged (boundary) tiles: a tile that extends past its loop or tensor.
 
 Loads zero-pad the part outside, ``_mask_to`` replaces it by the reduction
 identity, and stores write only the real part. When the block size divides the
@@ -224,7 +224,7 @@ def test_nonzero_begin() -> None:
 
 
 def test_read_past_tensor_end_is_zero() -> None:
-    """``docs/PADDING_FUSION_FINDINGS.md``, finding 2: the excess reads as zeros."""
+    """A tile read past the tensor's end reads zeros there."""
     torch.manual_seed(0)
     a = torch.randn(19)
     result = run_direct(read_past_end_kernel, [a, hl.constexpr(64)])

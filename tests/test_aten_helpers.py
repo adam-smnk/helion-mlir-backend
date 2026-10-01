@@ -1,4 +1,4 @@
-"""ATen helpers typed at the call site (plan Phase 5).
+"""ATen helpers typed at the call site.
 
 Generic ATen nodes become calls to torch-mlir helpers whose signatures come from
 the operands' MLIR types; these tests pin the properties of that design.

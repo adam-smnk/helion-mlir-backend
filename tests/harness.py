@@ -20,23 +20,26 @@ if TYPE_CHECKING:
 
 
 @contextlib.contextmanager
-def scalar_pipeline() -> Iterator[None]:
-    """Force the scalar lighthouse pipeline regardless of ``HELION_MLIR_PIPELINE``."""
-    with patch.dict(os.environ, {"HELION_MLIR_PIPELINE": "0"}):
+def use_pipeline(pipeline: str | None) -> Iterator[None]:
+    """Default compiles in the block to ``pipeline`` (``None``: unchanged)."""
+    if pipeline is None:
+        yield
+        return
+    with patch.dict(os.environ, {"HELION_MLIR_PIPELINE": pipeline}):
         yield
 
 
-@contextlib.contextmanager
-def opt_pipeline() -> Iterator[None]:
-    """Force the backend's optimizing lighthouse pipeline."""
-    with patch.dict(os.environ, {"HELION_MLIR_PIPELINE": "1"}):
-        yield
+def scalar_pipeline() -> contextlib.AbstractContextManager[None]:
+    return use_pipeline("scalar")
+
+
+def opt_pipeline() -> contextlib.AbstractContextManager[None]:
+    return use_pipeline("opt")
 
 
 def execute_module(module: object, *tensors: torch.Tensor, kernel_name: str) -> object:
-    """Run a module from ``generate_mlir`` on the scalar pipeline."""
-    with scalar_pipeline():
-        return MLIRBackend().execute_mlir(module, *tensors, kernel_name=kernel_name)
+    """Run a module from ``generate_mlir``."""
+    return MLIRBackend().execute_mlir(module, *tensors, kernel_name=kernel_name)
 
 
 def run_generated(
@@ -51,9 +54,11 @@ def run_generated(
     return execute_module(module, *tensors, kernel_name=kernel.fn.__name__)
 
 
-def run_direct(kernel: helion.Kernel, args: list[object]) -> object:
+def run_direct(
+    kernel: helion.Kernel, args: list[object], *, pipeline: str | None = None
+) -> object:
     """Run ``kernel`` through the direct ``@helion.kernel(backend="mlir")`` call path."""
-    with scalar_pipeline():
+    with use_pipeline(pipeline):
         return kernel(*args)
 
 
@@ -64,22 +69,24 @@ def check_kernel(
     *,
     paths: tuple[str, ...] = ("direct",),
     config: helion.Config | None = None,
+    pipeline: str | None = None,
     atol: float = 1e-5,
     rtol: float = 1e-5,
 ) -> None:
     """Assert that ``kernel(*args)`` matches ``reference(*args)`` on every requested path.
 
     ``reference`` runs on clones so in-place kernels and references cannot see each
-    other's writes.
+    other's writes. ``pipeline`` overrides the default lighthouse pipeline.
     """
     expected = reference(*_clone_args(args))
     for path in paths:
-        if path == "direct":
-            actual = run_direct(kernel, _clone_args(args))
-        elif path == "generated":
-            actual = run_generated(kernel, _clone_args(args), config=config)
-        else:
-            raise ValueError(f"unknown execution path {path!r}")
+        with use_pipeline(pipeline):
+            if path == "direct":
+                actual = run_direct(kernel, _clone_args(args))
+            elif path == "generated":
+                actual = run_generated(kernel, _clone_args(args), config=config)
+            else:
+                raise ValueError(f"unknown execution path {path!r}")
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=path)
 
 

@@ -12,9 +12,7 @@ and then computes each output column panel from that packed RHS:
 
 Run with, for example:
 
-    PYTHONPATH=~/llvm-project/build/tools/mlir/python_packages/mlir_core:$PYTHONPATH \
-    OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 \
-    uv run python helion_block_packed_f32_repro.py
+    OMP_NUM_THREADS=4 uv run python benchmarks/helion_block_packed_f32_repro.py
 
 The defaults are deliberately small so this can run under `timeout 30` on a
 non-AMX machine while debugging lowering/runtime bugs.
@@ -105,8 +103,6 @@ def benchmark(name: str, operation: Callable[[], object]) -> float:
 
 
 def main() -> None:
-    if os.environ.get("HELION_MLIR_PIPELINE") != "1":
-        raise RuntimeError("Set HELION_MLIR_PIPELINE=1 to use the vectorizing pipeline")
     if SIZE % BLOCK_N or SIZE % BLOCK_M or SIZE % BLOCK_K:
         raise ValueError("SIZE must be divisible by BLOCK_M, BLOCK_N, and BLOCK_K")
 

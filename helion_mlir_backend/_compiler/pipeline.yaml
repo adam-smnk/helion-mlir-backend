@@ -63,7 +63,6 @@ Pipeline:
   ## convert-vector-to-llvm does not include (reductions fail to JIT without it).
   - include: bufferization.yaml
   - include: bufferization-cleanup.yaml
-  # Before OpenMP: the split's slow path needs an allocation scope around the transfer.
   - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
   - schedule: "x86/amx_move_offsets.py[gen=amx_move_offsets]"
@@ -73,4 +72,5 @@ Pipeline:
   - pass: "func.func(convert-linalg-to-loops)"
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
   - pass: "func.func(lower-vector-multi-reduction)"
+  - schedule: "helion_transforms.py[gen=legalize_for_llvm]"
   - include: llvm-lowering.yaml

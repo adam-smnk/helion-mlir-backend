@@ -97,9 +97,6 @@ def _benchmark(name: str, operation: object, iters: int = 3) -> float:
 
 
 def main() -> None:
-    if os.environ.get("HELION_MLIR_PIPELINE") != "1":
-        raise RuntimeError("Set HELION_MLIR_PIPELINE=1 to use the vectorizing pipeline")
-
     size = int(os.environ.get("HELION_PACK_SIZE", "512"))
     block_n = int(os.environ.get("HELION_PACK_BLOCK_N", "32"))
     block_k = int(os.environ.get("HELION_PACK_BLOCK_K", "32"))

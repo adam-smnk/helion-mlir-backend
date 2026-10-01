@@ -1,4 +1,4 @@
-"""Autotuning, the pipeline config key and the JIT cache (plan Phase 10)."""
+"""Autotuning, the pipeline config key and the JIT cache."""
 
 from __future__ import annotations
 
@@ -52,7 +52,6 @@ def tuning(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -> None:
     """Allow autotuning, with a fresh cache directory."""
     monkeypatch.setenv("HELION_DISALLOW_AUTOTUNING", "0")
     monkeypatch.setenv("HELION_CACHE_DIR", str(tmp_path))
-    monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
 
 
 def test_one_config_is_used_as_is(tuning: None) -> None:
@@ -105,19 +104,23 @@ def test_cpu_name_is_known() -> None:
     assert cpu_name()
 
 
-def test_opt_search_raises_small_block_sizes() -> None:
+def test_opt_search_raises_small_inner_block_sizes() -> None:
     x, y = torch.randn(256, 256), torch.randn(256, 256)
-    _, _, env = _compile(helion.kernel(backend="mlir")(matmul), [x, y], None)
+    hf, _, env = _compile(helion.kernel(backend="mlir")(matmul), [x, y], None)
     spec = env.config_spec
-    assert min(spec.default_config().config["block_sizes"]) < 32
-    raise_block_minimums(spec)
-    assert min(spec.default_config().config["block_sizes"]) >= 32
+    default_m, *defaults = spec.default_config().config["block_sizes"]
+    assert min(defaults) < 32
+    (tile_mn,) = hf.device_ir.grid_block_ids
+    raise_block_minimums(spec, [tile_mn[0]])
+    m, *inner = spec.default_config().config["block_sizes"]
+    assert m == default_m
+    assert min(inner) >= 32
 
 
 def test_given_configs_keep_their_block_sizes_on_the_opt_pipeline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("HELION_MLIR_PIPELINE", "1")
+    monkeypatch.setenv("HELION_MLIR_PIPELINE", "opt")
     config = helion.Config(block_sizes=[1, 16, 32])
     kernel = helion.kernel(backend="mlir", config=config)(matmul)
     text = str(generate_mlir(kernel, [torch.randn(64, 64), torch.randn(64, 64)]))
@@ -136,7 +139,7 @@ def test_block_size_prior_prefers_divisors() -> None:
 
 
 def test_config_selects_the_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
+    monkeypatch.setenv("HELION_MLIR_PIPELINE", "scalar")
     chosen: list[str] = []
     original = execution.pipeline_descriptor
 

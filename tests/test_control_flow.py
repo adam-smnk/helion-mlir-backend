@@ -1,5 +1,5 @@
 """Device control flow: ``if`` (``scf.if``) and ``while`` (``scf.while``), and the
-scalar arithmetic and comparisons their conditions use (plan Phase 7)."""
+scalar arithmetic and comparisons their conditions use."""
 
 from __future__ import annotations
 

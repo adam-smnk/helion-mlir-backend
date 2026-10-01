@@ -117,11 +117,13 @@ Location: [lowering/](../helion_mlir_backend/_compiler/mlir/lowering/)
 - `tensor_creation_ops.py`: `full` (also `hl.zeros`) and `torch.tensor` constants
 - `tile_index_ops.py`: tile positions, `tile.index`, shape queries
 
-`einsum_capture.py` (at the package root) is the one piece that runs *before*
+`trace_mode.py` (at the package root) is the one piece that runs *before*
 codegen: it installs a `TorchFunctionMode` around Helion's device-IR lowering
 so a contractible `torch.einsum` is recorded as a single custom op instead of
 being expanded by PyTorch's dispatcher. Non-contractible equations are left to
-that expansion.
+that expansion. The mode also routes tensor methods that mirror a `torch`
+function with a Helion device replacement (`x.cumsum(d)`, `x.cumprod(d)`) to
+that replacement; Helion replaces only the function form.
 
 `inline_mlir` ([language.py](../helion_mlir_backend/language.py), guide in
 [INLINE_MLIR_GUIDE.md](INLINE_MLIR_GUIDE.md)) is a plain function: under the MLIR

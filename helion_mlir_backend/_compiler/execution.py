@@ -23,8 +23,9 @@ import mlir.ir as ir
 from mlir.passmanager import PassManager
 
 from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
+from helion_mlir_backend._compiler.mlir.support.debug import PIPELINES
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
-from helion_mlir_backend._compiler.mlir.support.debug import use_optimizing_pipeline
+from helion_mlir_backend._compiler.mlir.support.debug import default_pipeline
 from helion_mlir_backend._compiler.mlir.support.type_utils import mlir_dtype_to_torch
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 
     import torch
 
-PIPELINES = ("scalar", "opt")
+_PIPELINE_FILES = {"opt": "./pipeline.yaml", "scalar": "./scalar.yaml"}
 _JIT_CACHE: OrderedDict[tuple[str, str], CompiledEntry] = OrderedDict()
 _JIT_CACHE_SIZE = 128
 
@@ -44,15 +45,12 @@ def _dump_if(enabled: bool, label: str, module: ir.Module) -> None:
 
 
 def pipeline_descriptor(pipeline: str | None = None) -> Descriptor:
-    """The lighthouse pipeline by name; by default ``opt`` if
-    ``HELION_MLIR_PIPELINE=1``, else ``scalar``."""
+    """The lighthouse pipeline by name (default: :func:`default_pipeline`)."""
     if pipeline is None:
-        pipeline = "opt" if use_optimizing_pipeline() else "scalar"
-    if pipeline == "opt":
-        return Descriptor("./pipeline.yaml", base_path=os.path.dirname(__file__))
-    if pipeline == "scalar":
-        return Descriptor("./scalar.yaml", base_path=os.path.dirname(__file__))
-    raise ValueError(f"unknown pipeline {pipeline!r}; expected one of {PIPELINES}")
+        pipeline = default_pipeline()
+    if pipeline not in _PIPELINE_FILES:
+        raise ValueError(f"unknown pipeline {pipeline!r}; expected one of {PIPELINES}")
+    return Descriptor(_PIPELINE_FILES[pipeline], base_path=os.path.dirname(__file__))
 
 
 def inline_module(module: ir.Module) -> ir.Module:
@@ -141,7 +139,7 @@ def compile_entry(
     """Inline, lower and JIT-compile ``entry`` (consumes ``module``), or reuse the
     entry compiled from an identical module with the same pipeline."""
     if pipeline is None:
-        pipeline = "opt" if use_optimizing_pipeline() else "scalar"
+        pipeline = default_pipeline()
     debug = DebugOptions.from_env()
     if debug.dump_ir or debug.dump_pre_lowering or debug.dump_lowered:
         return _compile_entry(module, entry, pipeline, debug)

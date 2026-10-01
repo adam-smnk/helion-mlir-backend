@@ -56,7 +56,8 @@ def compile_kernel(
 ) -> Callable[..., object]:
     """A callable with the kernel's own signature and Helion call semantics.
 
-    ``pipeline`` defaults to the config's ``mlir_pipeline``, then ``HELION_MLIR_PIPELINE``.
+    ``pipeline`` defaults to the config's ``mlir_pipeline``, then
+    ``HELION_MLIR_PIPELINE``, then ``opt``.
     """
     if pipeline is None:
         pipeline = config.get(PIPELINE_CONFIG_KEY)

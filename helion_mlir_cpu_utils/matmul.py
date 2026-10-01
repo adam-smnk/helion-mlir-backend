@@ -15,7 +15,7 @@ what removes the separate unpack pass -- the result is reinterpreted as
 ``[M, N]`` by a metadata-only view.
 
 An optional bias and epilogue are fused into the accumulator before the store
-(see ``linear_bf16_blocked_mlir`` in ``helion_mlp_bf16.py`` for the pattern this
+(see ``linear_bf16_blocked_mlir`` in ``benchmarks/helion_mlp_bf16.py`` for the pattern this
 follows), so a fused linear+activation costs one kernel instead of a matmul
 kernel followed by a separate elementwise kernel.
 """
@@ -566,8 +566,8 @@ def bmm(a: Tensor, b: Tensor) -> Tensor:
 
     A genuine single-kernel batched version (one extra leading tile dimension
     threaded through the pack + contract kernels) was prototyped and measured
-    ~30% *slower* than this per-batch-call loop at BATCH=3, M=N=K=2048 (see
-    temp/probe_bmm_bench.py in the repo history) -- the combined kernel gets
+    ~30% *slower* than this per-batch-call loop at BATCH=3, M=N=K=2048 -- the
+    combined kernel gets
     worse thread-level parallelism across the batch dimension on this backend
     than launching one fully-parallel kernel per batch slice. Kept as the
     simpler, faster loop.

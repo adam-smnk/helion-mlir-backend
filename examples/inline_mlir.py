@@ -18,7 +18,7 @@ function on tiles inside a device loop:
    step of the K loop.
 
 Each call also gets a ``reference`` implementation, used by Helion's eager ref
-mode and other backends. See docs/INLINE_MLIR_GUIDE.md.
+mode and other backends.
 """
 
 from __future__ import annotations

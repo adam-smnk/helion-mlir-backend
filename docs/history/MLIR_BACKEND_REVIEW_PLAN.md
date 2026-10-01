@@ -224,7 +224,7 @@ None of these is a single lighthouse anchor, and the bf16 one never qualifies fo
   qualifies.
 - **Parallelism.** `omp.py` turns every `scf.forall` into OpenMP, including Helion's outer
   loop. Nested foralls from cache tiling become nested parallel regions.
-- **Known miscompiles/blockers**, recorded in `docs/AMX_MATMUL_OPTIMIZATION_FINDINGS.md`:
+- **Known miscompiles/blockers**, recorded in `docs/history/AMX_MATMUL_OPTIMIZATION_FINDINGS.md`:
   - A transposed inner-block B is silently wrong under AMX.
   - Rank-5 VNNI contractions fail to vectorize.
   - Outer tiles larger than `[1, 1]` hit an `eraseOp` assertion.
@@ -963,7 +963,7 @@ Work items:
    Found in Phase 5: `_get_symnode(block_size_N)` lowers to the block size as a value but
    to the tile extent in `hl.zeros` shapes; make them agree (e.g. `x.view(tile_m, -1)`).
 7. Remove the "ragged combined-tile" rejection and any `_validate_*` check this makes redundant.
-   Update finding 2 in `docs/PADDING_FUSION_FINDINGS.md`.
+   Update finding 2 in `docs/history/PADDING_FUSION_FINDINGS.md`.
 
 - **New tests:**
   - Ragged 1-D (100/16), ragged combined 2-D, ragged-K matmul.
@@ -1512,8 +1512,8 @@ Items to report or fix upstream:
   Reproducer: a dynamic-batch `batch_matmul` on the optimizing pipeline.
 - **Padded `linalg.batch_matmul`:** the optimizing pipeline returns NaNs for a
   `batch_matmul` whose operands are `tensor.pad`-ed partial tiles; plain `matmul` is
-  correct. Reproducer: `scripts/lighthouse_padded_batch_matmul_repro.py batch`.
-  Fixed by the opt pipeline's `vectorize_pads` stage (see `docs/MLIR_LIMITATIONS.md`, §15).
+  correct. Fixed by the opt pipeline's `vectorize_pads` stage (see
+  `docs/MLIR_LIMITATIONS.md`, §15).
 - **Vectorization of dynamic shapes** (I32): the schedule vectorizes without vector sizes,
   so a linalg op on a dynamic tile fails ("Attempted to vectorize, but failed"), and
   register unrolling fails on loops of runtime trip count. Resolved in the opt pipeline:
@@ -1532,7 +1532,7 @@ Items to report or fix upstream:
 - **Strided function-boundary layouts,** so non-contiguous tensors avoid a copy.
 - **SFC remap** only accepts normalized 2-D foralls. The backend adapts in Phase 1; no upstream
   change is required.
-- **Known AMX blockers,** already documented in `docs/AMX_MATMUL_OPTIMIZATION_FINDINGS.md`:
+- **Known AMX blockers,** already documented in `docs/history/AMX_MATMUL_OPTIMIZATION_FINDINGS.md`:
   - A transposed inner-block B is silently miscompiled.
   - Rank-5 VNNI contractions fail to vectorize.
   - Outer tiles larger than `[1, 1]` hit an `eraseOp` assertion.

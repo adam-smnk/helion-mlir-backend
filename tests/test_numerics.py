@@ -1,7 +1,6 @@
 """Numerical stress: small odd f32 shapes, several block sizes, loop-carried values.
 
-``temp/cleanup/stress.py`` runs a much larger sweep of the same kind; each case here
-guards a bug it found.
+Each case guards a bug a larger randomized sweep of the same kind found.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Calling convention and host semantics (docs/MLIR_DESIGN.md, calling convention).
+"""Calling convention and host semantics.
 
 Every call runs the kernel's host code, passes host tensors in place (inouts are
 written through) and returns the kernel's own ``return`` value.

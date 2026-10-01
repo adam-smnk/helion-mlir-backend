@@ -8,16 +8,9 @@ from __future__ import annotations
 
 import helion
 import helion.language as hl
-import pytest
 import torch
 
 import helion_mlir_backend  # noqa: F401 registers "mlir" backend
-
-
-@pytest.fixture(autouse=True)
-def _use_scalar_pipeline(monkeypatch):
-    """The AMX-specialized pipeline does not support multi-phase kernels."""
-    monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
 
 
 def _tiles_of_8(count: int) -> helion.Config:

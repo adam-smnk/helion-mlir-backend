@@ -76,8 +76,6 @@ def benchmark(name: str, operation: Callable[[], object]) -> float:
 
 
 def main() -> None:
-    if os.environ.get("HELION_MLIR_PIPELINE") != "1":
-        raise RuntimeError("Set HELION_MLIR_PIPELINE=1 to use the vectorizing pipeline")
     if len({TILE_M, TILE_N, TILE_K}) != 3:
         raise ValueError(
             "MLIR tile sizes must be distinct to preserve loop-index mapping"

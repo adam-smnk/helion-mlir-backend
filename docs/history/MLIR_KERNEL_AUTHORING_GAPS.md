@@ -1,6 +1,6 @@
 # MLIR backend: kernel authoring gaps
 
-Findings from writing a high-performance bf16 4K matmul (`helion_matmul_bf16.py`)
+Findings from writing a high-performance bf16 4K matmul (`benchmarks/helion_matmul_bf16.py`)
 against the `mlir` backend with `HELION_MLIR_PIPELINE=1` on an AMX-capable
 Xeon (Emerald Rapids). Everything below was reproduced on that setup; each item
 states the observed symptom and, where known, the root cause.
@@ -363,7 +363,7 @@ A standalone
 (`NoDeviceLoopsInKernel`).
 
 Those variants remain unsupported, but the two-level panel/tile kernels used by
-`helion_block_pack.py` are now functional. With `OMP_NUM_THREADS=1`,
+`benchmarks/helion_block_pack.py` are now functional. With `OMP_NUM_THREADS=1`,
 `HELION_MLIR_PIPELINE=1`, and the MLIR Python bindings configured, the default
 512x512 benchmark completes under 30 seconds and passes its numerical checks.
 With `OMP_NUM_THREADS=4`, the 4096x4096 pack also completes under `timeout 30`:
@@ -391,7 +391,7 @@ panel IV for both dimensions, effectively loading `A[panel, panel]` instead of
 Ragged K tails in a tiled contraction are zero-padded on load, so the final
 64-wide iteration of `K=96`, `TK=64` contributes only the 32 real columns.
 
-A standalone f32 reproducer is available in `helion_block_packed_f32_repro.py`.
+A standalone f32 reproducer is available in `benchmarks/helion_block_packed_f32_repro.py`.
 With `SIZE=128`, `BLOCK_M=32`, `BLOCK_N=32`, `BLOCK_K=64`,
 `OMP_NUM_THREADS=4`, and `HELION_MLIR_PIPELINE=1`, it now passes both the pack
 and packed-matmul numerical checks under `timeout 30`.
@@ -412,7 +412,7 @@ acc = torch.addmm(acc, x[tile_m, tile_k], yt[tile_n, tile_k].permute(1, 0))
 ```
 
 So the only currently correct bf16 high-performance path is still the row-major
-explicit-`K=32` loop in `helion_matmul_bf16.py`.
+explicit-`K=32` loop in `benchmarks/helion_matmul_bf16.py`.
 
 The no-explicit-K-loop matmul variant was also retried:
 

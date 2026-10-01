@@ -381,7 +381,7 @@ def test_einsum_broadcast_operand_over_batch():
 def test_size_one_broadcast_is_not_captured():
     """einsum broadcasts a size-1 shared dim; linalg.contract cannot, so the
     equation must be left to PyTorch even though its structure qualifies."""
-    from helion_mlir_backend._compiler.mlir.einsum_capture import _should_capture
+    from helion_mlir_backend._compiler.mlir.trace_mode import _should_capture
 
     assert _should_capture("mk,kn->mn", [torch.randn(4, 8), torch.randn(8, 6)])
     assert not _should_capture("mk,kn->mn", [torch.randn(4, 1), torch.randn(8, 6)])
@@ -481,7 +481,7 @@ def _device_ir_nodes(kernel, args, *, backend="mlir"):
 
 
 def _assert_not_captured(kernel, args):
-    from helion_mlir_backend._compiler.mlir.einsum_capture import is_einsum_node
+    from helion_mlir_backend._compiler.mlir.trace_mode import is_einsum_node
 
     nodes = _device_ir_nodes(kernel, args)
     assert nodes
@@ -509,11 +509,11 @@ def _assert_not_captured(kernel, args):
 def test_capture_mode_only_rewrites_contractible_equations(equation, shapes, captured):
     from torch.fx.experimental.proxy_tensor import make_fx
 
-    from helion_mlir_backend._compiler.mlir.einsum_capture import CaptureEinsumMode
-    from helion_mlir_backend._compiler.mlir.einsum_capture import einsum_op_target
+    from helion_mlir_backend._compiler.mlir.trace_mode import TraceMode
+    from helion_mlir_backend._compiler.mlir.trace_mode import einsum_op_target
 
     operands = [torch.randn(shape) for shape in shapes]
-    with CaptureEinsumMode():
+    with TraceMode():
         traced = make_fx(lambda *tensors: torch.einsum(equation, *tensors))(*operands)
 
     targets = [node.target for node in traced.graph.nodes]
@@ -673,7 +673,7 @@ def test_genuinely_mismatched_extents_still_fail_in_type_propagation():
 
 def test_capture_is_scoped_to_the_mlir_backend():
     """A non-MLIR backend must keep PyTorch's own einsum decomposition."""
-    from helion_mlir_backend._compiler.mlir.einsum_capture import is_einsum_node
+    from helion_mlir_backend._compiler.mlir.trace_mode import is_einsum_node
 
     nodes = _device_ir_nodes(
         _triton_einsum_kernel,

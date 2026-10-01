@@ -58,9 +58,7 @@ def main() -> None:
     print(f"Input shapes: x={x.shape}, w={w.shape}, w_batched={w_batched.shape}")
     print(f"Output shape: ({b}, {m}, {n})")
 
-    # Block sizes (b, m, n, k) chosen to evenly divide every dimension: the
-    # combined-tile [b, m, n] loop does not yet support a ragged
-    # (non-evenly-divisible) boundary tile (see docs/MLIR_LIMITATIONS.md).
+    # Block sizes (b, m, n, k) that evenly divide every dimension.
     config = helion.Config(block_sizes=[4, 16, 8, 16])
     module = generate_mlir(broadcast_matmul_kernel, [x, w_batched], config=config)
     print("\nGenerated MLIR:")

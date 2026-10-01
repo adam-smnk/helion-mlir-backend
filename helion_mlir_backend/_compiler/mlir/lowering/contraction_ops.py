@@ -16,13 +16,13 @@ from mlir.dialects import linalg as linalg_d
 import mlir.ir as ir
 import torch
 
-from ..einsum_capture import einsum_op_target
 from ..support import UnsupportedOperationError
 from ..support import ValueNotFoundError
 from ..support import torch_dtype_to_mlir
 from ..support.einsum_spec import ContractSpec
 from ..support.einsum_spec import EinsumNotContractible
 from ..support.einsum_spec import build_contract_spec
+from ..trace_mode import einsum_op_target
 from . import emit
 from .registry import NOT_APPLICABLE
 from .registry import lowers

@@ -1,4 +1,4 @@
-"""``inline_mlir``: user MLIR functions called from device loops (docs/INLINE_MLIR_GUIDE.md)."""
+"""``inline_mlir``: user MLIR functions called from device loops."""
 
 from __future__ import annotations
 

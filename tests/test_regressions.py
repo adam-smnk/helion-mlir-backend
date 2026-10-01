@@ -1,8 +1,7 @@
-"""Regression probes from the backend review (docs/MLIR_BACKEND_REVIEW_PLAN.md, section 2).
+"""Regression probes for kernels the backend once got wrong or rejected.
 
-Each probe was a known gap, a strict xfail tagged with its issue id, until the phase
-that fixed it; all pass now. A new gap gets a probe marked
-``[pytest.mark.xfail(strict=True, reason="I<n>: ..."), pytest.mark.isolated]``
+A new gap gets a probe marked
+``[pytest.mark.xfail(strict=True, reason="..."), pytest.mark.isolated]``
 (isolated because gaps can crash natively).
 """
 

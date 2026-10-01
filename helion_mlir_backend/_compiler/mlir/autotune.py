@@ -16,7 +16,7 @@ import textwrap
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.local_cache import LocalAutotuneCache
 
-from .support.debug import use_optimizing_pipeline
+from .support.debug import default_pipeline
 
 CPU_AUTOTUNE_CACHE = "MLIRCpuAutotuneCache"
 """Name under which the cache is registered in ``helion.autotuner.cache_classes``."""
@@ -31,7 +31,7 @@ class CpuAutotuneCache(LocalAutotuneCache):
             bound, tuple(self.args), bound.kernel._base_specialization_key(self.args)
         )
         source = textwrap.dedent(inspect.getsource(bound.kernel.fn))
-        pipeline = "opt" if use_optimizing_pipeline() else "scalar"
+        pipeline = default_pipeline()
         return LooseAutotuneCacheKey(
             specialization_key=in_memory.specialization_key,
             extra_results=in_memory.extra_results,

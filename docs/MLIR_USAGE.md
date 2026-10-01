@@ -89,7 +89,7 @@ C = add_direct(A, B)
 ```python
 from helion_mlir_backend import compile_mlir
 
-add = compile_mlir(add_kernel, [A, B], pipeline="scalar")  # or "opt"
+add = compile_mlir(add_kernel, [A, B], pipeline="scalar")  # default: "opt"
 C = add(A, B)
 ```
 
@@ -188,20 +188,20 @@ print(buf.getvalue())
 ## Configs, Pipelines and Autotuning
 
 A config has two keys on this backend: `block_sizes`, and `mlir_pipeline`
-(`"scalar"` or `"opt"`) to pick the lighthouse pipeline for that config. Without
-`mlir_pipeline`, `HELION_MLIR_PIPELINE=1` selects `opt`, otherwise `scalar`. Other
-Helion config keys (`num_warps`, `reduction_loops`, ...) are rejected.
+(`"opt"` or `"scalar"`) to pick the lighthouse pipeline for that config. Without
+`mlir_pipeline`, `HELION_MLIR_PIPELINE` (`opt` or `scalar`) selects it, and `opt` is the
+default. Other Helion config keys (`num_warps`, `reduction_loops`, ...) are rejected.
 
 ```python
-@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[32, 32, 32], mlir_pipeline="opt"))
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[32, 32, 32], mlir_pipeline="scalar"))
 ```
 
-The pipelines are `_compiler/scalar.yaml` (lighthouse's scalar lowering) and
-`_compiler/pipeline.yaml` (tiling, vectorization, OpenMP). Both begin by lowering
-`linalg.pack`/`linalg.unpack` with lighthouse's `x86/pack_lowering.py`; the opt
-pipeline also vectorizes `tensor.pad`, vectorizes ops of runtime shape with masks and
-splits out-of-bounds vector transfers into in-bounds and edge paths
-(`_compiler/helion_transforms.py`, see `docs/MLIR_LIMITATIONS.md`, section 15).
+The pipelines are `_compiler/pipeline.yaml` (`opt`: tiling, vectorization, OpenMP) and
+`_compiler/scalar.yaml` (lighthouse's scalar lowering, a simpler fallback). Both begin
+by lowering `linalg.pack`/`linalg.unpack` with lighthouse's `x86/pack_lowering.py`; the
+opt pipeline adds its own stages for padding, runtime-shaped ops, out-of-bounds vector
+transfers and LLVM legalization (`_compiler/helion_transforms.py`, see
+`docs/MLIR_LIMITATIONS.md`, section 15).
 
 Config selection follows Helion:
 - One config (`config=` or `configs=[c]`) is used as is; nothing is tuned.
@@ -211,8 +211,9 @@ Config selection follows Helion:
   wall clock on the CPU. The best config is cached on disk (`HELION_CACHE_DIR`),
   keyed by the kernel, its inputs, the CPU model and the default pipeline;
   `HELION_FORCE_AUTOTUNE=1` re-tunes.
-- A search under the optimizing pipeline only tries tiles of at least 32 (where
-  the dimension allows), since smaller ones abort in lighthouse.
+- A search under the optimizing pipeline tries tiles of at least 32 (where the
+  dimension allows) except for the leading dim of each outermost loop, which may
+  be smaller for more parallel tiles.
 
 Compiled modules are cached in-process by their text and pipeline, so compiling
 the same module again (another shape bucket with equal static sizes, a repeated

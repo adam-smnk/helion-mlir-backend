@@ -49,40 +49,6 @@ def abc_16x64():
     return torch.randn(16, 64), torch.randn(16, 64), torch.randn(16, 64)
 
 
-_SCALAR_PIPELINE_TEST_PREFIXES = (
-    "test_flat_gather_",
-    "test_unpack_grid_tile_reordered_store",
-    "test_unpack_triple_nested_grid",
-    "test_grid_combined_2d_tile",
-    "test_scalar_grid_index_transpose",
-    "test_grid_combined_tile_separate_reduction",
-    "test_grid_grid_combined_2d_tile",
-    "test_nested_grid_copy",
-    "test_grid_tile_slice",
-    "test_nested_tile_block_sizes",
-    "test_unpack_combined_tile_transpose_direct",
-    "test_batched_matmul_combined_tile_direct",
-    "test_outer_forall_inner_scf_for_block_sizes",
-    "test_outer_inner_loops_eltwise_block_sizes",
-    "test_prepacked_rhs_matmul_matches_runtime_packing",
-    "test_prepacked_rhs_affine_matmul_matches_reference",
-    "test_ragged_panel_count_matmul_execution",
-    "test_matmul_irregular_shapes_padded_packing",
-    "test_multiphase_inplace_buffer_preservation",
-)
-
-
-@pytest.fixture(autouse=True)
-def _use_scalar_pipeline_for_unsupported_kernels(request, monkeypatch):
-    """Keep known-incompatible kernel shapes out of the AMX-only pipeline."""
-    test_class = request.node.cls
-    if request.node.name.startswith(_SCALAR_PIPELINE_TEST_PREFIXES) or (
-        test_class is not None
-        and test_class.__name__ == "TestGenericAtenHelperBoundaryTileRegression"
-    ):
-        monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
-
-
 # ---------------------------------------------------------------------------
 # execute_mlir path
 # ---------------------------------------------------------------------------
@@ -392,10 +358,10 @@ class TestExecuteMlir:
 
     def test_block_packing_kernels_execute_mlir(self):
         """Nested tiled A/B panel packing matches contiguous PyTorch references."""
-        from helion_block_pack import pack_a
-        from helion_block_pack import pack_a_panels
-        from helion_block_pack import pack_b
-        from helion_block_pack import pack_b_panels
+        from benchmarks.helion_block_pack import pack_a
+        from benchmarks.helion_block_pack import pack_a_panels
+        from benchmarks.helion_block_pack import pack_b
+        from benchmarks.helion_block_pack import pack_b_panels
 
         torch.manual_seed(41)
         a = torch.randn(64, 64, dtype=torch.bfloat16)
@@ -810,9 +776,9 @@ class TestExecuteMlir:
     @pytest.mark.parametrize("size", [64, 128])
     def test_packed_rhs_matmul_execute_mlir(self, size):
         """A packed RHS remains numerically correct through tiled matmul consumption."""
-        from helion_block_packed_f32_repro import matmul_packed_b_f32
-        from helion_block_packed_f32_repro import pack_b_panels_f32
-        from helion_block_packed_f32_repro import unpack_panel_major
+        from benchmarks.helion_block_packed_f32_repro import matmul_packed_b_f32
+        from benchmarks.helion_block_packed_f32_repro import pack_b_panels_f32
+        from benchmarks.helion_block_packed_f32_repro import unpack_panel_major
 
         torch.manual_seed(43)
         block_n = 32

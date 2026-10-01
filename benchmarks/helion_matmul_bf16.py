@@ -4,11 +4,10 @@ Tuned for a 2-socket Intel Xeon Platinum 8592+ (Emerald Rapids, 64 cores and
 256 MiB of private L2 per socket) running one thread per physical core on a
 single socket:
 
-    HELION_MLIR_PIPELINE=1 OMP_NUM_THREADS=64 \
+    OMP_NUM_THREADS=64 \
     KMP_AFFINITY=granularity=fine,compact,1,0 \
     LD_PRELOAD=/lib64/libtcmalloc.so:$LD_PRELOAD \
-    PYTHONPATH=~/llvm-project/build/tools/mlir/python_packages/mlir_core:$PYTHONPATH \
-    uv run python helion_matmul_bf16.py
+    uv run python benchmarks/helion_matmul_bf16.py
 
 Shapes default to 4096 cubed and are overridden independently with
 ``HELION_MATMUL_M``, ``HELION_MATMUL_N`` and ``HELION_MATMUL_K``. Every tile and
@@ -352,8 +351,6 @@ def check_bf16_semantics(name: str, actual: Tensor, reference_bf16: Tensor) -> N
 
 
 def main() -> None:
-    if os.environ.get("HELION_MLIR_PIPELINE") != "1":
-        raise RuntimeError("Set HELION_MLIR_PIPELINE=1 to use the vectorizing pipeline")
     if any(tile % AMX_PARALLEL_TILE for tile in (TILE_M, TILE_N)):
         raise ValueError(
             f"TILE_M/TILE_N must be multiples of {AMX_PARALLEL_TILE} for AMX bf16"

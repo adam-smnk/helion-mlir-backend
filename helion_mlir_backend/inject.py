@@ -22,9 +22,7 @@ def install() -> bool:
         )
         from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
         from helion_mlir_backend._compiler.mlir.driver import mlir_compile_config
-        from helion_mlir_backend._compiler.mlir.einsum_capture import (
-            install_einsum_capture,
-        )
+        from helion_mlir_backend._compiler.mlir.trace_mode import install_trace_mode
     except ImportError as exc:
         log.debug("External MLIR backend registration unavailable: %s", exc)
         return False
@@ -34,7 +32,7 @@ def install() -> bool:
     _allow_pipeline_config_key()
     _register_cpu_autotune_cache()
     _accept_mlir_module_globals()
-    install_einsum_capture()
+    install_trace_mode()
     install_original_args_capture()
     return True
 

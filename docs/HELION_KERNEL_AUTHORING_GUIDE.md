@@ -340,22 +340,21 @@ handoff and final return are easy to follow.
 
 ## 9. Pipeline Selection and Performance Experiments
 
-The normal scalar pipeline is the baseline for correctness and general kernel
-experiments. `HELION_MLIR_PIPELINE=1` selects the AMX vectorizing pipeline in
-this repository. It is benchmark-oriented and is not a general compatibility
-mode; a kernel that works with the scalar pipeline may abort or fail in the AMX
-pipeline.
+The optimizing pipeline (`opt`: tiling, vectorization, OpenMP, AMX where the
+host has it) is the default. The scalar pipeline is a simpler fallback: select
+it with `HELION_MLIR_PIPELINE=scalar` or a config's `mlir_pipeline="scalar"`.
 
-When investigating a failure, first record:
+When investigating a failure, first record the pipeline in use:
 
 ```bash
-printf 'HELION_MLIR_PIPELINE=%s\n' "${HELION_MLIR_PIPELINE-<unset>}"
+printf 'HELION_MLIR_PIPELINE=%s\n' "${HELION_MLIR_PIPELINE-<unset: opt>}"
 ```
 
-Then reproduce with the variable unset:
+Then reproduce on the other pipeline; a failure on only one of them points at
+that pipeline rather than at the kernel:
 
 ```bash
-env -u HELION_MLIR_PIPELINE uv run python your_repro.py
+HELION_MLIR_PIPELINE=scalar uv run python your_repro.py
 ```
 
 Only compare performance after confirming that both runs produce the same
@@ -421,8 +420,7 @@ bandwidth at both four and eight threads, within normal run-to-run variation.
 For post-pipeline inspection, set:
 
 ```bash
-HELION_MLIR_DUMP_LOWERED=1 HELION_MLIR_PIPELINE=1 \
-  OMP_NUM_THREADS=4 uv run python your_kernel.py
+HELION_MLIR_DUMP_LOWERED=1 OMP_NUM_THREADS=4 uv run python your_kernel.py
 ```
 
 Look for the actual vector element counts, not only the presence of the word
@@ -467,7 +465,7 @@ pre-lowering dump around a direct kernel call.
 
 | Symptom | Likely cause | First check |
 | --- | --- | --- |
-| Abort only with `HELION_MLIR_PIPELINE=1` | AMX benchmark pipeline does not support the pattern | Unset the variable and retry |
+| Failure only on the default (`opt`) pipeline | The optimizing pipeline does not handle the pattern | Retry with `HELION_MLIR_PIPELINE=scalar` |
 | Correct output but unexpectedly slow | Wrong positional `block_sizes` entry, often because `hl.grid()` was counted | Inspect generated loop steps |
 | Small copy is far slower than native PyTorch | Fixed JIT/OpenMP/tensor overhead dominates the workload | Warm up and repeat at a larger shape |
 | Large transpose temporary in lowered IR | Transpose tile is too large for the vectorization path | Reduce the transposed tile dimension and inspect vector widths |
@@ -493,7 +491,7 @@ Before considering a kernel complete, confirm:
 - [ ] Dependent phases are separated by `hl.barrier()`.
 - [ ] Host-side views and reshapes have been tested for both shape and values.
 - [ ] Tests use random nonsymmetric data and a PyTorch reference.
-- [ ] Correctness was tested with the scalar pipeline before benchmarking.
+- [ ] Correctness was tested on both pipelines before benchmarking.
 - [ ] Generated loop steps and extract/insert slice sizes were inspected for a
       new or nontrivial pattern.
 - [ ] Post-pipeline vector widths and transpose temporary sizes were inspected

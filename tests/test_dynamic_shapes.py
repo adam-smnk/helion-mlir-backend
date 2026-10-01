@@ -1,4 +1,4 @@
-"""``static_shapes=False`` kernels (plan Phase 9): one compiled entry per shape
+"""``static_shapes=False`` kernels: one compiled entry per shape
 bucket, sizes resolved at run time, never specialized to the example sizes."""
 
 from __future__ import annotations

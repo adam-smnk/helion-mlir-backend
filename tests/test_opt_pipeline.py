@@ -1,8 +1,6 @@
 """End-to-end execution under the backend's optimizing lighthouse pipeline.
 
 f32 only: bf16 needs AMX hardware to execute (covered at IR level by test_amx_ir_gate.py).
-Tiles stay >= 32 because lighthouse's tile-and-fuse aborts when every tiled dim of an op
-is smaller than its cache tile (see docs/MLIR_LIMITATIONS.md).
 """
 
 from __future__ import annotations
@@ -17,6 +15,7 @@ import torch
 
 from tests.harness import opt_pipeline
 
+from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 
 if TYPE_CHECKING:
@@ -243,14 +242,35 @@ func.func @f(%m: memref<?x?xf32>, %i: index, %v: vector<32xf32>) -> vector<32xf3
 """
 
 
-def test_split_transfers_rank_reducing() -> None:
-    """Upstream's full/partial split loops forever on these unless their rank is
-    expanded first."""
+def _apply(make_schedule: Callable[[], ir.Module], source: str) -> str:
     with ir.Context(), ir.Location.unknown():
-        module = ir.Module.parse(RANK_REDUCING_TRANSFERS)
-        schedule = split_transfers()
+        module = ir.Module.parse(source)
+        schedule = make_schedule()
         schedule.body.operations[0].apply(module.operation)
         module.operation.verify()
-        text = str(module)
-    # The read and the write, each on its in-bounds path.
-    assert text.count("in_bounds = [true, true]") == 2
+        return str(module)
+
+
+def test_split_transfers_rank_reducing() -> None:
+    text = _apply(split_transfers, RANK_REDUCING_TRANSFERS)
+    # The read and the write, each on its in-bounds path (cleanup merges the ifs).
+    assert "scf.if" in text
+    assert text.count("in_bounds = [true]") == 2
+
+
+ZERO_D_TRANSFERS = """
+func.func @f(%m: memref<1x1xf32, strided<[?, ?], offset: ?>>) {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : f32
+  %read = vector.transfer_read %m[%c0, %c0], %pad : memref<1x1xf32, strided<[?, ?], offset: ?>>, vector<f32>
+  vector.transfer_write %read, %m[%c0, %c0] : vector<f32>, memref<1x1xf32, strided<[?, ?], offset: ?>>
+  return
+}
+"""
+
+
+def test_legalize_0d_transfers() -> None:
+    text = _apply(legalize_for_llvm, ZERO_D_TRANSFERS)
+    assert "vector.transfer" not in text
+    assert "memref.load" in text
+    assert "memref.store" in text

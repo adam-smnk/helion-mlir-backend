@@ -384,8 +384,6 @@ def run_case(linear_layers: int) -> None:
 
 
 def main() -> None:
-    if os.environ.get("HELION_MLIR_PIPELINE") != "1":
-        raise RuntimeError("Set HELION_MLIR_PIPELINE=1 to use the vectorizing pipeline")
     if BLOCK_N != BLOCK_K:
         raise ValueError(
             "BLOCK_N must equal BLOCK_K so a hidden layer's blocked output is a"

@@ -50,12 +50,6 @@ _PHASE_SETTINGS = settings(
 _BLOCK_SIZES = [4, 8, 16, 32]
 
 
-@pytest.fixture(autouse=True)
-def _use_scalar_pipeline(monkeypatch):
-    """Property cases exercise shapes outside the AMX pipeline's scope."""
-    monkeypatch.setenv("HELION_MLIR_PIPELINE", "0")
-
-
 @pytest.mark.isolated
 @given(
     m=st.sampled_from([8, 20, 32, 48]),

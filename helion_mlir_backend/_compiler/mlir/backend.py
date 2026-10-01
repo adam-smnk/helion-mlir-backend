@@ -22,11 +22,12 @@ from helion import exc
 from helion._compiler.backend import Backend
 
 from .support.debug import PIPELINE_CONFIG_KEY
-from .support.debug import use_optimizing_pipeline
+from .support.debug import default_pipeline
 from .support.errors import MLIRBackendError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Sequence
 
     from helion._compiler.compile_environment import CompileEnvironment
@@ -38,13 +39,18 @@ if TYPE_CHECKING:
 
 _CONFIG_KEYS = frozenset({"block_sizes", PIPELINE_CONFIG_KEY})
 _OPT_MIN_TILE = 32
-"""Lighthouse's tile-and-fuse aborts on ops whose tiled dims are all smaller."""
+"""Inner tiles narrower than lighthouse's 32-wide cache tiles waste vector lanes."""
 
 
-def raise_block_minimums(config_spec: ConfigSpec) -> None:
-    """Search (and default) tiles of at least 32 where the dimension allows."""
+def raise_block_minimums(
+    config_spec: ConfigSpec, outer_block_ids: Collection[int] = ()
+) -> None:
+    """Search (and default) tiles of at least 32 where the dimension allows, but
+    any size for ``outer_block_ids``: small outer tiles add parallel work and keep
+    the compiled inner work small."""
     for spec in config_spec.block_sizes:
-        spec.update_min(min(_OPT_MIN_TILE, spec.max_size))
+        if not set(spec.block_ids) & set(outer_block_ids):
+            spec.update_min(min(_OPT_MIN_TILE, spec.max_size))
 
 
 class MLIRBackend(Backend):
@@ -65,7 +71,7 @@ class MLIRBackend(Backend):
 
     def supports_config_key(self, key: str) -> bool:
         """Only block sizes shape the generated IR; ``mlir_pipeline`` picks the
-        lighthouse pipeline (default: ``HELION_MLIR_PIPELINE``)."""
+        lighthouse pipeline (default: ``HELION_MLIR_PIPELINE``, else ``opt``)."""
         return key in _CONFIG_KEYS
 
     def supports_precompile(self) -> bool:
@@ -80,16 +86,19 @@ class MLIRBackend(Backend):
         **kwargs: object,
     ) -> Config:
         """Helion's autotuning; its default local cache becomes the CPU one. A
-        search under the optimizing pipeline only tries tiles of at least 32."""
+        search under the optimizing pipeline tries tiles of at least 32 except for
+        the leading dim of each root loop."""
         from .autotune import CPU_AUTOTUNE_CACHE
 
         settings = bound_kernel.settings
         if settings.autotune_cache == "LocalAutotuneCache":
             settings.autotune_cache = CPU_AUTOTUNE_CACHE
-        if use_optimizing_pipeline() and (
+        if default_pipeline() == "opt" and (
             force or settings.force_autotune or not bound_kernel.kernel.configs
         ):
-            raise_block_minimums(bound_kernel.config_spec)
+            device_ir = bound_kernel.host_function.device_ir
+            outer = [ids[0] for ids in device_ir.grid_block_ids if ids]
+            raise_block_minimums(bound_kernel.config_spec, outer)
         return super().autotune(bound_kernel, args, force=force, **kwargs)
 
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
