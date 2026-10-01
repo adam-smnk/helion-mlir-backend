@@ -1,4 +1,4 @@
-# The default MLIR optimizing pipeline.
+# The optimizing (opt) pipeline.
 Pipeline:
   # Cleanup freshly imported IR.
   - pass: symbol-dce
@@ -59,8 +59,8 @@ Pipeline:
   - schedule: "hoisting.py[gen=hoist_loops]"
   - schedule: "vectorization.py[gen=simplify_vector_ops]"
 
-  ## x86_64/lower.yaml, plus the vector.multi_reduction lowering that
-  ## convert-vector-to-llvm no longer includes (reductions fail to JIT without it).
+  ## x86_64/lower.yaml, plus lower-vector-multi-reduction, which
+  ## convert-vector-to-llvm does not include (reductions fail to JIT without it).
   - include: bufferization.yaml
   - include: bufferization-cleanup.yaml
   # Before OpenMP: the split's slow path needs an allocation scope around the transfer.

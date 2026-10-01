@@ -34,7 +34,6 @@ def inline_mlir(
 
     The function is cloned into the kernel's module and inlined into it before
     bufferization, so the lighthouse pipeline lowers it with the rest of the kernel.
-    See ``docs/INLINE_MLIR_GUIDE.md``.
 
     Args:
         source: MLIR text, or an ``mlir.ir.Module``, with ``func.func`` ops only;

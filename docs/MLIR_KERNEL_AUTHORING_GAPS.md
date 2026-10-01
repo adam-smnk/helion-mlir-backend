@@ -7,10 +7,12 @@ states the observed symptom and, where known, the root cause.
 
 > **Status update.** Scalar grid/tile indexing, nested grid indexing, equal tile
 > sizes, dtype epilogues, transposed RHS contractions, mixed-precision
-> contractions, and static view/reshape lowering are covered by the backend
-> regression suite. Deeper reduction cache tiles (`TK > 32`) remain open as a
-> compiler-side AMX issue, as do the codegen quality items. 4D matmul remains a
-> Helion frontend limitation.
+> contractions, static view/reshape lowering, unpack kernels (section G) and block
+> packing with fused padding (`examples/block_packing_mlir.py`) are covered by the
+> backend regression suite. Deeper reduction cache tiles (`TK > 32`) remain open
+> as a compiler-side AMX issue, as do the codegen quality items. 4D matmul remains
+> a Helion frontend limitation. Sections below record each issue as found; fixed
+> ones are marked **RESOLVED**.
 
 ## Summary
 
@@ -166,8 +168,9 @@ are covered by integration and execution tests.
 
 ### 7. Mixed-precision contraction takes the fallback path
 
-`lowering/matmul_ops.py::emit_matmul_like` returns `None` when the accumulator
-element type differs from the operand element type:
+The contraction lowering (then `lowering/matmul_ops.py::emit_matmul_like`)
+returned `None` when the accumulator element type differed from the operand
+element type:
 
 ```python
 if out_type.element_type != lhs_type.element_type:
@@ -523,6 +526,15 @@ valuable of these: it would make the unpack a free `view` and remove a whole pas
 over the output. Until the interleaved scalar/tile store works, unpack stays an
 eager `permute().contiguous()` (~2.3 ms at 4K, 4 threads).
 
+**RESOLVED** for separate unpack kernels: `grid(np) -> tile(m)` with reordered
+store indices, `grid(mb) -> grid(np) -> tile(bm)` and `grid(mb) -> tile([bm, np])`
+execute correctly (`tests/test_mlir_execution.py`:
+`test_unpack_grid_tile_reordered_store_execute_mlir`,
+`test_unpack_triple_nested_grid_execute_mlir`,
+`test_grid_combined_2d_tile_execute_mlir`). Reordering dims within a combined tile
+needs an explicit `.permute()`/`.transpose()`
+(`test_grid_combined_2d_tile_explicit_transpose_execute_mlir`).
+
 ### Revised priorities
 
 1. **`TM > 16` / `BN > 32` register tiles for packed bf16** — currently a JIT
@@ -534,79 +546,6 @@ eager `permute().contiguous()` (~2.3 ms at 4K, 4 threads).
    VNNI operand. Today each B tile is re-shuffled `M / PACK_TILE_M` times.
 4. **Blocker 3** — deeper reduction cache tiles (`TK > 32`). This remains a
    compiler-side performance limitation and caps AMX utilization.
-2. Codegen quality: RHS repacking, accumulator spills, and nested OpenMP
+5. Codegen quality: RHS repacking, accumulator spills, and nested OpenMP
    regions remain performance work.
-3. 4D matmul remains a Helion frontend limitation.
-
-<!-- Historical priorities retained below for context. -->
-<!-- 1. **Fix A** — scalar block index plus a tiled reduction. Without it, `hl.grid`
-   and `tile.begin` cannot be used for anything except a batched matmul with the
-   whole `K` in one contraction, which blocker 3 then rejects. Blockers 1 and 2
-   are therefore only nominally resolved: no blocked matmul can be written.
-2. **Blocker 3** — deeper reduction cache tiles. Unchanged, and it is what caps
-   the current kernel at ~4% of AMX peak (accumulator round-trips to cache every
-   32 elements of `K`).
-3. **Fix B** — the transposed-RHS miscompile is a correctness bug and should
-   probably be disabled until fixed.
-4. **Fix C** — bf16 epilogue.
-5. Nested `hl.grid` index resolution.
--->
-
----
-
-## Architecture Notes: Descriptor-Driven Slice/Store Lowering (Phases 0-5 Refactor)
-
-**Goal**: Eliminate positional/size heuristics from load/store lowering. Replace with authoritative metadata from Helion index expressions.
-
-**Key Changes**:
-
-1. **Phase 0: `slice_plan.py`** — New descriptor abstraction (`DimSlice`, `SlicePlan`) that captures per-dimension geometry (kind: scalar/tile/full, offset, size, block_id, reduces).
-
-2. **Phase 1: Lower-load descriptor rewrite** — `load_slice_ops.py` now uses `plan_slice()` instead of guessing sizes from `for_store_ctx_stack`, value shape, or matching extents. Fast path (1-D gather) preserved.
-
-3. **Phase 2: Nested loop generalization** — Removed `assert len(block_ids) == 1` from `lower_nested_for_loop`. Divisibility heuristic fallback removed (kept inner block ID resolution from body symbols).
-
-4. **Phase 3: Synthetic store on descriptor** — `memory_ops.py` per-iteration insert uses `plan_slice()` on the synthetic store context directly (the legacy `inner_dim` fallback path was removed after empirical verification — see "Legacy cleanup" below).
-
-5. **Phase 4: Terminal store + grid dims** — `build_kernel_body` derives which grid block_id maps to which output dimension (not positional) from the terminal store's own index expression. Terminal store path tries the descriptor first, then a positional fallback (this fallback is the common case in practice, since the real output tensor usually has no SSA value bound yet at terminal-store time).
-
-6. **Phase 5: Cleanup + hardening** — `infer_block_id_from_value_shape()` (kept as a deprecated fallback in the original pass) was later confirmed dead via empirical instrumentation and removed — see "Legacy cleanup" below.
-
-**Legacy cleanup** (verified via empirical instrumentation: temporarily added stderr markers to every suspected-dead fallback branch, ran the full test suite with `-s`, counted hits, removed anything with zero hits):
-- Removed `build_context.py::infer_block_id_from_value_shape` and its 2 call sites — symbolic block-id resolution always suffices; this shape-based guess never fired.
-- Removed the legacy `inner_dim`-based fallback in `memory_ops.py::lower_store`'s synthetic-store branch, along with the `try/except` that swallowed `plan_slice` failures to reach it — `plan_slice` never fails there across all tested nesting depths, combined tiles, transposes, and reductions; a real failure now surfaces as a real error.
-- Removed the now-write-only `"block_id"`/`"inner_dim"`/`"rank"` keys from `control_flow.py`'s `synthetic_store_ctx` dict, and the dead `BuildContext.block_id_to_out_dim` field (set but never read back).
-- Confirmed **still active** (kept): the positional heuristic-based terminal store (the most common path in practice), `_find_reused_block_id`'s recursive wrapper-unwrapping, the `fallback_outer_bid` heuristic, and the loop-declaration-order fallback in `build_kernel_body`.
-
-**Invariants Maintained**:
-- Index position == tensor dimension (scalars reduce rank via `reduces=True`)
-- Block IDs come from `node_symbol_info()` or `infer_index_block_and_bias()`, never from size/extent matching
-- `for_store_ctx_stack` is optional (descriptor path doesn't require it)
-- Synthetic store accumulator carry is separate from slice geometry
-
-**Test Coverage**: 128/128 tests pass (`uv run pytest`, `HELION_MLIR_PIPELINE` unset — that env var switches to the AMX vectorizing `pipeline.yaml`, which is for the bf16 matmul benchmark scripts only, not general kernels).
-
-**Post-refactor bug fixes** (found via crash/correctness triage, not part of the original 6 phases):
-- `codegen.py` reused a fresh `mlir.ir.Context()` per compile; rapid create/destroy across kernel configs raced the native context's background thread pool and corrupted the heap. Fixed by sharing one process-wide `Context` (standard MLIR usage: one context, many modules).
-- `slice_plan.py`'s `plan_slice()` used the absolute block/tile induction variable as the offset even when the base tensor's dimension had already been reduced to one local tile (e.g. a synthetic per-iteration accumulator), writing out of bounds. Fixed: offset is forced to 0 whenever the base extent equals exactly one tile's size.
-- `control_flow.py`'s `block_id_to_out_dim` mapping assumed grid-block ids map to output dimensions in loop-declaration order. Two bugs from that assumption: (1) a single `hl.tile([m, n])` statement produces one `grid_block_ids` group containing both block ids, which all collapsed onto one output dimension; (2) the store's index order can differ from loop declaration order (e.g. `out[tm, panel, :]` with the `panel` loop declared first). Fixed by deriving the mapping from the actual terminal store's index expression (authoritative), falling back to flattened loop order only if no matching store is found.
-
-**Arbitrary-depth nested loop generalization** (implements the two previously-open unpack forms):
-- `lower_nested_for_loop` no longer asserts a single block id per loop node. It resolves each level's real block id (`_find_reused_block_id` now recurses through pure-wrapper nested `_for_loop` bodies to arbitrary depth, fixing `grid -> grid -> tile` 3+ levels deep) and, for a combined multi-dim tile (`hl.tile([a, b])`, one `_for_loop` node carrying 2+ block ids), disambiguates each dimension via `_resolve_multi_block_ids` (matches declared upper bound against each candidate block's real size hint), then emits one `scf.for` per block id via a shared recursive emitter (`_emit_for_loop_level`).
-- Every loop level between the outer `scf.forall` and the level with the actual store now threads its own synthetic accumulator (found via `_find_descendant_store`, a proper DFS scoped to true descendants — not a global scan), chained through `ctx.push_store_ctx`/`ctx.for_store_ctx_stack` exactly like naturally-nested `_for_loop` FX nodes already did. This required two additional fixes surfaced by testing: (1) the legacy `fallback_outer_bid` heuristic could misfire on a resolvable-but-not-yet-active descendant block or a full-slice dim, now guarded to only apply to genuinely unresolvable non-slice indices; (2) the tail flush into a parent's local accumulator now clamps an ancestor's offset to 0 whenever the parent's own dimension has already been reduced to a single slot (mirroring the `slice_plan.py` fix, but for this separate legacy code path).
-- `load_slice_ops.py` no longer builds a single rank-reducing `tensor.extract_slice` (ambiguous, and can trigger a native assertion, whenever a *kept* tile dimension also happens to have extent 1 — e.g. a `hl.tile()` with block size 1). It now always extracts at full rank, then explicitly drops only the scalar-indexed dims via `tensor.collapse_shape` with an index-based reassociation map (unambiguous, since dims are named by position, not inferred from size).
-
-**Future Work / remaining gaps**:
-- **Unpack operations** — all 3 originally-planned forms now work:
-  - `grid(np) → tile(m)`, including reordered store indices (`out[tm, panel, :]`) — covered by `test_unpack_grid_tile_reordered_store_execute_mlir`.
-  - `grid(mb) → grid(np) → tile(bm)` (3 levels deep) — covered by `test_unpack_triple_nested_grid_execute_mlir`.
-  - `grid(mb) → tile([bm, np])` (grid + a single combined 2D tile) — covered by `test_grid_combined_2d_tile_execute_mlir`.
-- **Dimension-reordering transpose in a combined tile — resolved, not a gap**: an *implicit* reorder via differing load/store index order (e.g. `out[m,tm,tp,:] = src[m,tp,tm,:]`, swapping `tm`/`tp`) is genuinely invalid Helion syntax when the swapped dims differ in size — Helion's own frontend type-checks the assigned value's shape against the store's expected shape and would reject a real mismatch (an earlier test of this only "passed" the frontend by degenerate luck, using a block size of 1 for one dim). The *correct*, already-fully-supported way to write this is an **explicit** `.permute()`/`.transpose()`/`.t()` call — Helion's device IR already represents these as standard `aten.permute`/`aten.transpose` ops, and the backend already has a dedicated `linalg.transpose` lowering (`transpose_ops.py`) for them. Investigating this surfaced a real, narrower, pre-existing bug: `aten_lowering.py::_fake_tensor_from_load_node` (used only when building torch-mlir "ATen helper" subgraphs) reconstructed a load's shape by counting index positions **without dropping scalar-indexed (grid/`tile.begin`/literal-int) dimensions**, disagreeing with the load's real (correctly rank-reduced) `meta['val']` — this broke any ATen op consuming a scalar-indexed load's result directly, not just permute in a combined tile. Fixed to drop scalar-indexed dims the same way `plan_slice`/`ctx.is_scalar_index_node` already do elsewhere. Covered by `test_scalar_grid_index_transpose_execute_mlir` (minimal case) and `test_grid_combined_2d_tile_explicit_transpose_execute_mlir` (the original motivating case).
-- **Combined multi-dim tile with an external loop-carried accumulator — resolved**:
-  a combined inner `hl.tile([a, b])` loop that updates an outer accumulator
-  carries it through every `scf.for` of the nest. Loop outputs are matched to
-  their variables through Helion's `_phi(before, getitem(loop, i))` nodes, not
-  by position, so invariant loop inputs may appear in any order
-  (`tests/test_numerics.py`).
-- Ragged K-dimension handling (K not exact multiple of TK): resolved, the tail
-  tile is zero-padded (`tests/test_ragged_tiles.py`).
+6. 4D matmul remains a Helion frontend limitation.

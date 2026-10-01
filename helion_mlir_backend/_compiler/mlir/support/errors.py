@@ -35,7 +35,6 @@ class UnsupportedOperationError(MLIRBackendError):
             msg += f"\nReason: {reason}"
         if alternatives:
             msg += f"\nAlternatives: {', '.join(alternatives)}"
-        msg += "\nNote: Check MLIR_LIMITATIONS.md for supported operations"
         super().__init__(msg)
         self.op_name = op_name
         self.reason = reason

@@ -283,6 +283,7 @@ from typing import TYPE_CHECKING
 from ...language import _decorators
 from ...language.reduce_ops import reduce as reduce_op
 from ..ast_extension import expr_from_string
+from ..compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -292,16 +293,17 @@ if TYPE_CHECKING:
 def _(state: CodegenState) -> ast.AST:
     """Generate reduction operation for MyBackend."""
     input_tensor = state.proxy_arg(0)
-    reduction_type = state.const_arg(1)  # "sum", "max", "min", etc.
+    reduction_type = state.proxy_arg(1)  # "sum", "max", "min", etc.
     output_dtype = state.proxy_arg(2)
 
     # Example: generate a sum reduction
     if reduction_type == "sum":
         # MyBackend-specific sum reduction syntax
+        backend = CompileEnvironment.current().backend
         return expr_from_string(
             "my_backend.sum({input}, dtype={dtype})",
             input=state.ast_arg(0),
-            dtype=expr_from_string(state.backend.dtype_str(output_dtype))
+            dtype=expr_from_string(backend.dtype_str(output_dtype))
         )
 
     raise NotImplementedError(f"Reduction {reduction_type} not implemented")
@@ -330,23 +332,22 @@ _BUILTIN_BACKENDS: list[type[Backend]] = [
 ```python
 class CodegenState:
     # Accessing arguments
-    proxy_arg(i: int)          # Get i-th arg as proxy (for analysis)
+    proxy_arg(i: int)          # Get i-th arg as proxy/constant (for analysis)
     ast_arg(i: int)            # Get i-th arg as AST expression (for codegen)
-    const_arg(i: int)          # Get i-th arg as constant value
 
     # Configuration
     config: Config             # Current tuning config
-    backend: Backend           # Active backend
 
     # Device context
-    device_function: DeviceFunction  # Kernel state/temporary allocation
+    device_function: DeviceFunction  # Kernel state; device_function.new_var(name) for temporaries
 
     # Code generation
-    add_statement(stmt: ast.AST)  # Add statement to output
-    tmpvar(prefix="v")         # Generate temporary variable name
+    add_statement(stmt: ast.AST | str)  # Add statement to output
 
     # Tracking
     fx_node: torch.fx.Node     # Source FX node
+
+# The active backend: CompileEnvironment.current().backend
 ```
 
 ## Important Patterns

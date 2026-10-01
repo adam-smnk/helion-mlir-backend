@@ -85,7 +85,7 @@ class MLIRModuleBuilder:
 
     The module holds one private tensor function per ``hl.barrier()`` phase and
     a public memref-ABI entry function named after the kernel that calls them in
-    order (see ``docs/MLIR_DESIGN.md``, calling convention).
+    order.
 
     Parameters
     ----------

@@ -1,20 +1,18 @@
 # Padding-Fusion Into Packing Kernels: Findings and Future Work
 
-This document records why fusing zero-padding directly into the AMX packing
+This document records the work on fusing zero-padding into the AMX packing
 kernels (`_pack_a_kernel`, `_pack_b_kernel`, `_pack_a_kernel_t`,
-`_pack_b_kernel_t` in `AI-bench/backends/utils/helion_mlir_cpu_utils/matmul.py`)
-is currently blocked in the backend, not in kernel authoring. Two independent
-root causes were found; both are reproducible with the small scripts below,
-copied here as starting points for a future fix.
+`_pack_b_kernel_t` in `AI-bench/backends/utils/helion_mlir_cpu_utils/matmul.py`).
+The Status section is current; Findings 1 to 3 are the original investigation,
+kept for history.
 
-Context: today, packing for irregular (non-32-divisible) shapes pads via a
-host-level `torch.zeros(...)` + slice-assign *before* the packing kernel runs
-(see `matmul.py`), which touches the operand's data twice (once to copy into
-the padded buffer, once to pack from it). The goal explored here was to fold
-the zero-fill and the real-data copy into the same kernel that does the
-packing, so padding-needed shapes get the same single-pass treatment as the
-already-fast aligned-shape path (see `docs/AMX_MATMUL_OPTIMIZATION_FINDINGS.md`
-for that unrelated packing-loop speedup, which *is* shipped).
+Context: packing for irregular (non-32-divisible) shapes in `matmul.py` pads via
+a host-level `torch.zeros(...)` + slice-assign *before* the packing kernel runs,
+which touches the operand's data twice (once to copy into the padded buffer,
+once to pack from it). The goal is to fold the zero-fill and the real-data copy
+into the kernel that does the packing, so padding-needed shapes get the same
+single-pass treatment as the aligned-shape path (see
+`docs/AMX_MATMUL_OPTIMIZATION_FINDINGS.md` for the packing-loop speedup).
 
 ## Status: padding fused into single-phase packing kernels
 
@@ -60,27 +58,16 @@ Remaining limits:
   their padded reads have a permutation map, which the split skips, so every
   tile is masked. For small padded operands they are slower than eager.
 
-Sections 1 to 3 below are the original findings.
-
-Reproduce with:
-
-```bash
-# scalar pipeline -- all repros below pass here
-env -u HELION_MLIR_PIPELINE OMP_NUM_THREADS=4 LD_PRELOAD=/lib64/libtcmalloc.so uv run python temp/<script>.py
-# AMX pipeline -- repros below fail here
-OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 LD_PRELOAD=/lib64/libtcmalloc.so uv run python temp/<script>.py
-```
+Sections 1 to 3 below are the original findings; their probe scripts are no
+longer kept.
 
 ---
 
 ## 1) Multi-Phase Padding+Pack Kernel: Wrong Results Under the AMX Pipeline
 
-**Status:** blocked in the AMX-optimizing pipeline (lighthouse's register-tiling
-schedule), not in Helion frontend codegen.
-**Probes:** `temp/test_pack_a_fused_padding2.py` (3-phase single kernel, fails
-standalone -- no other kernel needed to reproduce),
-`temp/test_pack_a_split_kernels.py` (2 separate kernels called back to back,
-same failure).
+**Status:** superseded by the single-phase kernel above (not re-tested). The
+garbage in the padded region matches the `vectorize_pads` bug described in
+the Status section, not the tiling assumption suspected below.
 
 ### Summary
 
@@ -105,7 +92,7 @@ aside) once you account for buffer identity, and both give correct results
 under the scalar pipeline. Only when this same packing logic is the *last*
 phase of a barrier-separated, multi-phase kernel does the **AMX** pipeline's
 register-tiling/tile-and-fuse schedule (`pipeline.yaml`'s
-`tile_and_fuse.py[gen=tile_and_fuse_annotated]` stage, see Finding 2's IR dump
+`tile_and_fuse.py[gen=tile_and_fuse_annotated]` stage, see Finding 3's IR dump
 below for exactly which schedule this is) produce wrong results for that
 phase. The suspicion is that lighthouse's tile-and-fuse transform makes an
 incorrect assumption about the *shared_outs*/output-buffer-identity produced
@@ -118,41 +105,20 @@ investigation.
 Note: an earlier version of this document (before this update) additionally
 attributed a *crash* (not wrong-results) symptom to "cross-kernel state
 corruption" from compiling an unrelated trivial kernel before the pack
-kernel. That framing was incorrect -- see Finding 2 below, which shows the
+kernel. That framing was incorrect -- see Finding 3 below, which shows the
 "unrelated trivial kernel" crashes **on its own**, standalone, for a
 completely different and unrelated reason. The two bugs are independent;
 this document originally conflated them.
-
-### Potential fixes to investigate
-
-- Compare the bufferized/lowered IR for the crashing multi-phase-final-stage
-  case against the correct standalone case (both listed as probes above) at
-  each stage of `pipeline.yaml`, the same way Finding 2's IR-dump reproducer
-  does, to find exactly which stage in `pipeline.yaml` first diverges/goes
-  wrong for the multi-phase case.
-- Look at `tile_and_fuse.py[gen=assign_and_propagate_tile_sizes]` and
-  `tile_and_fuse.py[gen=tile_and_fuse_annotated]` (the two custom schedules in
-  `pipeline.yaml` responsible for register tiling) for any assumption that a
-  phase's `scf.forall`'s `shared_outs` init always comes from a fresh
-  `tensor.empty()` rather than a threaded-through buffer from an earlier
-  phase.
-- Bisect by reducing the padding kernel to just 2 phases (zero-fill + pack,
-  no separate real-data-copy phase) to see if the bug needs specifically 3
-  phases, or reproduces with 2.
 
 ---
 
 ## 2) Single-Phase Kernel: Boundary-Tile Masking Clamps Instead of Zero-Filling
 
-**Status:** resolved (review plan, Phase 6). Loads now read only the part of a
+**Status:** resolved. Loads now read only the part of a
 tile inside the loop and the tensor and zero-pad the rest, and the ragged
 combined-tile rejection is gone. The reproducer below returns zeros past the
 input (`tests/test_ragged_tiles.py::test_read_past_tensor_end_is_zero`), so
 design 1 works. The analysis below is kept for history.
-**Probes:** `temp/test_auto_masked_read.py` (2D combined tile, direct OOB
-read), `temp/test_auto_masked_read_1d.py` (1D single-dim tile, direct OOB
-read), `temp/test_local_partial_write.py` (functional
-`torch.nn.functional.pad` composition).
 
 ### Summary
 
@@ -188,7 +154,7 @@ zero) in the out-of-bounds region.
 
 ### Root cause
 
-Isolated with a minimal 1D case (`test_auto_masked_read_1d.py`): tiling a
+Isolated with a minimal 1D case: tiling a
 64-wide output in two blocks of 32 while reading from a 19-element input, the
 **first** block (containing real data, indices 0-18, and some in-block
 padding, indices 19-31) computes correctly. The **second** block (indices
@@ -264,20 +230,10 @@ print("res[19:64] should be 0, is:", res[19:64])  # shows duplicated a[0:...] da
 
 ## 3) Unrelated: AMX Tile-And-Fuse Schedule Crashes on a Standalone 1D Elementwise Kernel
 
-**Status:** a separate, tangential bug found while investigating Finding 1 by
-testing whether an unrelated kernel compiled beforehand could affect the pack
-kernel's compilation. It turned out the "unrelated kernel" itself crashes
-under the AMX pipeline, **standalone**, with no other kernel involved --
-correcting an earlier (wrong) version of this document's Finding 1, which had
-misattributed this crash to "cross-kernel state corruption".
-
-**Probes:** `temp/repro_trivial_alone.py` (minimal, standalone repro),
-`temp/repro_amx_state_corruption_dump_ir.py` (same repro, but monkey-patches
-`lighthouse.pipeline.stage.PassStage.apply`/`TransformStage.apply` to dump the
-input IR of every pipeline stage to `temp/ir_dump/stage_NN_*.mlir` --
-including an `fsync()` after every write -- *before* that stage runs, so the
-crashing stage's input IR survives on disk even though the crash is a native
-`SIGABRT` that Python cannot catch).
+**Status:** current, and not specific to padding: the optimizing pipeline aborts on
+ops whose tiled dims are all smaller than 32 (`docs/MLIR_LIMITATIONS.md`, section 14;
+`scripts/lighthouse_small_tile_repro.py`). It was found while investigating Finding 1,
+whose earlier version misattributed this crash to "cross-kernel state corruption".
 
 ### Summary
 
@@ -312,11 +268,8 @@ Under the scalar pipeline it runs fine and gives correct results.
 
 ### IR at the point of the crash
 
-Running `temp/repro_amx_state_corruption_dump_ir.py` dumps 14 stages
-(`stage_00` .. `stage_13`) to `temp/ir_dump/` before the process aborts; no
-`stage_14` file is written, so `stage_13_TransformStage.mlir` is the input IR
-to the crashing stage. Per `temp/ir_dump/stage_log.txt`, that crashing stage
-is the last transform in `pipeline.yaml`'s register-tiling flow --
+Dumping the input IR of every pipeline stage shows the crashing stage is the
+last transform in `pipeline.yaml`'s register-tiling flow --
 `tile_and_fuse.py[gen=tile_and_fuse_annotated]`:
 
 ```mlir
@@ -339,9 +292,8 @@ module attributes {transform.with_named_sequence} {
 }
 ```
 
-...applied to this payload IR (`stage_13_TransformStage.mlir`, the trivial
-kernel's own IR after the earlier register-tiling/fusion-root-assignment
-stages have already run):
+...applied to this payload IR (the trivial kernel's own IR after the earlier
+register-tiling/fusion-root-assignment stages have already run):
 
 ```mlir
 #map = affine_map<(d0) -> (d0)>
@@ -397,17 +349,9 @@ in `applyTilingToAll` (upstream MLIR, not lighthouse or this backend).
 
 ## Recommendation
 
-Given both findings are backend-level (not kernel-authoring) issues -- one in
-lighthouse's register-tiling schedule for multi-phase kernels, one in this
-backend's tile-boundary masking semantics (since resolved) -- padding-fusion into the packing
-kernels is **not** attempted in the shipped `matmul.py`. The current
-host-side `torch.zeros(...)` + slice-assign approach for the padding-needed
-case is kept as-is; it is correct and only adds overhead for the relatively
-rare non-32-divisible-shape case. The already-shipped nested-tile
-packing-loop speedup (see `docs/AMX_MATMUL_OPTIMIZATION_FINDINGS.md` and
-`tests/test_mlir_execution.py::TestPaddedPackingAndMultiPhaseExecution`) is
-unaffected by either finding above, since it only exercises a single kernel,
-single phase, with tile domains matching the (already block-aligned) packed
-buffer's own shape. Finding 3 is unrelated to padding-fusion but is recorded
-here since it surfaced during this investigation and blocks anyone trying to
-run *any* two AMX-piped kernels in one process today.
+Fused padding now works in one single-phase kernel on both pipelines (Status
+above), but the shipped `matmul.py` still pads on the host. Switching its
+packing kernels to the fused form of `examples/block_packing_mlir.py` would
+remove the extra pass over the operand for padding-needed shapes. The transposed
+layouts would first need the padded transposed read to be split like the others
+(see Remaining limits).

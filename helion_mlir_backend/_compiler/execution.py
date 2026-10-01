@@ -44,7 +44,8 @@ def _dump_if(enabled: bool, label: str, module: ir.Module) -> None:
 
 
 def pipeline_descriptor(pipeline: str | None = None) -> Descriptor:
-    """The lighthouse pipeline by name; ``HELION_MLIR_PIPELINE=1`` selects ``opt`` by default."""
+    """The lighthouse pipeline by name; by default ``opt`` if
+    ``HELION_MLIR_PIPELINE=1``, else ``scalar``."""
     if pipeline is None:
         pipeline = "opt" if use_optimizing_pipeline() else "scalar"
     if pipeline == "opt":

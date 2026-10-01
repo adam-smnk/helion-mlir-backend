@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 _CONFIG_KEYS = frozenset({"block_sizes", PIPELINE_CONFIG_KEY})
 _OPT_MIN_TILE = 32
-"""Lighthouse's tile-and-fuse aborts on ops whose tiled dims are all smaller (I23)."""
+"""Lighthouse's tile-and-fuse aborts on ops whose tiled dims are all smaller."""
 
 
 def raise_block_minimums(config_spec: ConfigSpec) -> None:

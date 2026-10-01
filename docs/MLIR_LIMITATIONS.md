@@ -13,8 +13,6 @@ This document lists current limitations for the MLIR backend in this repository.
 - All example scripts under `examples/` are kept runnable and are re-verified
   after backend changes (`uv run python examples/<name>.py`).
 
-This replaces earlier "IR-only" descriptions.
-
 ## 1) Dynamic Shapes
 
 Current behavior:
@@ -154,20 +152,19 @@ Current behavior:
   Helion's masked loads and stores. `extra_mask` zeroes loaded elements and
   skips stored ones.
 - A load past the end of a tensor smaller than the iteration domain reads zeros.
-- A zero-padded load stored whole into a full destination slice
-  (`out[tn.id, tk.id, :, :] = b[tk, tn]` over a padded extent) is written
-  directly: a static copy for tiles the source covers, masked row reads plus
-  zero rows for edge tiles. See `docs/PADDING_FUSION_FINDINGS.md` (Status) and
-  `examples/block_packing_mlir.py`.
+- On the optimizing pipeline a zero-padded load is a vector read of its real
+  part, padded past its end, and only edge tiles take the masked path (section 15;
+  `examples/block_packing_mlir.py`).
 - When every block size divides its loop and the loops stay inside the tensors,
   the IR has only static sizes.
 
 Limits:
 - A tile offset that may point before the start of a tensor (`x[tile.index - 1]`
   style negative offsets from the first tile) is rejected.
-- A padded load transformed before its store (`b_t[tn, tk].permute(1, 0)`), or
-  stored into a tile the loop end cuts short, keeps its `tensor.pad`. The result
-  is correct but slower.
+- A padded tile read transposed (`b_t[tn, tk].permute(1, 0)`) keeps a permuted
+  vector read, which the optimizing pipeline does not split: every such tile takes
+  the masked path, which is slower (much slower for bf16 on CPUs without
+  AVX512_BF16, where LLVM scalarizes masked bf16 loads).
 
 ## 10) Multi-Output Kernels
 
@@ -285,29 +282,19 @@ through the optimizing pipeline. The scalar pipeline is unaffected. The autotune
 itself: a search under the optimizing pipeline only tries tiles of at least 32 (where the
 dimension allows); given configs are not changed.
 
-With tiles of at least 32, lighthouse's transforms still reject (a Python `ValueError`:
-"Failed to apply named transform sequence", or "mixed static/dynamic
-offset/sizes/strides requires explicit result type" from `move_offsets_to_subview`)
-many ops over tiles larger than their dimension, over ragged tiles, and over full
-slices whose extent is not a multiple of 32 (a 33x65 softmax row, a 64x40 layer norm).
+With tiles of at least 32, the remaining failures are statically shaped ops that
+lighthouse's vectorization rejects on ragged tiles, e.g. `argmax` over 33x65 rows (a
+Python `ValueError`: "Failed to apply named transform sequence").
 
 ## 15) Lighthouse Pipeline Deviations
 
-The local lighthouse checkout carries these pipeline changes (to be upstreamed):
-- `bufferization.yaml` runs one-shot bufferization with `allow-return-allocs-from-loops`, so
-  loop-carried values no longer have to be updated in place (previously any such update
-  failed with "Yield operand #0 is not equivalent to the corresponding iter bbArg").
-- `scalar-lowering.yaml` includes `bufferization-cleanup.yaml` to deallocate the buffers that
-  option allows inside loops.
-- `move_offsets_to_subview` skips transfers on memrefs with a dynamic shape or dynamic
-  strides, whose subview result type the Python helper cannot infer.
-- `tile_and_unroll_annotated` (`x86_64/unroll-register.yaml`) leaves loops of runtime
-  trip count rolled instead of failing ("failed to fully unroll").
-- `llvm-lowering.yaml` expands `math.fpowi` of constant exponent (`math-expand-ops`):
-  vector `fpowi` has no LLVM lowering, as LLVM's `powi` takes a scalar exponent.
+The backend relies on one lighthouse change not yet on its main branch:
+`bufferization.yaml` runs one-shot bufferization with `allow-return-allocs-from-loops`,
+so loop-carried values need not be updated in place (otherwise such updates fail with
+"Yield operand #0 is not equivalent to the corresponding iter bbArg"; section 5).
 
-The backend's opt pipeline replaces or adds these stages, from
-`_compiler/helion_transforms.py`:
+The optimizing pipeline (`_compiler/pipeline.yaml`) follows lighthouse's x86 pipeline,
+with these stages from `_compiler/helion_transforms.py` replacing or added to it:
 - `vectorize_pads`, before the tensor-level vectorization: each `tensor.pad` whose
   runtime extents have evident constant bounds becomes a vector read of its source
   (padded with the pad value) written into an empty tensor. Bufferized as is, a pad is a
@@ -352,7 +339,6 @@ The backend's opt pipeline replaces or adds these stages, from
 
 ## Out of Scope for This Backend Today
 
-- Dynamic-shape kernels on the optimizing pipeline beyond statically tiled ones.
 - GPU runtime execution path parity with CPU path in this backend.
 - Guaranteed support for all ATen programs independent of pattern shape.
 

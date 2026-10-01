@@ -1,10 +1,10 @@
 # helion_mlir_backend: In-Depth Review and Improvement Plan
 
-Status: proposal for review (revision 2: lighthouse investigation folded in, detailed
-per-phase plan in §5). No backend code has changed yet.
+Status: done. This is the record of the review and its phases; each phase's **Outcome**
+notes what changed and what deviated from the plan. Sections before the outcomes describe
+the backend as it was at review time.
 Baseline: `uv run pytest -q tests/` gives 284 passed in 77 s. The package has about 8.3k LOC.
-Probe and spike scripts that reproduce every claim below are in `temp/review_probes/`. Run
-each case in its own process, e.g. `uv run python temp/review_probes/probe.py ragged1d`.
+The probe and spike scripts used for the review were scratch files and are not kept.
 
 Decisions already agreed:
 
@@ -93,8 +93,7 @@ listed in §4.3 is preserved and guarded by tests.
 
 ### 2.1 Lighthouse spikes
 
-These are hand-written MLIR modules in `temp/review_probes/spike_lighthouse.py` and
-`spike_sfc.py`. They use tiles of at least 32 unless noted.
+These are hand-written MLIR modules. They use tiles of at least 32 unless noted.
 
 | Spike | Scalar pipeline | Optimizing pipeline | Consequence for the plan |
 |---|---|---|---|
@@ -466,7 +465,7 @@ Work items:
      optimizing pipeline under
      `TargetInfo.override(features=host + ["amx_bf16", "amx_tile", "amx_int8"])`.
    - Applies stages until `x86_vectorization` and asserts `x86.amx.tile_mulf` is present.
-   - Nothing is executed. This is already verified in `temp/review_probes/spike_amx_ir.py`.
+   - Nothing is executed.
 5. Optimizing-pipeline execution suite: `tests/test_opt_pipeline.py`, isolated,
    `HELION_MLIR_PIPELINE=1`.
    - Covers f32 `helion_mlir_cpu_utils` `matmul` (plain, bias + relu, `trans_b`), `linear`,
@@ -546,7 +545,7 @@ Work items:
   - Goldens are regenerated once; the reviewed diff is limited to the forall header and
     `affine.apply` offsets.
   - AMX gate and opt suite are green.
-- **Risks:** tile-and-fuse behaviour with `affine.apply` offsets. `spike_sfc.py` verified it
+- **Risks:** tile-and-fuse behaviour with `affine.apply` offsets. A spike verified it
   for a contraction. Keep an internal `normalize_forall` switch for this phase only.
 
 ### Phase 2: Registry, exact op matching, one contraction path (including `hl.dot`), diagnostics
@@ -721,7 +720,7 @@ Work items:
     (`out[tm, tn] = x[tm, None]`) is legal Helion (type propagation checks rank only; eager
     mode and Triton `tl.store` broadcast). It failed in the MLIR pipeline before Phase 3
     and now raises the "transposed or mismatched tile layout" error. Scheduled in Phase 7
-    (I27); probe: `temp/probe_store_broadcast.py`.
+    (I27).
 
 ### Phase 4: Host semantics, calling convention, runtime
 
@@ -1105,7 +1104,7 @@ Work items:
 - **Outcome (done).** Suite 408 -> 423, sweep 22/22, examples pass. Timings on this laptop
   varied several-fold between identical runs, so the exit criterion is the allocation
   count instead (agreed with the user). `memref.alloc` ops inside loops
-  (`temp/phase8/measure_allocs.py` and `opt_allocs.py`, 256-row inputs), before -> after:
+  (256-row inputs), before -> after:
 
   | Case | Scalar bufferization | Opt pipeline |
   |---|---|---|
@@ -1141,8 +1140,8 @@ Work items:
     op's identity. Other combiners, dtypes (unsigned, `add` on bool) and tuple inputs keep
     Phase 7's lowering.
   - Scans keep the sequential loop. torch-mlir lowers `cumsum`/`cumprod`/`logcumsumexp` to
-    `tm_tensor.scan`, which upstream MLIR cannot parse, and fails to import `cummax`
-    (`temp/phase8/probe_scan_helpers.py`). The loop already combines a whole slice of the
+    `tm_tensor.scan`, which upstream MLIR cannot parse, and fails to import `cummax`.
+    The loop already combines a whole slice of the
     other dims per step. Its `take` now uses a rank-reducing `extract_slice` (a view)
     instead of `extract_slice` + `tensor.reshape`, which copied every step. `put` keeps
     `reshape` + `insert_slice`, because a rank-reducing `insert_slice` there trips an MLIR
@@ -1163,8 +1162,8 @@ kernel; the optimizing pipeline handles those whose tile computations are static
 matmul), and the rest fall back to the scalar pipeline. Static kernels are unchanged.
 **Addresses.** I30, I31, I32.
 
-**Feasibility (evaluated before the phase, `temp/phase9/`).**
-- Helion (`probe_dynamic_device_ir.py`): host tensors carry size symbols
+**Feasibility (evaluated before the phase).**
+- Helion: host tensors carry size symbols
   (`TensorSizeOrigin`/`NameOrigin`); device IR reads runtime sizes through
   `_get_symnode('x_size1')`, which Phase 4 already passes as a runtime scalar argument, or
   through `sym_size.int` of tile values. The bound kernel is reused for every size in
@@ -1172,22 +1171,22 @@ matmul), and the rest fall back to the scalar pipeline. Static kernels are uncha
 - Today (I30): a dynamic matmul fails with `DynamicShapeError` (host tensor type).
   Worse, `geometry._static_int_or_none` calls `int()` on `SymInt`s, which specializes them
   to the example sizes behind Helion's back: `row_softmax` compiled for (20, 33) is reused
-  by Helion for (21, 40) and rejected by the driver's shape check
-  (`probe_row_softmax_dynamic.py`). Any use of size hints must go.
-- Lighthouse, scalar pipeline (`spike_dynamic.py scalar`): hand-written modules in the
+  by Helion for (21, 40) and rejected by the driver's shape check.
+  Any use of size hints must go.
+- Lighthouse, scalar pipeline: hand-written modules in the
   backend's form (`?` host tensors, `tensor.dim` sizes, forall trip counts from
   `ceildiv`, `affine.min` real sizes, pad on load, partial stores) give correct results
   from one compiled entry for a matmul (64x64@64x64, 70x100@100x50, 1x7@7x3,
   33x129@129x65), a batch matmul with a dynamic batch, and a row sum with a
   `tensor<8x?xf32>` tile.
-- Lighthouse, optimizing pipeline (`spike_dynamic.py opt`): the dynamic matmul is correct
+- Lighthouse, optimizing pipeline: the dynamic matmul is correct
   for all four shapes. The dynamic-batch matmul fails in lighthouse's
   `move_offsets_to_subview` transform, which builds a `memref.subview` with the static
   size sentinel of a dynamic memref (I31); with a two-line guard (skip dynamic memrefs,
   applied locally in `lighthouse/`) it is correct for batch 1, 3 and 8. A reduction over a
   dynamic tile dim fails with "Attempted to vectorize, but failed" (vectorization without
   vector sizes, I32), and tiles < 32 still abort (I23).
-- torch-mlir helpers (`spike_dynamic_helpers.py`): with symbolic sample tensors
+- torch-mlir helpers: with symbolic sample tensors
   (`FakeTensorMode` + `ShapeEnv`, one size symbol per `?`), `amax`, `sum`, `exp`,
   broadcasting `sub`/`div`, `add`, `mm` with a dynamic K and `view` lower to the expected
   signatures (`(tensor<32x?xf32>, tensor<32x1xf32>) -> tensor<32x?xf32>`, ...).
@@ -1291,10 +1290,11 @@ Work items:
     `div.Tensor_mode(Tensor, int)`.
   - Helion itself rejects `hl.zeros([tm, n])` reduced over the runtime `n` (an assertion
     in its inductor lowering), so the test stores it instead.
-  - Pipeline choice (`execution._dynamic_linalg_op`): the optimizing pipeline is used
-    unless a linalg op in the inlined module has a runtime-sized operand or result.
-    `row_softmax` then falls back to scalar. The lighthouse `move_offsets_to_subview`
-    guard (§9, I31) is still a local patch.
+  - Pipeline choice (then `execution._dynamic_linalg_op`): the optimizing pipeline was
+    used unless a linalg op in the inlined module had a runtime-sized operand or result;
+    `row_softmax` fell back to scalar. Later removed: the optimizing pipeline now
+    vectorizes runtime-sized ops with masks (§9, I32). The lighthouse
+    `move_offsets_to_subview` guard (§9, I31) is still a local patch.
   - Contraction results with runtime dims take their sizes from the operands
     (`x[:, :] @ y[:, tn]`). A contraction over a runtime full K on static output tiles
     stays a `linalg.matmul` with a `?` K.
@@ -1347,7 +1347,7 @@ Work items:
     offsets carry the block size even for a single trip), so hits come from recompiling
     one config (new bound kernels, `compile_mlir`). No on-disk JIT cache: lighthouse's
     `Runner` can dump an object file but not load one.
-  - Compile-time profile (`temp/phase10/compile_profile.py`): on the scalar pipeline a
+  - Compile-time profile: on the scalar pipeline a
     256x256 matmul or a 32x1024-row softmax compiles in about 0.1-0.3 s per stage. On the
     opt pipeline the matmul takes 0.2 s of lighthouse passes, while the softmax takes 2.5 s
     of lighthouse passes and 7 s of LLVM JIT (wide unrolled vectors). This is the likely
@@ -1365,7 +1365,7 @@ Work items:
   `view_ops.reshape` (was `static_reshape`) and one `emit.reassociation` helper.
 - Dead code removed: `TensorEffects.reads/written_in/read_in`, `emit.zero_attr`,
   `torch_tensor_to_mlir_type`; `mlir_dtype_to_torch` no longer defaults to f32.
-- Bugs found (by `temp/cleanup/stress.py`: 64 kernels, odd f32 shapes 1..100, 8 block
+- Bugs found (by a stress harness: 64 kernels, odd f32 shapes 1..100, 8 block
   size patterns, static and dynamic, 2718 runs; and targeted probes), all fixed:
   - Nested `_for_loop` carried values were the *last* N loop args; a loop reading an
     invariant tile after its accumulator (`acc + x.sum() * scale`) carried the wrong one.
@@ -1439,7 +1439,7 @@ Work items:
 | I24 | No harness, isolation, goldens, AMX gate or conformance metric | 0 | — |
 | I25 | `uint8` mapped to `ui8` | 2 | dtype test |
 | I26 | No autotuning or compile cache | 10 | `tests/test_autotune.py` |
-| I27 | Size-1 broadcasting store rejected | 7 | `temp/probe_store_broadcast.py` |
+| I27 | Size-1 broadcasting store rejected | 7 | `tests/test_regressions.py` `broadcast_store_kernel` |
 | I28 | Host tensor shape depending on a block size gets a dynamic type | 7 | register_block_size shape test |
 | I29 | Host-side Helion API calls (`hl.specialize`) not evaluated in host code | 7 | sweep `matmul_layernorm` |
 | I30 | Dynamic shapes fail, or are specialized to the example sizes via `int(SymInt)` | 9 | `tests/test_dynamic_shapes.py`, `conformance_sweep.py --dynamic` |
@@ -1509,7 +1509,7 @@ Items to report or fix upstream:
   fails ("mixed static/dynamic offset/sizes/strides requires explicit result type").
   Local fix: skip memrefs without a static shape. Ragged tiles of static tensors still
   reach it with dynamic subviews (e.g. a 64x40 elementwise kernel with 32x32 tiles).
-  Reproducer: `temp/phase9/spike_dynamic.py opt batch_matmul`.
+  Reproducer: a dynamic-batch `batch_matmul` on the optimizing pipeline.
 - **Padded `linalg.batch_matmul`:** the optimizing pipeline returns NaNs for a
   `batch_matmul` whose operands are `tensor.pad`-ed partial tiles; plain `matmul` is
   correct. Reproducer: `scripts/lighthouse_padded_batch_matmul_repro.py batch`.
@@ -1522,11 +1522,11 @@ Items to report or fix upstream:
   `insert_slice tensor<32xf32> into tensor<32x1024xf32>[0, %i] [32, 1]` carried by an
   `scf.for`, `x86_64/vectorize.yaml` aborts in
   `ValueBoundsConstraintSet::areEquivalentSlices` ("expected slices of same rank").
-  Reproducer: drop the `reshape` in `view_ops.put` and run
-  `temp/phase8/opt_allocs.py cumsum`. The backend avoids the rank-reducing form there.
+  Reproducer: drop the `reshape` in `view_ops.put` and run a `cumsum` kernel on the
+  optimizing pipeline. The backend avoids the rank-reducing form there.
 - **torch-mlir scans:** `aten.cumsum`/`cumprod`/`logcumsumexp` lower to `tm_tensor.scan`,
   which upstream MLIR (and so lighthouse) cannot parse, and `aten.cummax` fails in the
-  FX importer (`NameError: sparsity`). Reproducer: `temp/phase8/probe_scan_helpers.py`.
+  FX importer (`NameError: sparsity`).
 - **`result_to_args`:** support in/out arguments, returning an argument unchanged, and
   non-tensor scalars. Once available, the backend's own entry can be replaced.
 - **Strided function-boundary layouts,** so non-contiguous tensors avoid a copy.

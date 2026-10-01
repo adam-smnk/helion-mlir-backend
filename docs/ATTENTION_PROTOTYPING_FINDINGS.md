@@ -3,8 +3,14 @@
 This document records the investigation into a Helion MLIR CPU implementation
 of KernelBench level1/97 scaled dot-product attention. No production kernel or
 `mlir-cpu-bench` variant was shipped because none of the explored designs was
-both functional and competitive with PyTorch eager. All prototypes and logs
-remain under `temp/` as starting points for future work.
+both functional and competitive with PyTorch eager.
+
+Status since the investigation: `hl.dot` lowers (Finding 1), and a
+FlashAttention-style kernel (online softmax over key tiles with `bmm`/`baddbmm`,
+`amax`, `exp`, `sum`) compiles and is correct on the scalar pipeline
+(`tests/test_numerics.py::test_attention_small_shapes`) and on the optimizing
+pipeline, including runtime shapes. Its performance has not been measured. The
+findings below record the state at the time.
 
 The reference operation is:
 
@@ -25,8 +31,7 @@ $$
 
 Relevant source files:
 
-- Reference model: `AI-bench/third_party/KernelBench/KernelBench/level1/97_ScaledDotProductAttention.py`
-- Existing problem spec: `AI-bench/problems/specs/KernelBench/level1/97_ScaledDotProductAttention.yaml`
+- Problem spec: `AI-bench/problems/specs/KernelBench/level1/97_ScaledDotProductAttention.yaml`
 - Triton CPU implementation: `AI-bench/backends/triton/cpu/KernelBench/level1/97_ScaledDotProductAttention.py`
 - Helion GPU-oriented inspiration: `helion/examples/flex_attention.py`
 
@@ -40,9 +45,10 @@ The investigation established the following:
 2. A per-head composition of existing 2D AMX matmul helpers is numerically
    correct, but far too slow because it serializes heads and launches several
    kernels per head.
-3. A FlashAttention-style Helion kernel is expressible at the source level, but
-   the current MLIR backend does not lower `hl.dot`, and its generic ATen
-   reduction/broadcast metadata is not robust for tiled loop-local tensors.
+3. A FlashAttention-style Helion kernel was expressible at the source level, but
+   at the time the MLIR backend did not lower `hl.dot`, and its generic ATen
+   reduction/broadcast metadata was not robust for tiled loop-local tensors.
+   Both have since been fixed (see the status above).
 4. The backend can execute a blocked rank-5 batched AMX contraction. This is the
    most promising primitive for attention.
 5. A two-kernel design using blocked batched `QK^T` followed by fused
@@ -122,19 +128,9 @@ for key_block:
 out = acc / row_sum[:, None]
 ```
 
-Primary prototype:
-
-- `temp/prototype_attention_mlir.py`
-
-Representative logs:
-
-- `temp/prototype_attention_1x1x32x32.txt`
-- `temp/prototype_attention_1x1x32x32_v2.txt`
-- `temp/prototype_attention_flattened.txt`
-
 ### Finding 1: `hl.dot` Is Not Lowered by the MLIR Backend
 
-**RESOLVED** (backend review plan, Phase 2): `hl.dot` with or without `acc=` lowers
+**RESOLVED**: `hl.dot` with or without `acc=` lowers
 through the same contraction path as `addmm`/einsum; `tests/test_contractions.py`.
 
 The GPU example uses `hl.dot` for both contractions. The MLIR backend reports:
@@ -206,20 +202,10 @@ The Triton CPU kernel materializes `[BH,S,S]` scores in one kernel, then perform
 online softmax and `PV` in a second kernel. A similar Helion design was explored
 with full-key query blocks.
 
-Primary prototype:
-
-- `temp/prototype_attention_full_keys.py`
-
-Representative logs:
-
-- `temp/prototype_attention_full_keys_64x128.txt`
-- `temp/prototype_attention_full_keys_64x128_v2.txt`
-- `temp/prototype_attention_full_keys_broadcast_fix.txt`
-- `temp/prototype_attention_full_keys_generic_broadcast.txt`
-- `temp/prototype_attention_full_keys_parallel.txt`
-- `temp/prototype_attention_lowered_dump.txt`
-
 ### Finding 5: Reduction Results Can Carry Stale Tile Metadata
+
+**RESOLVED**: ATen helpers are now typed from the call site's MLIR operand
+types (`aten_bridge/helpers.py`).
 
 For a score tensor with actual call-site type similar to:
 
@@ -269,10 +255,6 @@ LinalgTransformOps.cpp: applyTilingToAll
 Assertion `tiledResults->loops.size() == numLoops` failed
 ```
 
-Probe:
-
-- `temp/probe_compiler_generalizations.py`
-
 These compiler changes were removed. They must not be reintroduced without:
 
 1. Scalar and optimized-pipeline numerical tests.
@@ -288,15 +270,6 @@ A correctness-first composition used only proven 2D matmul helpers:
 2. AMX projection matmul to compute row sums.
 3. `V.T @ P.T` for the numerator.
 4. Identity AMX affine matmul to apply reciprocal row sums.
-
-Prototype:
-
-- `temp/prototype_attention_composed.py`
-
-Logs:
-
-- `temp/prototype_attention_composed_32.txt`
-- `temp/prototype_attention_composed_64x128.txt`
 
 At `[B,H,S,D] = [1,1,64,128]`:
 
@@ -326,26 +299,10 @@ This was the most promising design:
 4. Perform stable softmax over key blocks and within-block keys.
 5. Contract probabilities with packed V in a second blocked batched kernel.
 
-Prototype:
-
-- `temp/prototype_attention_two_kernel.py`
-
-Representative logs:
-
-- `temp/prototype_attention_two_kernel_64x128.txt`
-- `temp/prototype_attention_two_kernel_no_reshape.txt`
-- `temp/prototype_attention_two_kernel_reshape_fix.txt`
-- `temp/prototype_attention_two_kernel_reshape_fix_v2.txt`
-- `temp/prototype_attention_two_kernel_source_fix.txt`
-- `temp/prototype_attention_two_kernel_bd1.txt`
-
 ### Finding 8: Blocked Batched AMX Contraction Works
 
-The existing prototype below remains a valuable anchor:
-
-- `temp/probe_bmm_kernel.py`
-
-It packs rank-3 batched matrices into rank-5 blocked layouts and performs:
+A probe kernel packed rank-3 batched matrices into rank-5 blocked layouts and
+performed:
 
 ```python
 acc = hl.zeros([batch, mb, nb, 32, 32], dtype=torch.float32)
@@ -385,9 +342,7 @@ B=1, H=1, S=64, D=128
 ```
 
 Reducing the `PV` output tile from all four 32-column blocks to one block still
-exceeded the 120-second cap. Log:
-
-- `temp/prototype_attention_two_kernel_bd1.txt`
+exceeded the 120-second cap.
 
 This indicates transform/schedule complexity rather than runtime workload. The
 current generic matmul pipeline is not a suitable schedule for a fused region
@@ -410,21 +365,10 @@ and:
 vector<1x16x16xf32> to !llvm.array<1 x array<16 x vector<16xf32>>>
 ```
 
-These were captured in:
-
-- `temp/prototype_attention_lowered_dump.txt`
-
-Lighthouse contains a nominal AMX bf16 batch-matmul descriptor:
-
-- `lighthouse/lighthouse/pipeline/descriptors/x86_64/amx_bf16/batch_matmul/bf16.yaml`
-
-Using it directly did not solve the generalized attention contractions and left
-OpenMP operations untranslated. Log:
-
-- `temp/prototype_attention_batch_pipeline.txt`
-
-The descriptor may still be useful for a canonical `linalg.batch_matmul`, but
-attention's generalized blocked `linalg.contract` requires dedicated handling.
+Lighthouse's AMX bf16 batch-matmul descriptor of the time did not solve the
+generalized attention contractions and left OpenMP operations untranslated.
+It may still suit a canonical `linalg.batch_matmul`, but attention's
+generalized blocked `linalg.contract` requires dedicated handling.
 
 ## Compiler Changes Audited and Removed
 
@@ -445,14 +389,6 @@ After review:
 
 All were removed. The relevant compiler files match their pre-investigation
 state, and the full backend suite passed afterward.
-
-Validation after rollback:
-
-```text
-Ruff: passed
-Focused execution/reduction tests: 110 passed, 1 skipped
-Full HELION_MLIR_PIPELINE=1 suite: 283 passed, 1 skipped
-```
 
 ## Recommended Future Architecture
 
@@ -517,25 +453,15 @@ Lighthouse's GPU fused-attention work can provide structural inspiration:
 
 ### 3. Fix Generic Reduction Metadata Separately
 
-If generic reductions remain desirable, result types must be derived from the
-actual MLIR operand at the call site, not only pre-codegen FX metadata. Required
-tests include:
-
-- Last-dimension sum and max.
-- Rank 2 through rank 5.
-- Tile sizes smaller than, equal to, and larger than 64.
-- Boundary/ragged tiles.
-- `keepdim=False` followed by unsqueeze.
-- Scalar and optimized pipelines.
-- Lighthouse transform tests proving tile-and-fuse does not assert.
-
-Do not consider scalar-pipeline correctness sufficient: the experimental direct
-lowering passed scalar execution but aborted in the optimized pipeline.
+**RESOLVED**: ATen helpers are typed from the call site's MLIR operand types
+(`aten_bridge/helpers.py`), not FX metadata, and the optimizing pipeline lowers
+reductions over ragged and runtime-sized tiles (`tests/test_opt_pipeline.py`,
+`tests/test_dynamic_shapes.py`).
 
 ### 4. Fix Batched Vector Contract Conversion
 
-Create a minimal pure-MLIR reproducer from the unresolved casts in
-`temp/prototype_attention_lowered_dump.txt`. The desired outcome is either:
+Create a minimal pure-MLIR reproducer of the unresolved casts above. The
+desired outcome is either:
 
 - Proper vector-to-LLVM conversion for batched vector shapes, or
 - A register-tiling schedule that lowers the batch dimension before vector
@@ -576,45 +502,6 @@ Correctness gates:
   implemented.
 - Verify each row sums to approximately one before `PV` in a debug variant.
 
-## Reproduction Commands
-
-Run from `AI-bench/` with low shared-node parallelism:
-
-```bash
-# Correct but slow per-head composition
-OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 \
-LD_PRELOAD=/lib64/libtcmalloc.so \
-uv run python ../temp/prototype_attention_composed.py 1 1 64 128
-
-# Direct FlashAttention-style experiments
-OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 \
-LD_PRELOAD=/lib64/libtcmalloc.so \
-uv run python ../temp/prototype_attention_mlir.py 1 1 32 32
-
-# Full-key fused prototype
-OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 \
-LD_PRELOAD=/lib64/libtcmalloc.so \
-uv run python ../temp/prototype_attention_full_keys.py 1 1 64 128
-
-# Most promising two-kernel blocked prototype
-OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 \
-LD_PRELOAD=/lib64/libtcmalloc.so \
-uv run python ../temp/prototype_attention_two_kernel.py 1 1 64 128
-
-# Proven blocked batched AMX contraction anchor
-OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 \
-LD_PRELOAD=/lib64/libtcmalloc.so \
-uv run python ../temp/probe_bmm_kernel.py
-```
-
-Always apply a timeout while iterating, for example:
-
-```bash
-timeout 120 env OMP_NUM_THREADS=4 HELION_MLIR_PIPELINE=1 \
-LD_PRELOAD=/lib64/libtcmalloc.so \
-uv run python ../temp/prototype_attention_two_kernel.py 1 1 64 128
-```
-
 ## Final Status
 
 Attention is not shipped for Helion MLIR CPU. The investigation produced:
@@ -623,7 +510,6 @@ Attention is not shipped for Helion MLIR CPU. The investigation produced:
 - A numerically correct but slow composed reference.
 - A proven blocked batched AMX contraction primitive.
 - Several minimized backend/pipeline failure modes.
-- Preserved source and log artifacts for each attempted design.
 - A clear path toward a first-class blocked attention operation and dedicated
   Lighthouse CPU schedule.
 

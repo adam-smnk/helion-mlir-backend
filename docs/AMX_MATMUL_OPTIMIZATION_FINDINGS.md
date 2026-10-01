@@ -18,21 +18,15 @@ B = [NB, KB, BK, BN]        C(merged)  = [MB, BM, NB, BN]  -> viewable as [M, N]
 
 `helion_matmul_bf16.py` already produces exactly this. `BM = BN = BK = 32`.
 
-Reproduce with the probes in `temp/`:
-
-```bash
-# scalar (correctness)
-env -u HELION_MLIR_PIPELINE OMP_NUM_THREADS=4 uv run python temp/<probe>.py
-# AMX (lowering + performance)
-HELION_MLIR_PIPELINE=1 OMP_NUM_THREADS=4 uv run python temp/<probe>.py
-```
+Each section's minimal example is a starting point for a reproducer (the original
+probe scripts are not kept): run it with `HELION_MLIR_PIPELINE` unset for
+correctness, and with `HELION_MLIR_PIPELINE=1` for AMX lowering and performance.
 
 ---
 
 ## 1. VNNI Block-Packed Contraction
 
 **Status:** frontend works, AMX vectorization fails.
-**Probe:** `temp/probe_vnni_blocked_contract.py`
 
 ### Summary
 
@@ -120,7 +114,6 @@ b5 = (
 
 **Status:** frontend works, AMX lowering fails. Also net-negative on traffic for
 square shapes.
-**Probe:** `temp/probe_split_k.py`
 
 ### Summary
 
@@ -209,9 +202,7 @@ b5 = b4.view(nb, SLABS, nb // SLABS, BLOCK, BLOCK)
 ## 3. Cache Blocking via Larger Outer Tiles
 
 **Status:** blocked by a compiler assertion. Likely the highest-leverage of the
-three.
-**Probe:** `temp/probe_block_tile_sweep.py` (set `TMB`/`TNB`; run one config per
-process, the assertion aborts)
+three. The assertion aborts the process, so try one config per process.
 
 ### Summary
 
@@ -326,5 +317,4 @@ future design can assume.
   the surviving `vector.contract` cannot be translated. Consequently **AMX
   operands must already be in memory in their final layout**, which is why
   packing is materialized today. Teaching the pattern to spill a non-memref
-  operand to a small scratch buffer would unblock this. Probe:
-  `temp/probe_blis_inloop_packing.py`.
+  operand to a small scratch buffer would unblock this.

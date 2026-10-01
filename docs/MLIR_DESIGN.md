@@ -477,11 +477,11 @@ See [tests/test_mlir_backend.py](../tests/test_mlir_backend.py) for test suite.
 
 ## Future Extensions
 
-1. **Layer Normalization**: Add custom linalg operation or linalg.normalize
-2. **Softmax**: Implement as fused reduction + exponential
-3. **Attention**: Matmul-based building blocks
-4. **Bufferization**: Option to generate memref-based IR
-5. **Custom Dialects**: Support for domain-specific operations
+Layer normalization, softmax and attention building blocks already lower through
+the ATen bridge (torch-mlir helper functions inlined into the kernel).
+
+1. **Bufferization**: Option to emit memref-based IR directly
+2. **Custom Dialects**: Support for domain-specific operations
 
 ## References
 
