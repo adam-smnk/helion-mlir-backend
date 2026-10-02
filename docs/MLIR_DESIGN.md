@@ -66,7 +66,12 @@ Downstream Compiler (e.g., Triton, MLIR transforms)
     (inserted back with `parallel_insert_slice`); if a written tensor is not
     partitioned by every grid dim, the root runs as a sequential `scf.for` nest.
     A store index partitions a grid dim if it is the dim's tile, or a scalar equal
-    to its offset (`hl.grid` index, `tile.begin`) or its tile number (`tile.id`).
+    to its offset (`hl.grid` index, `tile.begin`) or its tile number (`tile.id`),
+    or the tile of a nested loop over exactly one tile of that dim
+    (`hl.tile(t.begin, t.end)`, recorded in `KernelGeometry.enclosing_tiles`): such
+    a tile lies inside the iteration's region and is indexed from its origin. A
+    nested loop over a full enclosing tile whose block size divides it has only
+    full tiles, so its slices are static.
     Nested `scf.for` loops carry the tensors their bodies write.
 
 - **Key Methods:**

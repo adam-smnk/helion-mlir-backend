@@ -147,6 +147,13 @@ def affine_min(results: list[ir.AffineExpr], operands: list[ir.Value]) -> ir.Val
     ).result
 
 
+def affine_apply(result: ir.AffineExpr, operands: list[ir.Value]) -> ir.Value:
+    """``affine.apply`` of ``result`` over dims ``d0..`` bound to ``operands``."""
+    return affine_d.AffineApplyOp(
+        ir.AffineMap.get(len(operands), 0, [result]), operands
+    ).result
+
+
 def reassociation(rank: int, dropped: Iterable[int]) -> list[list[int]]:
     """``collapse_shape``/``expand_shape`` groups of a rank-``rank`` shape without
     its unit ``dropped`` dims: each joins the next kept dim, or the last kept one

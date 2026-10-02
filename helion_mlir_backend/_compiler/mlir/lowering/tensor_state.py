@@ -90,10 +90,14 @@ def _owner(
     if isinstance(index, slice):
         return None
     descriptor = resolve_index_descriptor(ctx, index)
-    if descriptor.block_id not in grid_block_ids or descriptor.bias:
+    if descriptor.block_id is None or descriptor.bias:
         return None
     if not descriptor.is_scalar:
-        return OwnedDim(descriptor.block_id, point=False)
+        # A tile of a loop over one grid tile's range stays inside that tile.
+        owner = ctx.geometry.owning_block(descriptor.block_id, grid_block_ids)
+        return None if owner is None else OwnedDim(owner, point=False)
+    if descriptor.block_id not in grid_block_ids:
+        return None
     # Positions distinct in every iteration of the block's loop.
     if descriptor.is_offset or descriptor.kind == "tile_id":
         return OwnedDim(descriptor.block_id, point=True, kind=descriptor.kind)

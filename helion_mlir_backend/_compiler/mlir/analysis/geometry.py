@@ -74,6 +74,8 @@ class LoopBounds:
 class KernelGeometry:
     blocks: dict[int, BlockGeometry]
     root_bounds: dict[int, LoopBounds]
+    enclosing_tiles: dict[int, int]
+    """Block id of a nested loop over ``hl.tile(t.begin, t.end)`` -> ``t``'s block id."""
 
     @classmethod
     def from_host_function(
@@ -116,10 +118,22 @@ class KernelGeometry:
                     end=_size(end, f"end of block_id {block_id}"),
                     step=blocks[block_id].block_size,
                 )
-        return cls(blocks=blocks, root_bounds=root_bounds)
+        return cls(
+            blocks=blocks,
+            root_bounds=root_bounds,
+            enclosing_tiles=_enclosing_tiles(hf),
+        )
 
     def block(self, block_id: int) -> BlockGeometry:
         return self.blocks[block_id]
+
+    def owning_block(self, block_id: int, candidates: object) -> int | None:
+        """The first of ``block_id`` and the tiles enclosing it in ``candidates``."""
+        while block_id not in candidates:
+            block_id = self.enclosing_tiles.get(block_id)
+            if block_id is None:
+                return None
+        return block_id
 
     def block_size(self, block_id: int) -> int | None:
         return self.blocks[block_id].block_size
@@ -162,6 +176,35 @@ class KernelGeometry:
 
 def is_loop_node(node: object) -> bool:
     return getattr(node, "target", None) in LOOP_TARGETS
+
+
+def _enclosing_tiles(hf: HostFunction) -> dict[int, int]:
+    """Block ids of nested loops whose range is exactly one tile of another loop
+    (``hl.tile(t.begin, t.end)``), mapped to that loop's block id."""
+    from ..support.block_ids import symbol_origin_info
+
+    def position(node: object) -> tuple[int, str] | None:
+        value = getattr(node, "meta", {}).get("val")
+        return symbol_origin_info(hf, value) if value is not None else None
+
+    enclosing: dict[int, int] = {}
+    for graph_info in hf.device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if not is_loop_node(node):
+                continue
+            block_ids = loop_block_ids(hf, node)
+            for block_id, begin, end in zip(
+                block_ids, node.args[1], node.args[2], strict=True
+            ):
+                begin_at, end_at = position(begin), position(end)
+                if (
+                    begin_at is not None
+                    and end_at is not None
+                    and begin_at == (begin_at[0], "tile_begin")
+                    and end_at == (begin_at[0], "tile_end")
+                ):
+                    enclosing[block_id] = begin_at[0]
+    return enclosing
 
 
 def loop_block_ids(hf: HostFunction, node: torch.fx.Node) -> list[int]:

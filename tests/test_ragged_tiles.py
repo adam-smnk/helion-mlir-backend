@@ -193,6 +193,66 @@ def test_tile_id_store_index_is_parallel() -> None:
     assert "scf.forall" in ir
 
 
+@_kernel(32, 64, 16, 24)
+def subtile_matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Each grid tile of rows is split into row panels that each run over all of K."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tmo, tn in hl.tile([m, n]):
+        for tm in hl.tile(tmo.begin, tmo.end):
+            acc = hl.zeros([tm, tn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+            out[tm, tn] = acc
+    return out
+
+
+@_kernel(32, 16)
+def overlapping_rows_kernel(x: torch.Tensor) -> torch.Tensor:
+    """Every grid iteration writes all rows: not partitioned by the grid tile."""
+    out = torch.zeros_like(x)
+    for _tg in hl.tile(x.size(0)):
+        for t in hl.tile(x.size(0)):
+            out[t] = out[t] + x[t]
+    return out
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(64, 48, 128), (70, 45, 100), (20, 16, 30)],
+    ids=["aligned", "partial", "single_partial_tile"],
+)
+def test_subtile_loop_stores(shape: tuple[int, int, int]) -> None:
+    """A loop over one grid tile's range (``hl.tile(t.begin, t.end)``) with an
+    inner block that does not divide it, and partial grid tiles."""
+    torch.manual_seed(0)
+    m, k, n = shape
+    check_kernel(
+        subtile_matmul_kernel,
+        torch.matmul,
+        [torch.randn(m, k), torch.randn(k, n)],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_subtile_loop_stores_are_parallel() -> None:
+    ir = str(
+        generate_mlir(
+            subtile_matmul_kernel, [torch.randn(64, 48), torch.randn(48, 128)]
+        )
+    )
+    assert "scf.forall" in ir
+
+
+def test_loop_over_whole_range_stays_sequential() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(40)
+    assert "scf.forall" not in str(generate_mlir(overlapping_rows_kernel, [x]))
+    check_kernel(overlapping_rows_kernel, lambda x: x * 2, [x])
+
+
 def test_padded_rows_of_runtime_width() -> None:
     torch.manual_seed(0)
     x = torch.randn(13, 10)

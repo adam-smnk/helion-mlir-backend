@@ -357,6 +357,12 @@ These stages from `_compiler/helion_transforms.py` replace or are added to it:
   folded into an f32 contraction for the x86 dot-product and AMX patterns) that no x86
   pattern took get their operands extended again; without AMX or AVX512-BF16 they
   otherwise fail to lower.
+- `hoist_allocas`, after `convert-vector-to-scf` (run ahead of lighthouse's LLVM
+  lowering): the stack buffers staging n-D masked transfers are placed in the loops
+  holding the transfers, and the LLVM lowering of an `alloca` in a loop grows the
+  stack every iteration. Each moves to the entry of its `omp.parallel` region (one
+  buffer per thread) or function: a packed GEMM with partial K tiles overflowed the
+  OpenMP thread stacks.
 
 ## 16) Autotuning
 

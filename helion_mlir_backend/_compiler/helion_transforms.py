@@ -938,6 +938,34 @@ class LegalizeForLLVMOp(HelionTransformDialect.Operation, name="legalize_for_llv
         return DiagnosedSilenceableFailure.Success
 
 
+@_transform_op(modifies_payload=True)
+class HoistAllocasOp(HelionTransformDialect.Operation, name="hoist_allocas"):
+    """Move every static ``memref.alloca`` in the target to the entry of its
+    ``omp.parallel`` region or function, unless an ``alloca_scope`` frees it."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "HoistAllocasOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for alloca in _payload_ops(state, op.target, memref.AllocaOp):
+            if list(alloca.operands):
+                continue
+            parent = alloca.operation.parent
+            while parent.name not in ("omp.parallel", "func.func"):
+                if parent.name == "memref.alloca_scope":
+                    break
+                parent = parent.parent
+            else:
+                entry = parent.regions[0].blocks[0]
+                alloca.operation.move_before(entry.operations[0])
+        return DiagnosedSilenceableFailure.Success
+
+
 @contextmanager
 def _suppressing(op: ir.Value) -> Iterator[ir.Value]:
     """A sequence on ``op`` whose silenceable failures are ignored."""
@@ -1042,6 +1070,16 @@ def pin_transposes() -> ir.Module:
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
         PinTransposesOp(target=funcs)
+        transform.yield_()
+    return schedule
+
+
+def hoist_allocas() -> ir.Module:
+    """Schedule: hoist every function's static stack buffers out of loops."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        HoistAllocasOp(target=funcs)
         transform.yield_()
     return schedule
 

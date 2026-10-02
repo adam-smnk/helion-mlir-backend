@@ -197,11 +197,13 @@ class BuildContext:
         block_id: int,
         offset: ir.Value,
         bounds: tuple[int | ir.Value, int | ir.Value],
+        span: int | None = None,
     ) -> None:
-        """Make ``offset`` the current tile of ``block_id`` in a loop over ``bounds``."""
+        """Make ``offset`` the current tile of ``block_id`` in a loop over ``bounds``
+        (``span`` wide when known statically though the bounds are runtime values)."""
         self.block_id_to_iv[block_id] = offset
         self.block_id_to_bounds[block_id] = bounds
-        valid = self._valid_size(block_id, offset, *bounds)
+        valid = self._valid_size(block_id, offset, *bounds, span)
         if valid is None:
             self.block_id_to_valid.pop(block_id, None)
         else:
@@ -213,6 +215,7 @@ class BuildContext:
         offset: ir.Value,
         begin: int | ir.Value,
         end: int | ir.Value,
+        span: int | None = None,
     ) -> int | ir.Value | None:
         """``min(tile, end - offset)``, or ``None`` if every tile is full.
 
@@ -224,6 +227,8 @@ class BuildContext:
             return None
         size = self.geometry.tile_extent(block_id)
         d0, d1 = ir.AffineDimExpr.get(0), ir.AffineDimExpr.get(1)
+        if span is not None and span % size == 0:
+            return None
         if isinstance(begin, int) and isinstance(end, int):
             if end <= begin or (end - begin) % size == 0:
                 return None
@@ -241,6 +246,7 @@ class BuildContext:
         block_id: int,
         induction_variable: ir.Value,
         bounds: tuple[int | ir.Value, int | ir.Value],
+        span: int | None = None,
     ) -> Generator[None]:
         """Bind a loop induction variable and bounds, restoring the previous ones."""
         saved = [
@@ -251,7 +257,7 @@ class BuildContext:
                 self.block_id_to_valid,
             )
         ]
-        self.bind_loop(block_id, induction_variable, bounds)
+        self.bind_loop(block_id, induction_variable, bounds, span)
         try:
             yield
         finally:

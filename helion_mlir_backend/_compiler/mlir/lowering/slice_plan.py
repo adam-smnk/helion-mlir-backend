@@ -149,7 +149,14 @@ def plan_slice(
         descriptor = resolve_index_descriptor(ctx, index_node)
         owner = owned.get(dimension)
         if owner is not None:
-            if descriptor.block_id != owner.block_id or descriptor.bias:
+            inner = (
+                descriptor.block_id is not None
+                and descriptor.block_id != owner.block_id
+                and not descriptor.is_scalar
+                and ctx.geometry.owning_block(descriptor.block_id, {owner.block_id})
+                is not None
+            )
+            if (descriptor.block_id != owner.block_id and not inner) or descriptor.bias:
                 raise NodeLoweringError(
                     index_node,
                     reason=(
@@ -167,6 +174,9 @@ def plan_slice(
                 if ir.ShapedType.is_dynamic_size(extent)
                 else extent
             )
+            if inner:
+                dims.append(_inner_tile(ctx, descriptor.block_id, owner.block_id, size))
+                continue
             tile = ctx.geometry.tile_extent(owner.block_id)
             dims.append(DimSlice("tile", zero, size, tile, owner.block_id))
             continue
@@ -220,6 +230,29 @@ def plan_slice(
     return SlicePlan(dims)
 
 
+def _inner_tile(
+    ctx: BuildContext, block_id: int, owner: int, region: emit.Size
+) -> DimSlice:
+    """``block_id``'s current tile, inside the region of ``owner``'s tile that
+    encloses it: offset from the region's origin, real part clamped to the region."""
+    tile = ctx.geometry.tile_extent(block_id)
+    d0, d1 = ir.AffineDimExpr.get(0), ir.AffineDimExpr.get(1)
+    offset = emit.affine_apply(
+        d0 - d1, [ctx.block_id_to_iv[block_id], ctx.block_id_to_iv[owner]]
+    )
+    size = ctx.block_id_to_valid.get(block_id, tile)
+    if (
+        isinstance(region, int)
+        and isinstance(size, int)
+        and region % tile == 0
+        and size == tile
+    ):
+        return DimSlice("tile", offset, size, tile, block_id)
+    operands = [offset, ctx.as_index(region), ctx.as_index(size)]
+    clamped = emit.affine_min([d1 - d0, ir.AffineDimExpr.get(2)], operands)
+    return DimSlice("tile", offset, clamped, tile, block_id)
+
+
 def tile_window(
     ctx: BuildContext, block_id: int, bias: int, extent: emit.Size
 ) -> tuple[ir.Value, emit.Size, int]:
@@ -243,6 +276,14 @@ def tile_window(
         offset = arith_d.addi(offset, ctx.index_const(bias))
     size = ctx.block_id_to_valid.get(block_id, tile)
     begin, end = ctx.block_id_to_bounds[block_id]
+    # A loop over one enclosing tile ends within the enclosing loop.
+    outer = block_id
+    while (
+        isinstance(end, ir.Value)
+        and (outer := ctx.geometry.enclosing_tiles.get(outer)) is not None
+        and outer in ctx.block_id_to_bounds
+    ):
+        end = ctx.block_id_to_bounds[outer][1]
     if bias < 0 and not (isinstance(begin, int) and begin + bias >= 0):
         raise UnsupportedOperationError(
             "tile index", reason=f"offset {bias} may index before the tensor start"

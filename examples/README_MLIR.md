@@ -234,6 +234,46 @@ aligned and padded), then f32 time and bandwidth tables for both input layouts.
 
 ---
 
+### 12. gemm_fused_packing_mlir.py
+**BLAS-style GEMM: packing and blocked contraction in one kernel**
+
+One Helion kernel of two phases: both operands are packed into zero-padded 32x32
+blocks, then (after `hl.barrier()`) tiles of blocks accumulate a blocked
+(mmt4d-style) contraction over K steps, stored straight into the row-major result.
+`gemm` picks tile sizes, in blocks, that divide the block counts.
+
+**Run:**
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc.so.4 python examples/gemm_fused_packing_mlir.py
+```
+
+**Output:** A correctness check against `torch.matmul` (f32) and quick timings
+against eager PyTorch and a plain Helion matmul on row-major tiles.
+
+---
+
+### 13. gemm_goto_mlir.py
+**Goto-style GEMM: panels of a C tile with `hl.tile(t.begin, t.end)`**
+
+The GotoBLAS loop nest in Helion: a loop over one tile of the parallel C loop
+splits it into row panels of A.
+- **`gemm_goto`:** each row panel accumulates over all of K.
+- **`gemm_goto_inplace`:** per K step, one B panel is reused by every row panel,
+  which updates C in place.
+
+The nested panels lie inside their C tile, so the outer loop stays parallel, and
+when the block sizes divide each other and the shapes the IR is static.
+
+**Run:**
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc.so.4 python examples/gemm_goto_mlir.py
+```
+
+**Output:** A correctness check against `torch.matmul` (f32) and quick timings
+against eager PyTorch and a plain Helion matmul.
+
+---
+
 ## Running the Examples
 
 ### Prerequisites
@@ -255,6 +295,8 @@ python examples/multi_phase_mlir.py
 python examples/inline_mlir.py
 python examples/block_packing_mlir.py
 python examples/vnni_packing_mlir.py
+python examples/gemm_fused_packing_mlir.py
+python examples/gemm_goto_mlir.py
 ```
 
 ### Run Specific Example

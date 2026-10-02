@@ -72,4 +72,7 @@ Pipeline:
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
   - pass: "func.func(lower-vector-multi-reduction)"
   - schedule: "helion_transforms.py[gen=legalize_for_llvm]"
+  # Stack buffers of transfers in a loop would grow the stack each iteration.
+  - pass: "convert-vector-to-scf"
+  - schedule: "helion_transforms.py[gen=hoist_allocas]"
   - include: llvm-lowering.yaml

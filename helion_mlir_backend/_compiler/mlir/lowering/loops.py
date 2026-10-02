@@ -264,7 +264,10 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
         with (
             ir.InsertionPoint(for_op.body),
             ctx.enter_for_loop(
-                block_ids[level], for_op.induction_variable, (begin, end)
+                block_ids[level],
+                for_op.induction_variable,
+                (begin, end),
+                _enclosing_span(ctx, block_ids[level]),
             ),
         ):
             for name, arg in zip(names, block_args[count:], strict=True):
@@ -277,6 +280,17 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
         return results[:count]
 
     return emit.Results(emit_level(0, [inputs[position] for position in positions]))
+
+
+def _enclosing_span(ctx: BuildContext, block_id: int) -> int | None:
+    """The static width of the enclosing tile a loop over one tile's range spans,
+    if that tile is full (its loop has no partial tile)."""
+    enclosing = ctx.geometry.enclosing_tiles.get(block_id)
+    if enclosing is None or enclosing not in ctx.block_id_to_iv:
+        return None
+    if enclosing in ctx.block_id_to_valid:
+        return None
+    return ctx.geometry.tile_extent(enclosing)
 
 
 def _resolve_loop_bound(

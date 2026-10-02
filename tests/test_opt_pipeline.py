@@ -15,6 +15,7 @@ import torch
 
 from tests.harness import opt_pipeline
 
+from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 
@@ -142,6 +143,33 @@ def opt_online_softmax_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    backend="mlir", static_shapes=True, config=helion.Config(block_sizes=[2, 4, 4])
+)
+def opt_packed_gemm_kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Pack A and B into 32x32 blocks, then a blocked contraction over tiles of
+    blocks (partial ones too)."""
+    m, k = a.size()
+    _, n = b.size()
+    mb, kb, nb = (m + 31) // 32, (k + 31) // 32, (n + 31) // 32
+    a4 = torch.empty((mb, kb, 32, 32), dtype=a.dtype, device=a.device)
+    b4 = torch.empty((nb, kb, 32, 32), dtype=b.dtype, device=b.device)
+    out4 = torch.empty((mb, 32, nb, 32), dtype=a.dtype, device=a.device)
+    for tm, tk in hl.tile([mb * 32, kb * 32], block_size=[32, 32]):
+        a4[tm.id, tk.id, :, :] = a[tm, tk]
+    for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
+        b4[tn.id, tk.id, :, :] = b[tk, tn]
+    hl.barrier()
+    for tbm, tbn in hl.tile([mb, nb]):
+        acc = hl.zeros([tbm, tbn, 32, 32], dtype=torch.float32)
+        for tbk in hl.tile(kb):
+            acc = acc + torch.einsum(
+                "akmc,bkcn->abmn", a4[tbm, tbk, :, :], b4[tbn, tbk, :, :]
+            )
+        out4[tbm, :, tbn, :] = acc.permute(0, 2, 1, 3)
+    return out4.view(mb * 32, nb * 32)[:m, :n]
+
+
 def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], object]]]:
     import helion_mlir_cpu_utils as cpu
 
@@ -152,6 +180,7 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
     rows, ragged_rows = torch.randn(64, 1024), torch.randn(64, 1000)
     ragged_a, ragged_b = torch.randn(2, 32, 40), torch.randn(2, 40, 32)
     ragged_cols = torch.randn(70, 64)
+    gemm_a, gemm_b = torch.randn(70, 200), torch.randn(200, 150)
     return {
         "matmul": (lambda: cpu.matmul(a, b), lambda: a @ b),
         "matmul_bias_relu": (
@@ -202,6 +231,10 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
                 .sum(1)
             ),
         ),
+        "packed_gemm_ragged": (
+            lambda: opt_packed_gemm_kernel(gemm_a, gemm_b),
+            lambda: gemm_a @ gemm_b,
+        ),
     }
 
 
@@ -221,6 +254,7 @@ def _cpu_utils_cases() -> dict[str, tuple[Callable[[], object], Callable[[], obj
         "ragged_k_bmm",
         "col_sum_ragged",
         "tile_sums_ragged",
+        "packed_gemm_ragged",
     ],
 )
 def test_optimizing_pipeline_f32(case: str) -> None:
@@ -274,3 +308,22 @@ def test_legalize_0d_transfers() -> None:
     assert "vector.transfer" not in text
     assert "memref.load" in text
     assert "memref.store" in text
+
+
+ALLOCA_IN_LOOP = """
+func.func @f(%n: index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  scf.for %i = %c0 to %n step %c1 {
+    %buffer = memref.alloca() : memref<f32>
+    %value = memref.load %buffer[] : memref<f32>
+    memref.store %value, %buffer[] : memref<f32>
+  }
+  return
+}
+"""
+
+
+def test_hoist_allocas_out_of_loops() -> None:
+    text = _apply(hoist_allocas, ALLOCA_IN_LOOP)
+    assert text.index("memref.alloca") < text.index("scf.for")
