@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 _CONFIG_KEYS = frozenset({"block_sizes", PIPELINE_CONFIG_KEY})
 _OPT_MIN_TILE = 32
-"""Inner tiles narrower than lighthouse's 32-wide cache tiles waste vector lanes."""
+"""Inner tiles narrower than 32 waste vector lanes."""
 
 
 def raise_block_minimums(

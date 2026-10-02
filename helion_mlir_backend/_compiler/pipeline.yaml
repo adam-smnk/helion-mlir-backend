@@ -14,15 +14,8 @@ Pipeline:
   ## Initial elementwise operations fusion to group them.
   - pass: "linalg-fuse-elementwise-ops"
 
-  ## 1) CPU cache-level tiling - improves data locality and exposes parallelism.
-  ## Small transposes stay one vector transpose: tiled, they read padded tiles per slice.
+  ## Small transposes stay one vector transpose: register tiling unrolls narrow ones per element.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
-  - include: x86_64/tile-and-fuse.yaml {
-                                  strategy=cache
-                                  propagate=True
-                                  use_forall=True
-                                }
-  - include: cleanup.yaml
   # Simplify shapes.
   - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
   - include: cleanup.yaml
@@ -54,11 +47,15 @@ Pipeline:
   - include: x86_64/unroll-register.yaml
   - include: cleanup.yaml
 
+  ## Large slice moves as linalg.copy ops, which vectorize_linalg tiles: unit-dim
+  ## folding turns data-movement ops into bare slices, copied whole when bufferized.
+  - schedule: "helion_transforms.py[gen=materialize_copies]"
   ## Pads as vector reads of their source: no padded temporary to bufferize.
   - schedule: "helion_transforms.py[gen=vectorize_pads]"
   ## x86_64/vectorize.yaml, vectorizing ops of runtime shape with masks.
   - schedule: "helion_transforms.py[gen=vectorize_linalg]"
-  - schedule: "hoisting.py[gen=hoist_loops]"
+  # Not out of scf.forall: a value hoisted out of the parallel loop is copied per iteration.
+  - schedule: "hoisting.py[gen=hoist_loops]{target_op=scf.for}"
   - schedule: "vectorization.py[gen=simplify_vector_ops]"
 
   ## x86_64/lower.yaml, plus lower-vector-multi-reduction, which

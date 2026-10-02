@@ -3,10 +3,10 @@
 The ops share a module because a Python-defined dialect only registers the ops
 defined before it is loaded.
 
-``pin_transposes``: lighthouse's tiling splits a rank-3 transpose per leading
-index, fusing a padded load into each slice (a heap-allocated temporary per
-slice), and unrolls it per element of a narrow inner dim. A small transpose that
-only moves a loaded tile is pinned untiled, so it becomes one vector transpose.
+``pin_transposes``: lighthouse's register tiling unrolls a transpose with a
+narrow inner dim into per-element pieces, read from a temporary of its padded
+source tile. A small transpose that only moves a loaded tile is pinned untiled,
+so it becomes one vector transpose.
 
 ``vectorize_pads``: bufferized, a pad is a temporary zeroed and then copied
 into, and vectorize_all's copy forwarding (upstream
@@ -206,6 +206,83 @@ class VectorizePadsOp(HelionTransformDialect.Operation, name="vectorize_pads"):
         for pad in _payload_ops(state, op.target, tensor.PadOp):
             _vectorize(pad, rewriter)
         return DiagnosedSilenceableFailure.Success
+
+
+@_transform_op(modifies_payload=True)
+class MaterializeCopiesOp(HelionTransformDialect.Operation, name="materialize_copies"):
+    """Insert a ``linalg.copy`` into the destination slice of every insert in the
+    target of a static slice of more than ``_MAX_VECTOR_ELEMENTS`` elements."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "MaterializeCopiesOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        insert_types = (tensor.InsertSliceOp, tensor.ParallelInsertSliceOp)
+        for insert in _payload_ops(state, op.target, insert_types):
+            _materialize_copy(insert)
+        return DiagnosedSilenceableFailure.Success
+
+
+def _materialize_copy(insert: tensor.InsertSliceOp) -> None:
+    if _is_empty(insert.dest):
+        return
+    source = _moved_slice(insert.source)
+    if source is None:
+        return
+    source_type = ir.RankedTensorType(source.type)
+    sizes = list(insert.static_sizes)
+    if (
+        not source_type.has_static_shape
+        or math.prod(source_type.shape) <= _MAX_VECTOR_ELEMENTS
+        or [size for size in sizes if size != 1]
+        != [dim for dim in source_type.shape if dim != 1]
+    ):
+        return
+    # Ops of an scf.forall's in_parallel region go before it.
+    anchor = insert
+    if isinstance(insert, tensor.ParallelInsertSliceOp):
+        anchor = insert.operation.parent
+    with ir.InsertionPoint(anchor), insert.location:
+        destination = tensor.ExtractSliceOp(
+            source_type,
+            insert.dest,
+            insert.offsets,
+            insert.sizes,
+            insert.strides,
+            static_offsets=insert.static_offsets,
+            static_sizes=insert.static_sizes,
+            static_strides=insert.static_strides,
+        ).result
+        copied = linalg.copy(source, outs=[destination])
+    insert.operation.operands[0] = copied
+
+
+def _moved_slice(value: ir.Value) -> ir.Value | None:
+    """The slice of another tensor ``value`` is, looking through inserts that fill
+    a whole empty tensor (unit dims added), else ``None``."""
+    if not isinstance(value, ir.OpResult):
+        return None
+    op = value.owner.opview
+    if isinstance(op, tensor.ExtractSliceOp):
+        return value
+    if (
+        isinstance(op, tensor.InsertSliceOp)
+        and _is_empty(op.dest)
+        and list(op.static_sizes) == list(ir.RankedTensorType(op.dest.type).shape)
+    ):
+        return _moved_slice(op.source)
+    return None
+
+
+def _is_empty(value: ir.Value) -> bool:
+    return isinstance(value, ir.OpResult) and isinstance(
+        value.owner.opview, tensor.EmptyOp
+    )
 
 
 def _split(
@@ -916,6 +993,16 @@ def vectorize_pads() -> ir.Module:
         VectorizePadsOp(target=funcs)
         lh_transform.cleanup(named_seq.bodyTarget)
 
+        transform.yield_()
+    return schedule
+
+
+def materialize_copies() -> ir.Module:
+    """Schedule: large slice moves of every function as ``linalg.copy`` ops."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        MaterializeCopiesOp(target=funcs)
         transform.yield_()
     return schedule
 

@@ -270,37 +270,46 @@ assigns the wrong block size to the tiled loops.
 
 ## 14) Small Tiles on the Optimizing Pipeline
 
-Lighthouse's cache-level tile-and-fuse assigns a zero tile size to every dimension smaller
-than its 32-element cache tile. Upstream MLIR aborts the process when it fuses an op whose
+Lighthouse's tile-and-fuse assigns a zero tile size to every dimension smaller
+than its tile. Upstream MLIR aborts the process when it fuses an op whose
 tile sizes are all zero (`applyTilingToAll`: "Mismatched number of loops");
 `scripts/lighthouse_small_tile_repro.py N` reproduces it with a single
-`linalg.elementwise` on `tensor<Nxf32>` (N < 32 aborts). The local lighthouse change of
-section 15 skips such fusion roots, so small tiles work on the optimizing pipeline.
+`linalg.elementwise` on `tensor<Nxf32>` (N < 32 aborts on lighthouse before #294).
+Lighthouse now skips such fusion roots (section 15), so small tiles work on the
+optimizing pipeline.
 
 An autotuning search under the optimizing pipeline tries tiles of at least 32 (where the
 dimension allows) except for the leading dim of each outermost loop, which may be any
 size: small outer tiles add parallel work and keep the code per tile small, while
-narrower inner tiles waste vector lanes. Given configs are not changed. On lighthouse's
-main branch, a small outer tile of a kernel without another tiled dim still aborts.
+narrower inner tiles waste vector lanes. Given configs are not changed.
 
 ## 15) Lighthouse Pipeline Deviations
 
-The backend relies on two lighthouse changes not yet on its main branch:
+The backend relies on two lighthouse changes (on its main branch since #291 and #294):
 - `bufferization.yaml` runs one-shot bufferization with `allow-return-allocs-from-loops`,
   so loop-carried values need not be updated in place (otherwise such updates fail with
   "Yield operand #0 is not equivalent to the corresponding iter bbArg"; section 5).
 - `get_fusion_roots` skips ops whose tile sizes are all zero (section 14).
 
 The optimizing pipeline (`_compiler/pipeline.yaml`, the default) follows lighthouse's x86
-pipeline, with these stages from `_compiler/helion_transforms.py` replacing or added to it:
-- `pin_transposes`, before the cache-level tiling: a static transpose of at most 4096
+pipeline with two stages left out or narrowed:
+- No cache-level tile-and-fuse: a kernel's outer `hl.tile` loop already is the
+  parallel, cache-sized tiling. Inside it, cache tiling split ops again into nested
+  `scf.forall`s, each lowered to an OpenMP fork per iteration of the outer loop.
+- `hoist_loops` hoists out of `scf.for` loops only. Hoisted out of the kernel's
+  `scf.forall`, a loop-invariant accumulator initialization (`hl.zeros`) became one
+  buffer shared by all iterations and copied into a fresh one by each (in
+  `benchmarks/helion_matmul.py`, a 128x512 copy per tile that LLVM took about 9 s to
+  compile).
+
+These stages from `_compiler/helion_transforms.py` replace or are added to it:
+- `pin_transposes`, before the register-level tiling: a static transpose of at most 4096
   elements with no linalg producer or user (a tile moved to another layout, such as
   `b[tk, tn].reshape(16, 2, 32).permute(0, 2, 1)`) is annotated with zero tile sizes,
-  which lighthouse's tiling keeps, so it becomes one vector transpose. Tiled, rank-3
-  transposes were split per leading index and unrolled per element of a narrow inner
-  dim, and a padded load fused into the split took a heap-allocated temporary per
-  slice (VNNI packing in `examples/vnni_packing_mlir.py` was up to 2.5x slower than
-  plain block packing; it now takes about as long).
+  which lighthouse's tiling keeps, so it becomes one vector transpose. Tiled, a
+  transpose with a narrow inner dim was unrolled per element, reading a temporary of
+  its padded source tile (VNNI packing in `examples/vnni_packing_mlir.py` was up to
+  1.4x slower than plain block packing; it now takes about as long).
 - `vectorize_pads`, before the tensor-level vectorization: each `tensor.pad` whose
   runtime extents have evident constant bounds becomes a vector read of its source
   (padded with the pad value) written into an empty tensor. Bufferized as is, a pad is a
