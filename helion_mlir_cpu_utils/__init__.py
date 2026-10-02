@@ -19,6 +19,8 @@ from .matmul import pack_a_blocked
 from .matmul import pack_a_blocked_t
 from .matmul import pack_b_blocked
 from .matmul import pack_b_blocked_t
+from .matmul import pack_b_blocked_vnni
+from .matmul import pack_b_blocked_vnni_t
 from .matmul import supports
 from .reduction import matvec
 from .reduction import supports_matvec
@@ -40,6 +42,8 @@ __all__ = [
     "pack_a_blocked_t",
     "pack_b_blocked",
     "pack_b_blocked_t",
+    "pack_b_blocked_vnni",
+    "pack_b_blocked_vnni_t",
     "relu",
     "scalar_mul",
     "supports",

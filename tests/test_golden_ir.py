@@ -118,6 +118,10 @@ _CASES: dict[str, tuple[Callable[..., object], Callable[[], list[object]]]] = {
         _cpu_matmul._pack_b_kernel,
         lambda: [_bf16(64, 64), hl.constexpr(64), hl.constexpr(64)],
     ),
+    "pack_b_vnni": (
+        _cpu_matmul._pack_b_vnni_kernel,
+        lambda: [_bf16(64, 64), hl.constexpr(64), hl.constexpr(64)],
+    ),
 }
 
 

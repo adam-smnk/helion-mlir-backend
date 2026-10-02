@@ -397,6 +397,17 @@ class PinTransposesOp(HelionTransformDialect.Operation, name="pin_transposes"):
 def _is_small_transpose(op: ir.OpView) -> bool:
     """A static transpose of at most ``_MAX_VECTOR_ELEMENTS`` elements with no
     linalg producer or user, which tiling would fuse it with."""
+    if not _is_transpose(op):
+        return False
+    if math.prod(ir.ShapedType(op.operands[1].type).shape) > _MAX_VECTOR_ELEMENTS:
+        return False
+    if _is_linalg(op.operands[0].owner):
+        return False
+    return not any(_is_linalg(use.owner) for use in op.results[0].uses)
+
+
+def _is_transpose(op: ir.OpView) -> bool:
+    """A static linalg op only moving its one input to a permuted layout."""
     if len(op.operands) != 2 or not _has_static_shape(op):
         return False
     maps = linalg.get_indexing_maps(op)
@@ -406,13 +417,9 @@ def _is_small_transpose(op: ir.OpView) -> bool:
     if source == result or not (source.is_permutation and result.is_permutation):
         return False
     body = list(op.regions[0].blocks[0].operations)
-    if len(body) != 1 or body[0].operands[0] != op.regions[0].blocks[0].arguments[0]:
-        return False
-    if math.prod(ir.ShapedType(op.operands[1].type).shape) > _MAX_VECTOR_ELEMENTS:
-        return False
-    if _is_linalg(op.operands[0].owner):
-        return False
-    return not any(_is_linalg(use.owner) for use in op.results[0].uses)
+    return (
+        len(body) == 1 and body[0].operands[0] == op.regions[0].blocks[0].arguments[0]
+    )
 
 
 def _is_linalg(owner: object) -> bool:
@@ -652,20 +659,29 @@ def _loop_bounds(op: ir.OpView) -> list[int | None] | None:
 
 def _tile_sizes(op: ir.OpView) -> list[int] | None:
     """Tile sizes making a linalg op's loop ranges bounded and its vectors at most
-    ``_MAX_VECTOR_ELEMENTS``, and those of an op of runtime shape multiples of
-    ``_TILE`` (0: untiled)."""
+    ``_MAX_VECTOR_ELEMENTS``, those of an op of runtime shape multiples of
+    ``_TILE``, and those of a transpose 1 on all but its source's two inner dims
+    (0: untiled)."""
     bounds = _loop_bounds(op)
     if bounds is None:
         return None
     too_large = None not in bounds and math.prod(bounds) > _MAX_VECTOR_ELEMENTS
     static = _has_static_shape(op)
-    return [
+    sizes = [
         _TILE
         if bound is None
         or (bound > _TILE and (too_large or (not static and bound % _TILE)))
         else 0
         for bound in bounds
     ]
+    # LLVM takes many seconds on n-D vector transposes; 2-D ones are shuffles.
+    if _is_transpose(op):
+        source_map = ir.AffineMapAttr(linalg.get_indexing_maps(op)[0]).value
+        for expr in list(source_map.results)[:-2]:
+            dim = ir.AffineDimExpr(expr).position
+            if bounds[dim] > 1:
+                sizes[dim] = 1
+    return sizes
 
 
 def _has_static_shape(op: ir.OpView) -> bool:

@@ -306,10 +306,17 @@ These stages from `_compiler/helion_transforms.py` replace or are added to it:
 - `pin_transposes`, before the register-level tiling: a static transpose of at most 4096
   elements with no linalg producer or user (a tile moved to another layout, such as
   `b[tk, tn].reshape(16, 2, 32).permute(0, 2, 1)`) is annotated with zero tile sizes,
-  which lighthouse's tiling keeps, so it becomes one vector transpose. Tiled, a
+  which lighthouse's tiling keeps, so `vectorize_linalg` vectorizes it whole (split per
+  leading index, see below). Tiled, a
   transpose with a narrow inner dim was unrolled per element, reading a temporary of
   its padded source tile (VNNI packing in `examples/vnni_packing_mlir.py` was up to
   1.4x slower than plain block packing; it now takes about as long).
+- `materialize_copies`, before the tensor-level vectorization: an insert of a static
+  slice of another tensor of more than 4096 elements becomes a `linalg.copy` into the
+  destination slice, looking through inserts that fill a whole empty tensor. Unit-dim
+  folding turns a data-movement op that only moves unit dims (`x[tk, p, :].permute(1, 0,
+  2)` with a 1-wide `p`) into bare slices, copied whole at bufferization: LLVM took
+  minutes on a 2048x32 vector copy. `vectorize_linalg` tiles the `linalg.copy`.
 - `vectorize_pads`, before the tensor-level vectorization: each `tensor.pad` whose
   runtime extents have evident constant bounds becomes a vector read of its source
   (padded with the pad value) written into an empty tensor. Bufferized as is, a pad is a
@@ -324,7 +331,9 @@ These stages from `_compiler/helion_transforms.py` replace or are added to it:
   are tiled by 32 first, and so are bounds above 32 that are not multiples of 32. All
   extents above 32 of any op, static or not, whose vectors would exceed 4096 elements
   are tiled by 32 too (LLVM otherwise spends seconds to minutes on them: a 32-row
-  softmax tile of 1024 columns compiled in about 110 s, now about 1 s). A masked
+  softmax tile of 1024 columns compiled in about 110 s, now about 1 s). Transposes of
+  rank 3 or more are tiled by 1 on all but their source's two inner dims: LLVM took
+  about 19 s on one 16x2x32 vector transpose, while 2-D ones are a few shuffles. A masked
   add-contraction becomes an unmasked one of
   operands zeroed where masked off (upstream's x86 contraction patterns rewrite inside
   `vector.mask` regions, which the verifier rejects). Ops that cannot be tiled or that

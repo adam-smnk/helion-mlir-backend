@@ -8,7 +8,10 @@ The contraction runs on operands in the block layout the AMX lowering expects:
 
 Packing is *not* hoisted out of :func:`matmul`: both operands are packed on every
 call, so the work matches what an eager ``torch.matmul`` does with plain
-row-major inputs.
+row-major inputs. Each packing kernel copies one 32x32 block per loop iteration
+and pads in the same pass: a load past the end of the operand reads zeros.
+:func:`pack_b_blocked_vnni` stores B's blocks in the VNNI layout of AMX's bf16
+tiles instead.
 
 Storing C as ``[M/BM, BM, N/BN, BN]`` rather than ``[M/BM, N/BN, BM, BN]`` is
 what removes the separate unpack pass -- the result is reinterpreted as
@@ -22,7 +25,6 @@ kernel followed by a separate elementwise kernel.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from typing import Callable
 
 import helion
@@ -31,9 +33,6 @@ import torch
 from torch import Tensor
 
 import helion_mlir_backend  # noqa: F401
-
-if TYPE_CHECKING:
-    from helion.runtime.kernel import Kernel
 
 # AMX bf16 register tile. All three extents must divide by this to use the
 # blocked path.
@@ -48,56 +47,72 @@ def identity_epilogue(x: Tensor) -> Tensor:
     return x
 
 
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, 1, 8, 32]),
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-)
+# Block sizes are literals in the packing loops: Helion cannot resolve a block
+# size from a global name.
+_PACK_CONFIG = helion.Config(block_sizes=[])
+
+
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
 def _pack_a_kernel(a: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[M, K]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
-    m, k = int(a.shape[0]), int(a.shape[1])
-    bm, bk = int(m_pad) // 32, int(k_pad) // 32
-    if m == int(m_pad) and k == int(k_pad):
-        a4 = a.reshape(bm, 32, bk, 32)
-    else:
-        pad = torch.zeros((int(m_pad), int(k_pad)), dtype=a.dtype, device=a.device)
-        pad[:m, :k] = a
-        a4 = pad.reshape(bm, 32, bk, 32)
-
-    out = torch.empty((bm, bk, 32, 32), dtype=a.dtype, device=a.device)
-    for bmi, bki, tm, tk in hl.tile([bm, bk, 32, 32]):
-        out[bmi, bki, tm, tk] = a4[bmi, tm, bki, tk].permute(0, 2, 1, 3)
+    mb, kb = int(m_pad) // 32, int(k_pad) // 32
+    out = torch.empty((mb, kb, 32, 32), dtype=a.dtype, device=a.device)
+    for tm, tk in hl.tile([mb * 32, kb * 32], block_size=[32, 32]):
+        out[tm.id, tk.id, :, :] = a[tm, tk]
     return out
 
 
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, 4096]),
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-)
-def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
-    """Pack row-major ``[K, N]`` into ``[N_pad/BN, K_pad, BN]``."""
-    k, n = int(b.shape[0]), int(b.shape[1])
-    depth = int(k_pad)
-    panels = int(n_pad) // 32
-    if k == int(k_pad) and n == int(n_pad):
-        b3 = b.reshape(depth, panels, 32)
-    else:
-        pad = torch.zeros((int(k_pad), int(n_pad)), dtype=b.dtype, device=b.device)
-        pad[:k, :n] = b
-        b3 = pad.reshape(depth, panels, 32)
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+def _pack_a_kernel_t(a_t: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
+    """Pack transposed ``[K, M]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
+    mb, kb = int(m_pad) // 32, int(k_pad) // 32
+    out = torch.empty((mb, kb, 32, 32), dtype=a_t.dtype, device=a_t.device)
+    for tm, tk in hl.tile([mb * 32, kb * 32], block_size=[32, 32]):
+        out[tm.id, tk.id, :, :] = a_t[tk, tm].permute(1, 0)
+    return out
 
-    out = torch.empty((panels, depth, 32), dtype=b.dtype, device=b.device)
-    # Nested (not combined) tile loops: each block-count dim gets its own
-    # ragged-safe mask and a much larger per-iteration chunk than tiling the
-    # raw depth extent directly (previously ~65k tiny 8x32 iterations).
-    # The public wrapper rewraps this function with exact-divisor panel/depth
-    # blocks for each padded shape, avoiding unsafe ragged stores.
-    for panel in hl.tile(panels):
-        for tile_k in hl.tile(depth):
-            out[panel, tile_k, :] = b3[tile_k, panel, :].permute(1, 0, 2)
+
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
+    """Pack row-major ``[K, N]`` into ``[N_pad/BN, K_pad/BK, BK, BN]``."""
+    kb, nb = int(k_pad) // 32, int(n_pad) // 32
+    out = torch.empty((nb, kb, 32, 32), dtype=b.dtype, device=b.device)
+    for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
+        out[tn.id, tk.id, :, :] = b[tk, tn]
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
+    """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad/BK, BK, BN]``."""
+    kb, nb = int(k_pad) // 32, int(n_pad) // 32
+    out = torch.empty((nb, kb, 32, 32), dtype=b_t.dtype, device=b_t.device)
+    for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
+        out[tn.id, tk.id, :, :] = b_t[tn, tk].permute(1, 0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+def _pack_b_vnni_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
+    """Pack row-major ``[K, N]`` into ``[N_pad/BN, K_pad/BK, BK/2, BN, 2]``."""
+    kb, nb = int(k_pad) // 32, int(n_pad) // 32
+    out = torch.empty((nb, kb, 16, 32, 2), dtype=b.dtype, device=b.device)
+    for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
+        pairs = b[tk, tn].reshape(tk.block_size // 2, 2, tn.block_size)
+        out[tn.id, tk.id, :, :, :] = pairs.permute(0, 2, 1)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+def _pack_b_vnni_kernel_t(
+    b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr
+) -> Tensor:
+    """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad/BK, BK/2, BN, 2]``."""
+    kb, nb = int(k_pad) // 32, int(n_pad) // 32
+    out = torch.empty((nb, kb, 16, 32, 2), dtype=b_t.dtype, device=b_t.device)
+    for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
+        pairs = b_t[tn, tk].reshape(tn.block_size, tk.block_size // 2, 2)
+        out[tn.id, tk.id, :, :, :] = pairs.permute(1, 0, 2)
     return out
 
 
@@ -214,74 +229,6 @@ def _matmul_blocked_kernel_affine(
     return out
 
 
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, 1, 8, 32]),
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-)
-def _pack_a_kernel_t(a_t: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
-    """Pack transposed ``[K, M]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
-    k, m = int(a_t.shape[0]), int(a_t.shape[1])
-    bm, bk = int(m_pad) // 32, int(k_pad) // 32
-    if m == int(m_pad) and k == int(k_pad):
-        a4 = a_t.reshape(bk, 32, bm, 32)
-    else:
-        pad = torch.zeros((int(k_pad), int(m_pad)), dtype=a_t.dtype, device=a_t.device)
-        pad[:k, :m] = a_t
-        a4 = pad.reshape(bk, 32, bm, 32)
-
-    out = torch.empty((bm, bk, 32, 32), dtype=a_t.dtype, device=a_t.device)
-    for bmi, bki, tm, tk in hl.tile([bm, bk, 32, 32]):
-        out[bmi, bki, tm, tk] = a4[bki, tk, bmi, tm].permute(2, 0, 3, 1)
-    return out
-
-
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, 4096]),
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-)
-def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
-    """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad, BN]``."""
-    n, k = int(b_t.shape[0]), int(b_t.shape[1])
-    depth = int(k_pad)
-    panels = int(n_pad) // 32
-    if k == int(k_pad) and n == int(n_pad):
-        b3 = b_t.reshape(panels, 32, depth)
-    else:
-        pad = torch.zeros((int(n_pad), int(k_pad)), dtype=b_t.dtype, device=b_t.device)
-        pad[:n, :k] = b_t
-        b3 = pad.reshape(panels, 32, depth)
-
-    out = torch.empty((panels, depth, 32), dtype=b_t.dtype, device=b_t.device)
-    # See _pack_b_kernel: depth block intentionally oversized (safe on this
-    # inner nested dim), panel block stays 1 (outer/store-position dim).
-    for panel in hl.tile(panels):
-        for tile_k in hl.tile(depth):
-            out[panel, tile_k, :] = b3[panel, :, tile_k].permute(0, 2, 1)
-    return out
-
-
-# Seed the shape-specialized caches with the common MLP configuration.
-_pack_b_kernel_wide = helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[8, 4096]),
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-)(_pack_b_kernel.fn)
-_pack_b_kernel_t_wide = helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[8, 4096]),
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-)(_pack_b_kernel_t.fn)
-
-_pack_b_kernel_configs = {(8, 4096): _pack_b_kernel_wide}
-_pack_b_kernel_t_configs = {(8, 4096): _pack_b_kernel_t_wide}
-
-
 def pack_a_blocked(
     a: Tensor, m_pad: int | None = None, k_pad: int | None = None
 ) -> Tensor:
@@ -302,29 +249,6 @@ def pack_a_blocked_t(
     return _pack_a_kernel_t(a_t, hl.constexpr(m_target), hl.constexpr(k_target))
 
 
-def _pack_b_block_sizes(n_target: int, k_target: int) -> tuple[int, int]:
-    panels = n_target // BLOCK_N
-    panel_block = next(
-        (candidate for candidate in range(8, 1, -1) if panels % candidate == 0),
-        panels,
-    )
-    return panel_block, k_target
-
-
-def _pack_b_kernel_for_shape(n_target: int, k_target: int, transposed: bool) -> Kernel:
-    block_sizes = _pack_b_block_sizes(n_target, k_target)
-    configs = _pack_b_kernel_t_configs if transposed else _pack_b_kernel_configs
-    if block_sizes not in configs:
-        source = _pack_b_kernel_t if transposed else _pack_b_kernel
-        configs[block_sizes] = helion.kernel(
-            static_shapes=True,
-            backend="mlir",
-            config=helion.Config(block_sizes=list(block_sizes)),
-            ignore_warnings=[helion.exc.TensorOperationInWrapper],
-        )(source.fn)
-    return configs[block_sizes]
-
-
 def pack_b_blocked(
     b: Tensor, k_pad: int | None = None, n_pad: int | None = None
 ) -> Tensor:
@@ -332,9 +256,7 @@ def pack_b_blocked(
     k, n = int(b.shape[0]), int(b.shape[1])
     k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
     n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
-    pack_kernel = _pack_b_kernel_for_shape(n_target, k_target, transposed=False)
-    panels = pack_kernel(b, hl.constexpr(k_target), hl.constexpr(n_target))
-    return panels.view(n_target // BLOCK_N, k_target // BLOCK_K, BLOCK_K, BLOCK_N)
+    return _pack_b_kernel(b, hl.constexpr(k_target), hl.constexpr(n_target))
 
 
 def pack_b_blocked_t(
@@ -344,9 +266,32 @@ def pack_b_blocked_t(
     n, k = int(b_t.shape[0]), int(b_t.shape[1])
     k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
     n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
-    pack_kernel = _pack_b_kernel_for_shape(n_target, k_target, transposed=True)
-    panels = pack_kernel(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
-    return panels.view(n_target // BLOCK_N, k_target // BLOCK_K, BLOCK_K, BLOCK_N)
+    return _pack_b_kernel_t(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
+
+
+def pack_b_blocked_vnni(
+    b: Tensor, k_pad: int | None = None, n_pad: int | None = None
+) -> Tensor:
+    """Pack row-major ``[K, N]`` into VNNI blocks ``[N/BN, K/BK, BK/2, BN, 2]``.
+
+    Block ``(j, i)`` is the ``[16, 64]`` bf16 AMX tile of
+    ``B[32i:32i+32, 32j:32j+32]``: ``out[j, i, r, n, p] = B[32i + 2r + p, 32j + n]``.
+    """
+    k, n = int(b.shape[0]), int(b.shape[1])
+    k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
+    n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
+    return _pack_b_vnni_kernel(b, hl.constexpr(k_target), hl.constexpr(n_target))
+
+
+def pack_b_blocked_vnni_t(
+    b_t: Tensor, k_pad: int | None = None, n_pad: int | None = None
+) -> Tensor:
+    """Pack transposed-layout ``[N, K]`` (e.g. ``nn.Linear`` weights) into the
+    layout of :func:`pack_b_blocked_vnni` of ``b_t.T``."""
+    n, k = int(b_t.shape[0]), int(b_t.shape[1])
+    k_target = _round_up(k, BLOCK_K) if k_pad is None else k_pad
+    n_target = _round_up(n, BLOCK_N) if n_pad is None else n_pad
+    return _pack_b_vnni_kernel_t(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
 
 
 def supports(

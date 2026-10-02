@@ -1823,45 +1823,25 @@ class TestPaddedPackingAndMultiPhaseExecution:
         expected[:32, :19] = a
         assert torch.equal(actual, expected)
 
-    def test_pack_b_kernels_use_nested_tiles_not_combined_raw_depth(self):
-        """Regression test for a severe perf bug in weight packing.
-
-        ``_pack_b_kernel``/``_pack_b_kernel_t`` used to tile a *combined*
-        ``[panels, depth, 32]`` iteration space directly over the raw ``K``
-        extent (e.g. block_sizes=[1, 8, 32]), producing tens of thousands of
-        tiny 8x32 iterations for a 4096x4096 weight and making MLP-style
-        models (see KernelBench level3/1_MLP) ~3.5x slower than necessary
-        purely from packing overhead, not the AMX contraction itself. Fixed
-        by nesting nested ``hl.tile()`` calls per block-count dimension
-        (mirroring ``_pack_a_kernel``'s already-fast structure), which also
-        keeps per-dimension ragged/masked handling instead of requiring the
-        packed extent to evenly divide a large combined-tile block size.
-        This only checks correctness (perf is exercised by AI-bench
-        benchmarks); a wrong block structure here would still be caught by
-        the shape/value assertions below since packing is what feeds the
-        AMX contraction's operand layout.
-        """
-        from helion_mlir_cpu_utils.matmul import pack_b_blocked
-        from helion_mlir_cpu_utils.matmul import pack_b_blocked_t
+    def test_pack_kernels_match_block_layouts(self):
+        """Fused packing (padding included) gives the blocked and VNNI layouts."""
+        import helion_mlir_cpu_utils as cpu_matmul
 
         torch.manual_seed(7)
-        b = torch.randn(128, 96, dtype=torch.float32)
-        b4 = pack_b_blocked(b)
-        expected = b.reshape(4, 32, 3, 32).permute(2, 0, 1, 3)
-        assert torch.equal(b4, expected)
-
-        b_t = torch.randn(96, 128, dtype=torch.float32)
-        b4_t = pack_b_blocked_t(b_t)
-        expected_t = b_t.reshape(3, 32, 4, 32).permute(0, 2, 3, 1)
-        assert torch.equal(b4_t, expected_t)
-
-    def test_pack_b_block_sizes_exactly_divide_padded_shape(self):
-        """Packing blocks must never create ragged panel or depth tiles."""
-        from helion_mlir_cpu_utils.matmul import _pack_b_block_sizes
-
-        assert _pack_b_block_sizes(4096, 4096) == (8, 4096)
-        assert _pack_b_block_sizes(5952, 2976) == (6, 2976)
-        assert _pack_b_block_sizes(352, 96) == (11, 96)
+        for rows, cols in [(128, 96), (70, 45)]:
+            x = torch.randn(rows, cols, dtype=torch.float32)
+            r, c = -(-rows // 32) * 32, -(-cols // 32) * 32
+            padded = torch.nn.functional.pad(x, (0, c - cols, 0, r - rows))
+            a4 = padded.reshape(r // 32, 32, c // 32, 32).permute(0, 2, 1, 3)
+            b4 = padded.reshape(r // 32, 32, c // 32, 32).permute(2, 0, 1, 3)
+            vnni = b4.reshape(c // 32, r // 32, 16, 2, 32).transpose(3, 4)
+            x_t = x.T.contiguous()
+            assert torch.equal(cpu_matmul.pack_a_blocked(x), a4)
+            assert torch.equal(cpu_matmul.pack_a_blocked_t(x_t), a4)
+            assert torch.equal(cpu_matmul.pack_b_blocked(x), b4)
+            assert torch.equal(cpu_matmul.pack_b_blocked_t(x_t), b4)
+            assert torch.equal(cpu_matmul.pack_b_blocked_vnni(x), vnni)
+            assert torch.equal(cpu_matmul.pack_b_blocked_vnni_t(x_t), vnni)
 
     def test_ragged_panel_count_matmul_execution(self):
         """Regression: ragged block-8 panel stores corrupted the native heap."""
