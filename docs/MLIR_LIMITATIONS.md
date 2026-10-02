@@ -293,6 +293,14 @@ The backend relies on two lighthouse changes not yet on its main branch:
 
 The optimizing pipeline (`_compiler/pipeline.yaml`, the default) follows lighthouse's x86
 pipeline, with these stages from `_compiler/helion_transforms.py` replacing or added to it:
+- `pin_transposes`, before the cache-level tiling: a static transpose of at most 4096
+  elements with no linalg producer or user (a tile moved to another layout, such as
+  `b[tk, tn].reshape(16, 2, 32).permute(0, 2, 1)`) is annotated with zero tile sizes,
+  which lighthouse's tiling keeps, so it becomes one vector transpose. Tiled, rank-3
+  transposes were split per leading index and unrolled per element of a narrow inner
+  dim, and a padded load fused into the split took a heap-allocated temporary per
+  slice (VNNI packing in `examples/vnni_packing_mlir.py` was up to 2.5x slower than
+  plain block packing; it now takes about as long).
 - `vectorize_pads`, before the tensor-level vectorization: each `tensor.pad` whose
   runtime extents have evident constant bounds becomes a vector read of its source
   (padded with the pad value) written into an empty tensor. Bufferized as is, a pad is a

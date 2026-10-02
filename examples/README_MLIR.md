@@ -212,6 +212,28 @@ Without tcmalloc, large outputs are page-faulted in on every call.
 
 ---
 
+### 11. vnni_packing_mlir.py
+**Block packing in AMX's bf16 VNNI layout, zero padding included**
+
+Packs B into 32x32 blocks stored as AMX tiles, K pairs innermost
+(`[N/32, K/32, 16, 32, 2]`), in one Helion kernel per input layout:
+- **`pack_b_vnni`** (B as `[K, N]`) and **`pack_b_t_vnni`** (B as `[N, K]`,
+  e.g. `nn.Linear` weights): one loop over the packed blocks; each loads a
+  zero-padded 32x32 block, splits K into pairs with a reshape and moves the pair
+  dimension innermost with a permute.
+- **References:** eager PyTorch (pad, reshape, permute, contiguous), and plain
+  block packing without VNNI, which moves the same bytes.
+
+**Run:**
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc.so.4 python examples/vnni_packing_mlir.py
+```
+
+**Output:** A correctness check against the layout's definition (f32 and bf16,
+aligned and padded), then f32 time and bandwidth tables for both input layouts.
+
+---
+
 ## Running the Examples
 
 ### Prerequisites
@@ -232,6 +254,7 @@ python examples/sum_mlir.py
 python examples/multi_phase_mlir.py
 python examples/inline_mlir.py
 python examples/block_packing_mlir.py
+python examples/vnni_packing_mlir.py
 ```
 
 ### Run Specific Example

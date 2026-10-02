@@ -3,6 +3,11 @@
 The ops share a module because a Python-defined dialect only registers the ops
 defined before it is loaded.
 
+``pin_transposes``: lighthouse's tiling splits a rank-3 transpose per leading
+index, fusing a padded load into each slice (a heap-allocated temporary per
+slice), and unrolls it per element of a narrow inner dim. A small transpose that
+only moves a loaded tile is pinned untiled, so it becomes one vector transpose.
+
 ``vectorize_pads``: bufferized, a pad is a temporary zeroed and then copied
 into, and vectorize_all's copy forwarding (upstream
 ``LinalgCopyVTRForwardingPattern``) reads past the copy with poison padding. As
@@ -37,6 +42,9 @@ import itertools
 import math
 
 from lighthouse.dialects import DialectExtension
+from lighthouse.dialects.transform.transform_ext.utils.tile_size_analysis import (
+    TILE_SIZES_ATTR_NAME,
+)
 from lighthouse.schedule.builders import schedule_boilerplate
 import lighthouse.transform as lh_transform
 from mlir import ir
@@ -280,6 +288,60 @@ class SplitTransfersOp(HelionTransformDialect.Operation, name="split_transfers")
         for transfer in _payload_ops(state, op.target, transfer_types):
             _split(transfer, rewriter)
         return DiagnosedSilenceableFailure.Success
+
+
+@_transform_op(modifies_payload=True)
+class PinTransposesOp(HelionTransformDialect.Operation, name="pin_transposes"):
+    """Annotate every ``_is_small_transpose`` op in the target with zero tile
+    sizes: lighthouse's tiling keeps annotated sizes, so it stays one vector
+    transpose."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "PinTransposesOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for linalg_op in _payload_ops(
+            state, op.target, (linalg.TransposeOp, linalg.GenericOp)
+        ):
+            if _is_small_transpose(linalg_op):
+                maps = linalg.get_indexing_maps(linalg_op)
+                n_dims = ir.AffineMapAttr(maps[0]).value.n_dims
+                linalg_op.operation.attributes[TILE_SIZES_ATTR_NAME] = (
+                    ir.DenseI64ArrayAttr.get([0] * n_dims)
+                )
+        return DiagnosedSilenceableFailure.Success
+
+
+def _is_small_transpose(op: ir.OpView) -> bool:
+    """A static transpose of at most ``_MAX_VECTOR_ELEMENTS`` elements with no
+    linalg producer or user, which tiling would fuse it with."""
+    if len(op.operands) != 2 or not _has_static_shape(op):
+        return False
+    maps = linalg.get_indexing_maps(op)
+    if maps is None or len(maps) != 2:
+        return False
+    source, result = (ir.AffineMapAttr(affine_map).value for affine_map in maps)
+    if source == result or not (source.is_permutation and result.is_permutation):
+        return False
+    body = list(op.regions[0].blocks[0].operations)
+    if len(body) != 1 or body[0].operands[0] != op.regions[0].blocks[0].arguments[0]:
+        return False
+    if math.prod(ir.ShapedType(op.operands[1].type).shape) > _MAX_VECTOR_ELEMENTS:
+        return False
+    if _is_linalg(op.operands[0].owner):
+        return False
+    return not any(_is_linalg(use.owner) for use in op.results[0].uses)
+
+
+def _is_linalg(owner: object) -> bool:
+    if isinstance(owner, ir.Operation):
+        owner = owner.opview
+    return isinstance(owner, ir.OpView) and linalg.get_indexing_maps(owner) is not None
 
 
 def _scalarize(
@@ -867,6 +929,16 @@ def split_transfers() -> ir.Module:
         SplitTransfersOp(target=funcs)
         lh_transform.cleanup(named_seq.bodyTarget)
 
+        transform.yield_()
+    return schedule
+
+
+def pin_transposes() -> ir.Module:
+    """Schedule: keep every function's small static transposes untiled."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        PinTransposesOp(target=funcs)
         transform.yield_()
     return schedule
 

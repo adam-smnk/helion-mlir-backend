@@ -163,6 +163,25 @@ def _packed_blocks(b: torch.Tensor) -> torch.Tensor:
     return padded.reshape(kb, 8, nb, 8).permute(2, 0, 1, 3).contiguous()
 
 
+@_kernel()
+def pack_vnni_blocks_kernel(b: torch.Tensor) -> torch.Tensor:
+    """``[K, N] -> [N/32, K/32, 16, 32, 2]``, zero-padded: K pairs innermost."""
+    k, n = b.shape
+    kb, nb = (k + 31) // 32, (n + 31) // 32
+    out = torch.empty((nb, kb, 16, 32, 2), dtype=b.dtype, device=b.device)
+    for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
+        pairs = b[tk, tn].reshape(tk.block_size // 2, 2, tn.block_size)
+        out[tn.id, tk.id, :, :, :] = pairs.permute(0, 2, 1)
+    return out
+
+
+def _packed_vnni_blocks(b: torch.Tensor) -> torch.Tensor:
+    padded = torch.nn.functional.pad(b, (0, -b.shape[1] % 32, 0, -b.shape[0] % 32))
+    kb, nb = padded.shape[0] // 32, padded.shape[1] // 32
+    blocks = padded.reshape(kb, 16, 2, nb, 32)
+    return blocks.permute(3, 0, 1, 4, 2).contiguous()
+
+
 @pytest.mark.parametrize("shape", [(24, 32), (21, 30)], ids=["aligned", "padded"])
 def test_packing_blocks_padded_in_kernel(shape: tuple[int, int]) -> None:
     torch.manual_seed(0)
@@ -277,3 +296,21 @@ def test_opt_pipeline_padded_blocks() -> None:
     with opt_pipeline():
         packed = pack_blocks_kernel(b)
     torch.testing.assert_close(packed, _packed_blocks(b))
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("shape", [(64, 96), (45, 70)], ids=["aligned", "padded"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_opt_pipeline_vnni_blocks(shape: tuple[int, int], dtype: torch.dtype) -> None:
+    """A tile split into K pairs moved innermost: an untiled vector transpose."""
+    torch.manual_seed(0)
+    b = torch.randn(shape).to(dtype)
+    with opt_pipeline():
+        packed = pack_vnni_blocks_kernel(b)
+    torch.testing.assert_close(packed, _packed_vnni_blocks(b), atol=0, rtol=0)
+
+
+def test_static_reshape_is_expand_shape() -> None:
+    ir = str(generate_mlir(pack_vnni_blocks_kernel, [torch.randn(64, 96)]))
+    assert "tensor.expand_shape" in ir
+    assert "tensor.reshape" not in ir

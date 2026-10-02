@@ -15,6 +15,8 @@ Pipeline:
   - pass: "linalg-fuse-elementwise-ops"
 
   ## 1) CPU cache-level tiling - improves data locality and exposes parallelism.
+  ## Small transposes stay one vector transpose: tiled, they read padded tiles per slice.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
   - include: x86_64/tile-and-fuse.yaml {
                                   strategy=cache
                                   propagate=True

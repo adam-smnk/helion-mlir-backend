@@ -124,9 +124,10 @@ def put(
 
 
 def reshape(value: ir.Value, result_shape: list[int]) -> ir.Value | None:
-    """``value`` reshaped without a helper, else ``None``: a ``tensor.reshape`` for
-    static shapes; with runtime (``?``) dims, only unit dims may be added or
-    removed, and the other dims keep their sizes (the caller knows they do)."""
+    """``value`` reshaped without a helper, else ``None``: an ``expand_shape`` or
+    ``collapse_shape`` when one applies to static shapes, else a ``tensor.reshape``;
+    with runtime (``?``) dims, only unit dims may be added or removed, and the
+    other dims keep their sizes (the caller knows they do)."""
     source_type = ir.RankedTensorType(value.type)
     if list(source_type.shape) == list(result_shape):
         return value
@@ -139,13 +140,43 @@ def reshape(value: ir.Value, result_shape: list[int]) -> ir.Value | None:
         result_shape
     ):
         return None
+    result_type = ir.RankedTensorType.get(result_shape, source_type.element_type)
+    # A tensor.reshape bufferizes to a copy of a strided source; these stay views.
+    if (groups := _refining_groups(source_type.shape, result_shape)) is not None:
+        return tensor_d.ExpandShapeOp(
+            result_type, value, groups, [], result_shape
+        ).result
+    if (groups := _refining_groups(result_shape, source_type.shape)) is not None:
+        return tensor_d.CollapseShapeOp(result_type, value, groups).result
     i32 = ir.IntegerType.get_signless(32)
     shape = tensor_d.FromElementsOp(
         ir.RankedTensorType.get([len(result_shape)], i32),
         [emit.constant(i32, dim) for dim in result_shape],
     ).result
-    result_type = ir.RankedTensorType.get(result_shape, source_type.element_type)
     return tensor_d.ReshapeOp(result_type, value, shape).result
+
+
+def _refining_groups(coarse: object, fine: object) -> list[list[int]] | None:
+    """Groups of consecutive ``fine`` dims whose products are the ``coarse`` dims
+    in order (trailing unit dims join the last group), else ``None``."""
+    coarse, fine = [int(dim) for dim in coarse], [int(dim) for dim in fine]
+    if not coarse or len(fine) <= len(coarse):
+        return None
+    groups: list[list[int]] = []
+    position = 0
+    for dim in coarse:
+        group, product = [], 1
+        while position < len(fine) and (not group or product < dim):
+            group.append(position)
+            product *= fine[position]
+            position += 1
+        if product != dim:
+            return None
+        groups.append(group)
+    while position < len(fine) and fine[position] == 1:
+        groups[-1].append(position)
+        position += 1
+    return groups if position == len(fine) else None
 
 
 def _unit_dim_reshape(value: ir.Value, result_shape: list[int]) -> ir.Value | None:
