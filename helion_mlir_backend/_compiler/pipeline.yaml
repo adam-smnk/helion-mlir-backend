@@ -52,6 +52,8 @@ Pipeline:
   - schedule: "helion_transforms.py[gen=pin_transposes]"
   - include: x86_64/unroll-register.yaml
   - include: cleanup.yaml
+  ## Register-tile temporaries (fused accumulator init, epilogues) sized per register tile.
+  - schedule: "helion_transforms.py[gen=fold_empty_slices]"
 
   ## Large slice moves as linalg.copy ops, which vectorize_linalg tiles: unit-dim
   ## folding turns data-movement ops into bare slices, copied whole when bufferized.

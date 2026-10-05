@@ -60,6 +60,7 @@ from mlir.dialects import transform
 from mlir.dialects import vector
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 from mlir.dialects.transform import structured
+from mlir.dialects.transform import tensor as transform_tensor
 from mlir.dialects.transform import vector as transform_vector
 
 
@@ -1290,6 +1291,23 @@ def hoist_allocas() -> ir.Module:
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
         HoistAllocasOp(target=funcs)
+        transform.yield_()
+    return schedule
+
+
+def fold_empty_slices() -> ir.Module:
+    """Schedule: slices of empty tensors as empty tensors of the slice shape.
+
+    A per-register-tile op writing a slice of a whole-tile temporary (e.g. a
+    fused accumulator or epilogue) then gets a register-tile-sized buffer, not
+    one the size of the whole tile streaming through the caches.
+    """
+    with schedule_boilerplate() as (schedule, named_seq):
+        with ir.InsertionPoint(
+            transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
+        ):
+            transform_tensor.apply_patterns_tensor_fold_tensor_empty()
+            transform.apply_patterns_canonicalization()
         transform.yield_()
     return schedule
 

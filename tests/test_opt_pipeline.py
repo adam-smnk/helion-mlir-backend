@@ -15,6 +15,7 @@ import torch
 
 from tests.harness import opt_pipeline
 
+from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
 from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
@@ -328,6 +329,30 @@ func.func @f(%n: index) {
 def test_hoist_allocas_out_of_loops() -> None:
     text = _apply(hoist_allocas, ALLOCA_IN_LOOP)
     assert text.index("memref.alloca") < text.index("scf.for")
+
+
+REGISTER_TILE_TEMPORARY = """
+func.func @f(%x: tensor<4x32xf32>) -> tensor<4x32xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %cst = arith.constant 0.0 : f32
+  %whole = tensor.empty() : tensor<4x32xf32>
+  %r = scf.for %i = %c0 to %c4 step %c1 iter_args(%out = %x) -> (tensor<4x32xf32>) {
+    %slice = tensor.extract_slice %whole[%i, 0] [1, 32] [1, 1] : tensor<4x32xf32> to tensor<1x32xf32>
+    %zero = linalg.fill ins(%cst : f32) outs(%slice : tensor<1x32xf32>) -> tensor<1x32xf32>
+    %next = tensor.insert_slice %zero into %out[%i, 0] [1, 32] [1, 1] : tensor<1x32xf32> into tensor<4x32xf32>
+    scf.yield %next : tensor<4x32xf32>
+  }
+  return %r : tensor<4x32xf32>
+}
+"""
+
+
+def test_fold_empty_slices_sizes_temporaries_per_register_tile() -> None:
+    text = _apply(fold_empty_slices, REGISTER_TILE_TEMPORARY)
+    assert "tensor.empty() : tensor<1x32xf32>" in text
+    assert "tensor.empty() : tensor<4x32xf32>" not in text
 
 
 _TILE_A = "!x86.amx.tile<16x32xbf16>"
