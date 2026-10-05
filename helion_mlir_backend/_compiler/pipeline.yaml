@@ -25,6 +25,9 @@ Pipeline:
 
   ## Normalize ops to category.
   - pass: "linalg-categorize-ops"
+  ## Operand packs (e.g. VNNI B tiles) run once per contraction, not per register tile.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - schedule: "helion_transforms.py[gen=isolate_operand_packs]"
 
   ## 2) CPU register-level tiling - ensure data fits in registers.
   ## Parallel register tiles: assign/propagate from contraction anchors and fuse.
@@ -36,6 +39,8 @@ Pipeline:
   - include: cleanup.yaml
 
   ## Reduction register tiles: annotate K-like dims and tile ops individually.
+  # Tiling clears the pins; operand packs must not be tiled into tiny ops either.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
   - include: x86_64/tile.yaml {
                           strategy=register_reduction
                           propagate=False
@@ -44,6 +49,7 @@ Pipeline:
   - include: cleanup.yaml
 
   ## 3) CPU register-level unrolling via tiling - ensure hardware-friendly shapes.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
   - include: x86_64/unroll-register.yaml
   - include: cleanup.yaml
 

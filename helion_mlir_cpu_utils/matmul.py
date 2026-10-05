@@ -253,6 +253,71 @@ def _matmul_vnni_kernel(blocks_m: int, blocks_n: int) -> helion.Kernel:
     return _VNNI_KERNELS[tiles]
 
 
+def _matmul_fused_pack(
+    a4: Tensor, b4: Tensor, epilogue: Callable[[Tensor], Tensor]
+) -> Tensor:
+    """``a4 @ b4`` of row-major operands viewed ``[MB, BM, K/2, 2]`` and
+    ``[K/2, 2, NB, BN]`` into ``[MB, BM, NB, BN]``, epilogue fused in.
+
+    Each output tile packs the VNNI B chunk it needs per K step into a private
+    buffer and reuses it for all its rows: packed B never leaves the core
+    (a separate pack kernel's output is read by many cores, and rewriting
+    those lines on the next call costs more than the GEMM saves).
+    """
+    blocks_m, block_m, pairs, vnni = a4.shape
+    pairs2, vnni2, blocks_n, block_n = b4.shape
+    assert pairs == pairs2, "K mismatch"
+    assert vnni == vnni2, "VNNI factor mismatch"
+
+    out = torch.empty(
+        (blocks_m, block_m, blocks_n, block_n),
+        dtype=a4.dtype,
+        device=a4.device,
+    )
+    for tile_blocks_m, tile_blocks_n in hl.tile([blocks_m, blocks_n]):
+        acc = hl.zeros(
+            [tile_blocks_m, tile_blocks_n, block_m, block_n], dtype=torch.float32
+        )
+        for tile_pairs in hl.tile(pairs):
+            b_vnni = b4[tile_pairs, :, tile_blocks_n, :].permute(2, 0, 3, 1)
+            acc = acc + torch.einsum(
+                "amcv,bcnv->abmn", a4[tile_blocks_m, :, tile_pairs, :], b_vnni
+            )
+        y = epilogue(acc)
+        out[tile_blocks_m, :, tile_blocks_n, :] = y.permute(0, 2, 1, 3).to(a4.dtype)
+    return out
+
+
+_FUSED_PACK_KERNELS: dict[tuple[int, int, int], helion.Kernel] = {}
+
+
+def _fused_pack_tiles(blocks_m: int, blocks_n: int, pairs: int) -> tuple[int, int, int]:
+    """Tile of 16x4 output blocks and 512 K-pairs (best at 4K), at least one
+    tile per thread."""
+    threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+    tile_n = _largest_divisor_at_most(blocks_n, 4)
+    tile_m = _largest_divisor_at_most(blocks_m, 16)
+    while tile_m > 1 and (blocks_m // tile_m) * (blocks_n // tile_n) < threads:
+        tile_m = _largest_divisor_at_most(blocks_m, tile_m - 1)
+    # AMX VNNI register tiles take 16 K-pairs.
+    tile_k = max(d for d in range(16, min(pairs, 512) + 1, 16) if pairs % d == 0)
+    return tile_m, tile_n, tile_k
+
+
+def _matmul_fused_pack_kernel(
+    blocks_m: int, blocks_n: int, pairs: int
+) -> helion.Kernel:
+    tiles = _fused_pack_tiles(blocks_m, blocks_n, pairs)
+    if tiles not in _FUSED_PACK_KERNELS:
+        _FUSED_PACK_KERNELS[tiles] = helion.kernel(
+            _matmul_fused_pack,
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=list(tiles)),
+        )
+    return _FUSED_PACK_KERNELS[tiles]
+
+
 @helion.kernel(
     static_shapes=True,
     backend="mlir",
@@ -439,6 +504,20 @@ def matmul(
     m_pad = _round_up(m, BLOCK_M)
     n_pad = _round_up(n, BLOCK_N)
     k_pad = _round_up(k, BLOCK_K)
+
+    if (
+        a.dtype == torch.bfloat16
+        and not trans_a
+        and not trans_b
+        and bias is None
+        and (m, n, k) == (m_pad, n_pad, k_pad)
+        and a.is_contiguous()
+        and b.is_contiguous()
+    ):
+        a4 = a.view(m // BLOCK_M, BLOCK_M, k // 2, 2)
+        b4 = b.view(k // 2, 2, n // BLOCK_N, BLOCK_N)
+        kernel = _matmul_fused_pack_kernel(m // BLOCK_M, n // BLOCK_N, k // 2)
+        return kernel(a4, b4, epilogue).view(m, n)
 
     if (
         a.dtype == torch.bfloat16

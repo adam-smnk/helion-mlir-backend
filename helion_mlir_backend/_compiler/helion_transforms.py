@@ -369,9 +369,9 @@ class SplitTransfersOp(HelionTransformDialect.Operation, name="split_transfers")
 
 @_transform_op(modifies_payload=True)
 class PinTransposesOp(HelionTransformDialect.Operation, name="pin_transposes"):
-    """Annotate every ``_is_small_transpose`` op in the target with zero tile
-    sizes: lighthouse's tiling keeps annotated sizes, so it stays one vector
-    transpose."""
+    """Annotate every ``_is_small_transpose`` or ``_is_operand_pack`` op in the
+    target with zero tile sizes: lighthouse's tiling keeps annotated sizes, so it
+    stays one op, a fusion boundary."""
 
     target: ext.Operand[transform.AnyOpType]
 
@@ -385,7 +385,7 @@ class PinTransposesOp(HelionTransformDialect.Operation, name="pin_transposes"):
         for linalg_op in _payload_ops(
             state, op.target, (linalg.TransposeOp, linalg.GenericOp)
         ):
-            if _is_small_transpose(linalg_op):
+            if _is_small_transpose(linalg_op) or _is_operand_pack(linalg_op):
                 maps = linalg.get_indexing_maps(linalg_op)
                 n_dims = ir.AffineMapAttr(maps[0]).value.n_dims
                 linalg_op.operation.attributes[TILE_SIZES_ATTR_NAME] = (
@@ -404,6 +404,34 @@ def _is_small_transpose(op: ir.OpView) -> bool:
     if _is_linalg(op.operands[0].owner):
         return False
     return not any(_is_linalg(use.owner) for use in op.results[0].uses)
+
+
+def _is_operand_pack(op: ir.OpView) -> bool:
+    """A static transpose only read as a contraction operand: a pack into the
+    layout a contraction kernel reads (e.g. VNNI). Fused into the contraction's
+    tiles, its values would not be in memory, which AMX tile loads need."""
+    if not _is_transpose(op):
+        return False
+    uses = list(op.results[0].uses)
+    return bool(uses) and all(_is_contraction_input(use) for use in uses)
+
+
+def _is_contraction_input(use: ir.OpOperand) -> bool:
+    """Whether ``use`` reads its value, possibly through slices, as an input of
+    a contraction."""
+    owner = _opview(use.owner)
+    if isinstance(owner, tensor.ExtractSliceOp):
+        uses = list(owner.result.uses)
+        return bool(uses) and all(_is_contraction_input(u) for u in uses)
+    return (
+        _is_linalg(owner)
+        and linalg.isa_contraction_op(owner)
+        and use.operand_number < len(owner.operands) - 1
+    )
+
+
+def _opview(owner: object) -> ir.OpView:
+    return owner.opview if isinstance(owner, ir.Operation) else owner
 
 
 def _is_transpose(op: ir.OpView) -> bool:
@@ -660,8 +688,8 @@ def _loop_bounds(op: ir.OpView) -> list[int | None] | None:
 def _tile_sizes(op: ir.OpView) -> list[int] | None:
     """Tile sizes making a linalg op's loop ranges bounded and its vectors at most
     ``_MAX_VECTOR_ELEMENTS``, those of an op of runtime shape multiples of
-    ``_TILE``, and those of a transpose 1 on all but its source's two inner dims
-    (0: untiled)."""
+    ``_TILE``, and those of a transpose 1 on all but the inner dims of its source
+    and result (0: untiled)."""
     bounds = _loop_bounds(op)
     if bounds is None:
         return None
@@ -675,11 +703,20 @@ def _tile_sizes(op: ir.OpView) -> list[int] | None:
         for bound in bounds
     ]
     # LLVM takes many seconds on n-D vector transposes; 2-D ones are shuffles.
+    # Keeping the inner dims of both sides makes each tile contiguous reads
+    # interleaved into contiguous writes (e.g. a VNNI pack: 2 rows into pairs).
     if _is_transpose(op):
-        source_map = ir.AffineMapAttr(linalg.get_indexing_maps(op)[0]).value
-        for expr in list(source_map.results)[:-2]:
-            dim = ir.AffineDimExpr(expr).position
-            if bounds[dim] > 1:
+        source_map, result_map = (
+            ir.AffineMapAttr(affine_map).value
+            for affine_map in linalg.get_indexing_maps(op)
+        )
+        source = [ir.AffineDimExpr(e).position for e in source_map.results]
+        result_inner = ir.AffineDimExpr(result_map.results[-1]).position
+        kept = {source[-1], result_inner}
+        if len(kept) == 1 and len(source) > 1:
+            kept.add(source[-2])
+        for dim in source:
+            if dim not in kept and bounds[dim] > 1:
                 sizes[dim] = 1
     return sizes
 
@@ -1069,6 +1106,56 @@ def pin_transposes() -> ir.Module:
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
         PinTransposesOp(target=funcs)
+        transform.yield_()
+    return schedule
+
+
+OPERAND_PACK_ATTR_NAME = "helion.operand_pack"
+
+
+@_transform_op(modifies_payload=True)
+class MarkOperandPacksOp(HelionTransformDialect.Operation, name="mark_operand_packs"):
+    """Mark every ``_is_operand_pack`` op in the target with
+    ``OPERAND_PACK_ATTR_NAME``."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "MarkOperandPacksOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for linalg_op in _payload_ops(
+            state, op.target, (linalg.TransposeOp, linalg.GenericOp)
+        ):
+            if _is_operand_pack(linalg_op):
+                linalg_op.operation.attributes[OPERAND_PACK_ATTR_NAME] = (
+                    ir.UnitAttr.get()
+                )
+        return DiagnosedSilenceableFailure.Success
+
+
+def isolate_operand_packs() -> ir.Module:
+    """Schedule: tile every operand pack by 1 on its outer dim.
+
+    A loop result is no producer tile-and-fuse can fuse: the pack stays outside
+    the contraction's register loops and runs once per contraction, not once
+    per register tile reading it.
+    """
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        MarkOperandPacksOp(target=funcs)
+        packs = structured.MatchOp(
+            transform.any_op_t(),
+            named_seq.bodyTarget,
+            op_attrs=ir.DictAttr.get({OPERAND_PACK_ATTR_NAME: ir.UnitAttr.get()}),
+        )
+        with lh_transform.foreach(packs) as pack:
+            structured.TileUsingForOp(pack, sizes=[1])
+            transform.yield_()
         transform.yield_()
     return schedule
 
