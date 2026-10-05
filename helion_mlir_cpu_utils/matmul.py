@@ -26,6 +26,7 @@ kernel followed by a separate elementwise kernel.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 from typing import Callable
 
 import helion
@@ -34,6 +35,9 @@ import torch
 from torch import Tensor
 
 import helion_mlir_backend  # noqa: F401
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
 
 # AMX bf16 register tile. All three extents must divide by this to use the
 # blocked path.
@@ -289,18 +293,26 @@ def _matmul_fused_pack(
 
 
 _FUSED_PACK_KERNELS: dict[tuple[int, int, int], helion.Kernel] = {}
+_FUSED_PACK_BOUND: dict[tuple[object, ...], BoundKernel] = {}
 
 
 def _fused_pack_tiles(blocks_m: int, blocks_n: int, pairs: int) -> tuple[int, int, int]:
-    """Tile of 16x4 output blocks and 512 K-pairs (best at 4K), at least one
-    tile per thread."""
+    """Tile of the tallest column of 4 output blocks (fewest B chunk packs)
+    with at least one tile per thread, and up to 1024 K-pairs (64x4x1024 best
+    at 4K).
+
+    The f32 accumulator (``tile_m * tile_n`` 4 KiB blocks) and the packed B
+    chunk stay within 1 MiB, the stack promotion limit of ``pipeline.yaml``:
+    heap buffers per tile cost malloc and page faults.
+    """
     threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
     tile_n = _largest_divisor_at_most(blocks_n, 4)
-    tile_m = _largest_divisor_at_most(blocks_m, 16)
+    tile_m = _largest_divisor_at_most(blocks_m, 256 // tile_n)
     while tile_m > 1 and (blocks_m // tile_m) * (blocks_n // tile_n) < threads:
         tile_m = _largest_divisor_at_most(blocks_m, tile_m - 1)
-    # AMX VNNI register tiles take 16 K-pairs.
-    tile_k = max(d for d in range(16, min(pairs, 512) + 1, 16) if pairs % d == 0)
+    # AMX VNNI register tiles take 16 K-pairs; a whole-K tile is slower.
+    max_k = min(1024, pairs // 2 if pairs >= 32 else pairs)
+    tile_k = max(d for d in range(16, max_k + 1, 16) if pairs % d == 0)
     return tile_m, tile_n, tile_k
 
 
@@ -316,6 +328,24 @@ def _matmul_fused_pack_kernel(
             config=helion.Config(block_sizes=list(tiles)),
         )
     return _FUSED_PACK_KERNELS[tiles]
+
+
+def _matmul_fused_pack_bound(
+    a4: Tensor, b4: Tensor, epilogue: Callable[[Tensor], Tensor]
+) -> BoundKernel:
+    """The fused-pack kernel bound to contiguous ``a4``, ``b4`` and ``epilogue``.
+
+    Cached by problem size and epilogue: the tile choice and Helion's
+    specialization lookup (no fast path for callable arguments) cost tens of
+    microseconds per call.
+    """
+    blocks_m, _, pairs, _ = a4.shape
+    blocks_n = b4.shape[2]
+    key = (blocks_m, blocks_n, pairs, os.environ.get("OMP_NUM_THREADS"), epilogue)
+    if (bound := _FUSED_PACK_BOUND.get(key)) is None:
+        kernel = _matmul_fused_pack_kernel(blocks_m, blocks_n, pairs)
+        bound = _FUSED_PACK_BOUND[key] = kernel.bind((a4, b4, epilogue))
+    return bound
 
 
 @helion.kernel(
@@ -516,8 +546,7 @@ def matmul(
     ):
         a4 = a.view(m // BLOCK_M, BLOCK_M, k // 2, 2)
         b4 = b.view(k // 2, 2, n // BLOCK_N, BLOCK_N)
-        kernel = _matmul_fused_pack_kernel(m // BLOCK_M, n // BLOCK_N, k // 2)
-        return kernel(a4, b4, epilogue).view(m, n)
+        return _matmul_fused_pack_bound(a4, b4, epilogue)(a4, b4, epilogue).view(m, n)
 
     if (
         a.dtype == torch.bfloat16

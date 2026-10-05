@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 import gc
 import hashlib
@@ -98,9 +99,45 @@ class CompiledEntry:
     args: tuple[EntryArg, ...]
     runner: Runner
 
+    def __post_init__(self) -> None:
+        # The ctypes callable of the packed C interface, looked up once.
+        object.__setattr__(self, "_func", self.runner.engine.lookup(self.name))
+
     def __call__(self, buffers: list[torch.Tensor]) -> None:
-        with _stage(f"running '{self.name}'"):
-            self.runner.execute(self.name, buffers)
+        packed, _buffer = _packed_memref_args(buffers)
+        try:
+            self._func(packed)
+        except Exception as exc:
+            exc.add_note(f"Helion MLIR backend: failed while running '{self.name}'")
+            raise
+
+
+_WORD = ctypes.sizeof(ctypes.c_int64)
+
+
+def _packed_memref_args(buffers: list[torch.Tensor]) -> tuple[int, ctypes.Array]:
+    """The address of the packed arguments of a C-interface entry -- one pointer
+    per argument to a pointer to its memref descriptor -- and the buffer holding
+    them, which must outlive the call.
+
+    The descriptors (``allocated``, ``aligned``, ``offset``, sizes, strides), the
+    descriptor pointers and the packed arguments are all 64-bit words of one
+    buffer.
+    """
+    words: list[int] = []
+    starts = []
+    for tensor in buffers:
+        starts.append(len(words))
+        data = tensor.data_ptr()
+        words += (data, data, 0, *tensor.shape, *tensor.stride())
+    pointers = len(words)
+    count = len(buffers)
+    buffer = (ctypes.c_int64 * (pointers + 2 * count))()
+    base = ctypes.addressof(buffer)
+    words += [base + _WORD * start for start in starts]
+    words += [base + _WORD * (pointers + i) for i in range(count)]
+    buffer[:] = words
+    return base + _WORD * (pointers + count), buffer
 
 
 def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:

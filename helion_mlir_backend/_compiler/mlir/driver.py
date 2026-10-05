@@ -76,6 +76,12 @@ def compile_kernel(
     arg_exprs = [
         compile(arg.name, f"<helion-mlir-arg:{arg.name}>", "eval") for arg in entry.args
     ]
+    # Only sizes computed from symbols need checks at run time.
+    symbolic_sizes = (
+        sizes
+        if any(expr.free_symbols for exprs in sizes.values() for expr in exprs)
+        else None
+    )
 
     def run(*args: object) -> object:
         host = host_function(*args)
@@ -84,7 +90,7 @@ def compile_kernel(
             call_entry(
                 entry,
                 [eval(expr, host_globals, local_vars) for expr in arg_exprs],
-                sizes,
+                symbolic_sizes,
             )
             next(host)
         except StopIteration as done:
@@ -122,16 +128,16 @@ def call_entry(
         )
     roles = [arg.role for arg in entry.args if arg.role != "scalar"]
     inouts = [t for t, role in zip(tensors, roles, strict=True) if role == "inout"]
-    for i, first in enumerate(inouts):
-        for second in inouts[i + 1 :]:
-            if _overlaps(first, second):
-                raise UnsupportedOperationError(
-                    "kernel writes two tensors that share memory",
-                    reason="each written tensor must be its own buffer",
-                )
+    inout_spans = [_byte_span(t) for t in inouts if t.numel()]
+    for i, first in enumerate(inout_spans):
+        if any(_spans_overlap(first, second) for second in inout_spans[i + 1 :]):
+            raise UnsupportedOperationError(
+                "kernel writes two tensors that share memory",
+                reason="each written tensor must be its own buffer",
+            )
     staged = [
         tensor.clone(memory_format=torch.contiguous_format)
-        if role == "in" and any(_overlaps(tensor, other) for other in inouts)
+        if role == "in" and _overlaps_any(tensor, inout_spans)
         else tensor.contiguous()
         for tensor, role in zip(tensors, roles, strict=True)
     ]
@@ -158,11 +164,11 @@ def _checked_tensor(arg: EntryArg, value: object) -> torch.Tensor:
         )
     if (
         value.dim() != len(arg.shape)
-        or any(
-            expected not in (-1, actual)
-            for expected, actual in zip(arg.shape, value.shape, strict=True)
-        )
         or value.dtype != arg.dtype
+        or any(
+            expected != -1 and expected != actual
+            for expected, actual in zip(arg.shape, value.shape, strict=False)
+        )
     ):
         expected = tuple("?" if size == -1 else size for size in arg.shape)
         raise ValueError(
@@ -203,20 +209,23 @@ def _check_sizes(
                 )
 
 
-def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
-    if a.numel() == 0 or b.numel() == 0:
+def _overlaps_any(tensor: torch.Tensor, spans: list[tuple[int, int]]) -> bool:
+    if not spans or tensor.numel() == 0:
         return False
-    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
-        return False
-    (a_start, a_end), (b_start, b_end) = _byte_span(a), _byte_span(b)
-    return a_start < b_end and b_start < a_end
+    span = _byte_span(tensor)
+    return any(_spans_overlap(span, other) for other in spans)
+
+
+def _spans_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
 
 
 def _byte_span(t: torch.Tensor) -> tuple[int, int]:
+    """The bytes ``t`` spans in memory; ``t`` is not empty."""
+    start = t.data_ptr()
+    if t.is_contiguous():
+        return start, start + t.numel() * t.element_size()
     last = sum(
         (size - 1) * stride for size, stride in zip(t.shape, t.stride(), strict=True)
     )
-    return (
-        t.storage_offset() * t.element_size(),
-        (t.storage_offset() + last + 1) * t.element_size(),
-    )
+    return start, start + (last + 1) * t.element_size()
