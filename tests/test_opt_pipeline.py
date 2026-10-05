@@ -17,6 +17,7 @@ from tests.harness import opt_pipeline
 
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
+from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 
 if TYPE_CHECKING:
@@ -327,3 +328,105 @@ func.func @f(%n: index) {
 def test_hoist_allocas_out_of_loops() -> None:
     text = _apply(hoist_allocas, ALLOCA_IN_LOOP)
     assert text.index("memref.alloca") < text.index("scf.for")
+
+
+_TILE_A = "!x86.amx.tile<16x32xbf16>"
+_TILE_C = "!x86.amx.tile<16x16xf32>"
+
+
+def _amx_block(body: str, accumulators: int = 4) -> str:
+    """A K loop of AMX dot-products on 32x64 operands ``%a``/``%b``."""
+    accs = ", ".join(f"%x{i} = %zero" for i in range(accumulators))
+    types = ", ".join([_TILE_C] * accumulators)
+    return f"""
+func.func @f(%a: memref<32x64xbf16>, %b: memref<32x128xbf16>, %c: memref<16x16xf32>, %n: index) {{
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
+  %c96 = arith.constant 96 : index
+  %zero = x86.amx.tile_zero : {_TILE_C}
+  %r:{accumulators} = scf.for %i = %c0 to %n step %c1 iter_args({accs}) -> ({types}) {{
+{body}
+  }}
+  x86.amx.tile_store %c[%c0, %c0], %r#0 : memref<16x16xf32>, {_TILE_C}
+  return
+}}
+"""
+
+
+def _load(name: str, buffer: str, row: str, col: str) -> str:
+    shape = "32x64" if buffer == "a" else "32x128"
+    return (
+        f"    %{name} = x86.amx.tile_load %{buffer}[%{row}, %{col}] : "
+        f"memref<{shape}xbf16> into {_TILE_A}"
+    )
+
+
+def _dot(name: str, lhs: str, rhs: str, acc: str) -> str:
+    return (
+        f"    %{name} = x86.amx.tile_mulf %{lhs}, %{rhs}, %{acc} : "
+        f"{_TILE_A}, {_TILE_A}, {_TILE_C}"
+    )
+
+
+_AMX_2X2_BODY = "\n".join(
+    [
+        _load("a0", "a", "c0", "c0"),
+        _load("b0", "b", "c0", "c0"),
+        _load("b1", "b", "c0", "c32"),
+        _load("a1", "a", "c16", "c0"),
+        _dot("d0", "a0", "b0", "x0"),
+        _dot("d1", "a0", "b1", "x1"),
+        _dot("d2", "a1", "b0", "x2"),
+        _dot("d3", "a1", "b1", "x3"),
+        f"    scf.yield %d0, %d1, %d2, %d3 : {', '.join([_TILE_C] * 4)}",
+    ]
+)
+
+
+def _amx_order(text: str) -> list[str]:
+    """The AMX loads (``L``) and dot-products (``D``) of the K loop, in order."""
+    body = text[text.index("scf.for") : text.index("scf.yield")]
+    return [
+        "L" if "tile_load" in line else "D"
+        for line in body.splitlines()
+        if "tile_load" in line or "tile_mulf" in line
+    ]
+
+
+def test_schedule_amx_loads_interleaves() -> None:
+    text = _apply(schedule_amx_loads, _amx_block(_AMX_2X2_BODY))
+    # oneDNN's order: A0, B0, B1, dot, A1, dot, dot, dot.
+    assert _amx_order(text) == ["L", "L", "L", "D", "L", "D", "D", "D"]
+
+
+def test_schedule_amx_loads_keeps_blocks_writing_memory() -> None:
+    body = _AMX_2X2_BODY.replace(
+        _dot("d1", "a0", "b1", "x1"),
+        f"    x86.amx.tile_store %c[%c0, %c0], %d0 : memref<16x16xf32>, {_TILE_C}\n"
+        + _dot("d1", "a0", "b1", "x1"),
+    )
+    text = _apply(schedule_amx_loads, _amx_block(body))
+    assert _amx_order(text) == ["L", "L", "L", "L", "D", "D", "D", "D"]
+
+
+def test_schedule_amx_loads_keeps_tile_register_limit() -> None:
+    # 1x5 blocking: 5 accumulators, all 6 operand tiles loaded ahead would need 11.
+    loads = [_load("a0", "a", "c0", "c0")] + [
+        _load(f"b{j}", "b", f"c{16 * (j % 2)}", col)
+        for j, col in enumerate(["c0", "c32", "c64", "c96", "c0"])
+    ]
+    dots = [_dot(f"d{j}", "a0", f"b{j}", f"x{j}") for j in range(5)]
+    interleaved = [loads[0], loads[1], dots[0]]
+    for j in range(1, 5):
+        interleaved += [loads[j + 1], dots[j]]
+    body = "\n".join(
+        [
+            *interleaved,
+            f"    scf.yield {', '.join(f'%d{j}' for j in range(5))} : {', '.join([_TILE_C] * 5)}",
+        ]
+    )
+    text = _apply(lambda: schedule_amx_loads(distance=5), _amx_block(body, 5))
+    assert _amx_order(text) == ["L", "L", "D", "L", "D", "L", "D", "L", "D", "L", "D"]
