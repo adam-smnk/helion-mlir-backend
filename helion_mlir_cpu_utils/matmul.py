@@ -25,6 +25,7 @@ kernel followed by a separate elementwise kernel.
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import helion
@@ -186,6 +187,70 @@ def _matmul_blocked_kernel_bias(
         y = epilogue(acc + bias3[tile_blocks_n, :, :])
         out[tile_blocks_m, :, tile_blocks_n, :] = y.permute(0, 2, 1, 3).to(a4.dtype)
     return out
+
+
+def _matmul_vnni(
+    a4: Tensor, b4: Tensor, epilogue: Callable[[Tensor], Tensor]
+) -> Tensor:
+    """``[MB, BM, K/2, 2] x [NB, K/2, BN, 2] -> [MB, BM, NB, BN]``, epilogue fused in.
+
+    ``a4`` is a free view of row-major A: AMX loads its tiles with A's row stride.
+    ``b4`` is B in VNNI panels, the layout of AMX's bf16 B tiles.
+    """
+    blocks_m, block_m, pairs, vnni = a4.shape
+    blocks_n, pairs2, block_n, vnni2 = b4.shape
+    assert pairs == pairs2, "K mismatch"
+    assert vnni == vnni2, "VNNI factor mismatch"
+
+    out = torch.empty(
+        (blocks_m, block_m, blocks_n, block_n),
+        dtype=a4.dtype,
+        device=a4.device,
+    )
+    for tile_blocks_m, tile_blocks_n in hl.tile([blocks_m, blocks_n]):
+        acc = hl.zeros(
+            [tile_blocks_m, tile_blocks_n, block_m, block_n], dtype=torch.float32
+        )
+        acc = acc + torch.einsum(
+            "amcv,bcnv->abmn",
+            a4[tile_blocks_m, :, :, :],
+            b4[tile_blocks_n, :, :, :],
+        )
+        y = epilogue(acc)
+        out[tile_blocks_m, :, tile_blocks_n, :] = y.permute(0, 2, 1, 3).to(a4.dtype)
+    return out
+
+
+_VNNI_KERNELS: dict[tuple[int, int], helion.Kernel] = {}
+
+
+def _largest_divisor_at_most(extent: int, limit: int) -> int:
+    return max(d for d in range(1, max(1, min(extent, limit)) + 1) if extent % d == 0)
+
+
+def _vnni_tiles(blocks_m: int, blocks_n: int) -> tuple[int, int]:
+    """Output tile, in 32x32 blocks: about one tile per thread, few columns each.
+
+    Every core packing and then reading the same B panels keeps those panels out
+    of other cores' caches: B packed into lines that many cores read in the
+    previous call costs several times more (invalidations) than the GEMM saves.
+    """
+    threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+    tile_n = _largest_divisor_at_most(blocks_n, 4)
+    per_thread = max(1, blocks_m * (blocks_n // tile_n) // max(1, threads))
+    return _largest_divisor_at_most(blocks_m, per_thread), tile_n
+
+
+def _matmul_vnni_kernel(blocks_m: int, blocks_n: int) -> helion.Kernel:
+    tiles = _vnni_tiles(blocks_m, blocks_n)
+    if tiles not in _VNNI_KERNELS:
+        _VNNI_KERNELS[tiles] = helion.kernel(
+            _matmul_vnni,
+            static_shapes=True,
+            backend="mlir",
+            config=helion.Config(block_sizes=list(tiles)),
+        )
+    return _VNNI_KERNELS[tiles]
 
 
 @helion.kernel(
@@ -374,6 +439,23 @@ def matmul(
     m_pad = _round_up(m, BLOCK_M)
     n_pad = _round_up(n, BLOCK_N)
     k_pad = _round_up(k, BLOCK_K)
+
+    if (
+        a.dtype == torch.bfloat16
+        and not trans_a
+        and bias is None
+        and (m, k) == (m_pad, k_pad)
+        and a.is_contiguous()
+    ):
+        b4 = (
+            pack_b_blocked_vnni_t(b, k_pad=k_pad, n_pad=n_pad)
+            if trans_b
+            else pack_b_blocked_vnni(b, k_pad=k_pad, n_pad=n_pad)
+        )
+        a4 = a.view(m // BLOCK_M, BLOCK_M, k // 2, 2)
+        b4 = b4.view(n_pad // BLOCK_N, k // 2, BLOCK_N, 2)
+        out4 = _matmul_vnni_kernel(m // BLOCK_M, n_pad // BLOCK_N)(a4, b4, epilogue)
+        return out4.reshape(m, n_pad)[:, :n]
 
     a4 = (
         pack_a_blocked_t(a, m_pad=m_pad, k_pad=k_pad)

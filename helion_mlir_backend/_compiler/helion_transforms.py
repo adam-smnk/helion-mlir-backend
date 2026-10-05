@@ -941,7 +941,8 @@ class LegalizeForLLVMOp(HelionTransformDialect.Operation, name="legalize_for_llv
 @_transform_op(modifies_payload=True)
 class HoistAllocasOp(HelionTransformDialect.Operation, name="hoist_allocas"):
     """Move every static ``memref.alloca`` in the target to the entry of its
-    ``omp.parallel`` region or function, unless an ``alloca_scope`` frees it."""
+    ``alloca_scope``, ``omp.parallel`` region or function: in a loop, its
+    lowering grows the stack every iteration until the scope ends."""
 
     target: ext.Operand[transform.AnyOpType]
 
@@ -952,17 +953,15 @@ class HoistAllocasOp(HelionTransformDialect.Operation, name="hoist_allocas"):
         _results: transform.TransformResults,
         state: transform.TransformState,
     ) -> DiagnosedSilenceableFailure:
+        scopes = ("memref.alloca_scope", "omp.parallel", "func.func")
         for alloca in _payload_ops(state, op.target, memref.AllocaOp):
             if list(alloca.operands):
                 continue
             parent = alloca.operation.parent
-            while parent.name not in ("omp.parallel", "func.func"):
-                if parent.name == "memref.alloca_scope":
-                    break
+            while parent.name not in scopes:
                 parent = parent.parent
-            else:
-                entry = parent.regions[0].blocks[0]
-                alloca.operation.move_before(entry.operations[0])
+            entry = parent.regions[0].blocks[0]
+            alloca.operation.move_before(entry.operations[0])
         return DiagnosedSilenceableFailure.Success
 
 
@@ -1080,6 +1079,21 @@ def hoist_allocas() -> ir.Module:
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
         HoistAllocasOp(target=funcs)
+        transform.yield_()
+    return schedule
+
+
+def promote_buffers_to_stack(max_alloc_size_in_bytes: int = 262144) -> ir.Module:
+    """Schedule: ``promote-buffers-to-stack`` on every function, with a size limit
+    (the pipeline descriptor cannot nest a pass with options)."""
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        transform.apply_registered_pass(
+            transform.AnyOpType.get(),
+            funcs,
+            "promote-buffers-to-stack",
+            options={"max-alloc-size-in-bytes": max_alloc_size_in_bytes},
+        )
         transform.yield_()
     return schedule
 

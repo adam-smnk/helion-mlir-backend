@@ -61,10 +61,15 @@ Pipeline:
   ## x86_64/lower.yaml, plus lower-vector-multi-reduction, which
   ## convert-vector-to-llvm does not include (reductions fail to JIT without it).
   - include: bufferization.yaml
+  # Per-tile scratch (accumulators, staging) on the stack: no malloc/free per tile.
+  - schedule: "helion_transforms.py[gen=promote_buffers_to_stack]{max_alloc_size_in_bytes=262144}"
   - include: bufferization-cleanup.yaml
   - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
   - schedule: "x86/amx_move_offsets.py[gen=amx_move_offsets]"
+  # The AMX rewrite rebuilds a K loop without the loop-invariant index ops defined in
+  # it (outer tiles of several blocks): left in the erased loop, they abort the rewrite.
+  - pass: "loop-invariant-code-motion"
   - schedule: "vectorization.py[gen=x86_vectorization]"
   - schedule: "vectorization.py[gen=vectorize_all]"
   # Ops of runtime shape without evident bounds stay linalg until here.
