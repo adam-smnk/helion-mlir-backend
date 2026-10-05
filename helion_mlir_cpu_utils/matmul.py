@@ -25,6 +25,7 @@ kernel followed by a separate elementwise kernel.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import os
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -293,7 +294,9 @@ def _matmul_fused_pack(
 
 
 _FUSED_PACK_KERNELS: dict[tuple[int, int, int], helion.Kernel] = {}
-_FUSED_PACK_BOUND: dict[tuple[object, ...], BoundKernel] = {}
+# LRU: epilogues created per call must not pile up (each entry pins its epilogue).
+_FUSED_PACK_BOUND: OrderedDict[tuple[object, ...], BoundKernel] = OrderedDict()
+_FUSED_PACK_BOUND_SIZE = 64
 
 
 def _fused_pack_tiles(blocks_m: int, blocks_n: int, pairs: int) -> tuple[int, int, int]:
@@ -342,9 +345,13 @@ def _matmul_fused_pack_bound(
     blocks_m, _, pairs, _ = a4.shape
     blocks_n = b4.shape[2]
     key = (blocks_m, blocks_n, pairs, os.environ.get("OMP_NUM_THREADS"), epilogue)
-    if (bound := _FUSED_PACK_BOUND.get(key)) is None:
-        kernel = _matmul_fused_pack_kernel(blocks_m, blocks_n, pairs)
-        bound = _FUSED_PACK_BOUND[key] = kernel.bind((a4, b4, epilogue))
+    if (bound := _FUSED_PACK_BOUND.get(key)) is not None:
+        _FUSED_PACK_BOUND.move_to_end(key)
+        return bound
+    kernel = _matmul_fused_pack_kernel(blocks_m, blocks_n, pairs)
+    bound = _FUSED_PACK_BOUND[key] = kernel.bind((a4, b4, epilogue))
+    if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
+        _FUSED_PACK_BOUND.popitem(last=False)
     return bound
 
 
