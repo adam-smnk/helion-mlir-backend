@@ -59,6 +59,20 @@ _PACK_CONFIG = helion.Config(block_sizes=[])
 
 
 @helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+def _pad_kernel(x: Tensor, rows: hl.constexpr, cols: hl.constexpr) -> Tensor:
+    """``x`` zero-padded to ``[rows, cols]``: tiles past its end read zeros."""
+    out = torch.empty((int(rows), int(cols)), dtype=x.dtype, device=x.device)
+    for tr, tc in hl.tile([int(rows), int(cols)], block_size=[32, 32]):
+        out[tr, tc] = x[tr, tc]
+    return out
+
+
+def pad_2d(x: Tensor, rows: int, cols: int) -> Tensor:
+    """Contiguous ``x`` zero-padded to ``[rows, cols]``."""
+    return _pad_kernel(x, hl.constexpr(rows), hl.constexpr(cols))
+
+
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
 def _pack_a_kernel(a: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[M, K]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
     mb, kb = int(m_pad) // 32, int(k_pad) // 32
@@ -313,9 +327,10 @@ def _fused_pack_tiles(blocks_m: int, blocks_n: int, pairs: int) -> tuple[int, in
     tile_m = _largest_divisor_at_most(blocks_m, 256 // tile_n)
     while tile_m > 1 and (blocks_m // tile_m) * (blocks_n // tile_n) < threads:
         tile_m = _largest_divisor_at_most(blocks_m, tile_m - 1)
-    # AMX VNNI register tiles take 16 K-pairs; a whole-K tile is slower.
-    max_k = min(1024, pairs // 2 if pairs >= 32 else pairs)
-    tile_k = max(d for d in range(16, max_k + 1, 16) if pairs % d == 0)
+    # A chunk of one AMX K step (16 pairs) miscompiles upstream (B column tile
+    # offset), so chunks take 32-pair multiples; a whole-K chunk is slower.
+    max_k = min(1024, pairs // 2 if pairs >= 64 else pairs)
+    tile_k = max(d for d in range(32, max_k + 1, 32) if pairs % d == 0)
     return tile_m, tile_n, tile_k
 
 
@@ -541,13 +556,15 @@ def matmul(
     m_pad = _round_up(m, BLOCK_M)
     n_pad = _round_up(n, BLOCK_N)
     k_pad = _round_up(k, BLOCK_K)
+    # The fused-pack kernel's K chunks take two AMX K steps (see _fused_pack_tiles).
+    k_fused = _round_up(k, 2 * BLOCK_K)
 
     if (
         a.dtype == torch.bfloat16
         and not trans_a
         and not trans_b
         and bias is None
-        and (m, n, k) == (m_pad, n_pad, k_pad)
+        and (m, n, k) == (m_pad, n_pad, k_fused)
         and a.is_contiguous()
         and b.is_contiguous()
     ):
@@ -555,11 +572,27 @@ def matmul(
         b4 = b.view(k // 2, 2, n // BLOCK_N, BLOCK_N)
         return _matmul_fused_pack_bound(a4, b4, epilogue)(a4, b4, epilogue).view(m, n)
 
+    if a.dtype == torch.bfloat16 and not trans_a and not trans_b and bias is None:
+        a_p = (
+            a
+            if (m, k) == (m_pad, k_fused) and a.is_contiguous()
+            else pad_2d(a, m_pad, k_fused)
+        )
+        b_p = (
+            b
+            if (k, n) == (k_fused, n_pad) and b.is_contiguous()
+            else pad_2d(b, k_fused, n_pad)
+        )
+        a4 = a_p.view(m_pad // BLOCK_M, BLOCK_M, k_fused // 2, 2)
+        b4 = b_p.view(k_fused // 2, 2, n_pad // BLOCK_N, BLOCK_N)
+        out4 = _matmul_fused_pack_bound(a4, b4, epilogue)(a4, b4, epilogue)
+        return out4.view(m_pad, n_pad)[:m, :n]
+
     if (
         a.dtype == torch.bfloat16
         and not trans_a
         and bias is None
-        and (m, k) == (m_pad, k_pad)
+        and (m, k) == (m_pad, k_fused)
         and a.is_contiguous()
     ):
         b4 = (

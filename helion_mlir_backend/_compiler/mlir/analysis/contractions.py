@@ -161,7 +161,11 @@ def _with_operands(
     for position, operand in enumerate((lhs, rhs)):
         base = _transposed_input(operand)
         subscript = subscripts[position]
-        if base is not None and len(subscript) >= 2:
+        if (
+            base is not None
+            and len(subscript) >= 2
+            and not _is_vnni_operand(operand, subscript, output)
+        ):
             subscripts[position] = subscript[:-2] + subscript[-1] + subscript[-2]
             if len(operand.users) == 1:
                 absorbed.append(operand)
@@ -176,6 +180,27 @@ def _with_operands(
         named=named,
         absorbed=tuple(absorbed),
     )
+
+
+def _is_vnni_operand(operand: torch.fx.Node, subscript: str, output: str) -> bool:
+    """Whether ``operand``'s innermost dim is a reduction over its dtype's VNNI
+    factor: the layout AMX dot-products read, so a transpose producing it is a
+    pack, not a view to fold."""
+    value = operand.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.ndim < 2:
+        return False
+    factor = _VNNI_FACTORS.get(value.dtype)
+    return (
+        factor is not None and value.shape[-1] == factor and subscript[-1] not in output
+    )
+
+
+_VNNI_FACTORS = {
+    torch.bfloat16: 2,
+    torch.float16: 2,
+    torch.int8: 4,
+    torch.uint8: 4,
+}
 
 
 def _transposed_input(node: torch.fx.Node) -> torch.fx.Node | None:

@@ -1795,6 +1795,25 @@ class TestPaddedPackingAndMultiPhaseExecution:
         atol = 1e-4 if dtype == torch.float32 else 0.5
         assert torch.allclose(actual.float(), expected.float(), atol=atol)
 
+    @pytest.mark.parametrize("trans_b", [False, True])
+    @pytest.mark.parametrize(
+        "mkn", [(64, 32, 64), (32, 32, 32), (64, 64, 64), (64, 96, 70)]
+    )
+    def test_matmul_bf16_short_k(self, mkn, trans_b):
+        """bf16 matmuls whose K is one or a few AMX K steps (a single-step K
+        chunk miscompiled upstream)."""
+        from helion_mlir_cpu_utils.matmul import matmul
+
+        m, k, n = mkn
+        torch.manual_seed(6)
+        a = torch.randn(m, k, dtype=torch.bfloat16)
+        b = torch.randn(k, n, dtype=torch.bfloat16)
+        actual = matmul(a, b.T.contiguous() if trans_b else b, trans_b=trans_b)
+        expected = (a.float() @ b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=1e-2, atol=0.5
+        )
+
     def test_multiphase_inplace_buffer_preservation(self):
         """Multi-phase kernel preserves Phase 0's zeros in unwritten slice."""
 
