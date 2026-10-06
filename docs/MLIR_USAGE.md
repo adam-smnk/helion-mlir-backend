@@ -200,7 +200,8 @@ The pipelines are `_compiler/pipeline.yaml` (`opt`: tiling, vectorization, OpenM
 `_compiler/scalar.yaml` (lighthouse's scalar lowering, a simpler fallback). Both begin
 by lowering `linalg.pack`/`linalg.unpack` with lighthouse's `x86/pack_lowering.py`; the
 opt pipeline adds its own stages for padding, runtime-shaped ops, out-of-bounds vector
-transfers and LLVM legalization (`_compiler/helion_transforms.py`, see
+transfers and LLVM legalization (schedules in `_compiler/helion_transforms.py`, their
+transform ops in `_compiler/mlir_transforms/`, see
 `docs/MLIR_LIMITATIONS.md`, section 15).
 
 Config selection follows Helion:

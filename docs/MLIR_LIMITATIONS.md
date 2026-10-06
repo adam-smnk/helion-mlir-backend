@@ -310,7 +310,8 @@ pipeline with two stages left out or narrowed:
   `benchmarks/helion_matmul.py`, a 128x512 copy per tile that LLVM took about 9 s to
   compile).
 
-These stages from `_compiler/helion_transforms.py` replace or are added to it:
+These stages, schedules of `_compiler/helion_transforms.py` built from the transform
+ops of `_compiler/mlir_transforms/` (one module per op), replace or are added to it:
 - `materialize_operand_pads{packed_only}`, after `linalg-categorize-ops`: a static
   zero-padded operand read through an operand pack (e.g. B of a partial tile, packed
   into VNNI) becomes a buffer its source is copied into row by row, each row a 1-D
