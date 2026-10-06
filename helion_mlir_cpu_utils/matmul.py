@@ -282,14 +282,25 @@ def _vnni_dot(a: Tensor, b: Tensor) -> Tensor:
     return torch.einsum("mcv,cnv->mn", a3, b3)
 
 
+def _vnni_dot_t(a: Tensor, b_t: Tensor) -> Tensor:
+    """``a @ b_t.T`` of ``[M, K]`` and ``[N, K]`` tiles, ``b_t`` packed into the
+    VNNI layout of AMX's bf16 B tiles (``[K/2, N, 2]``)."""
+    a3 = a.reshape(a.size(0), a.size(1) // 2, 2)
+    b3 = b_t.reshape(b_t.size(0), b_t.size(1) // 2, 2).permute(1, 0, 2)
+    return torch.einsum("mcv,cnv->mn", a3, b3)
+
+
 def _matmul_fused_pack(
     a: Tensor,
     b: Tensor,
+    bias: Tensor | None,
     epilogue: Callable[[Tensor], Tensor],
     k_chunked: hl.constexpr,
     k_even: hl.constexpr,
+    trans_b: hl.constexpr,
 ) -> Tensor:
-    """``epilogue(a @ b)`` of row-major ``[M, K]`` and ``[K, N]``.
+    """``epilogue(a @ b + bias)`` of row-major ``[M, K]`` and ``[K, N]`` (``[N, K]``
+    with ``trans_b``); ``bias`` is ``[N]`` or ``None``.
 
     Each output tile packs the VNNI B chunk it needs per K step into a private
     buffer and reuses it for all its rows: packed B never leaves the core
@@ -302,21 +313,35 @@ def _matmul_fused_pack(
     whole AMX steps), then a partial chunk of 64 for the remaining columns.
     """
     m, k = a.shape
-    k2, n = b.shape
+    if trans_b:
+        n, k2 = b.shape
+    else:
+        k2, n = b.shape
     assert k == k2, "K mismatch"
 
     out = torch.empty((m, n), dtype=a.dtype, device=a.device)
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k_chunked):
-            acc = acc + _vnni_dot(a[tile_m, tile_k], b[tile_k, tile_n])
+            if trans_b:
+                acc = acc + _vnni_dot_t(a[tile_m, tile_k], b[tile_n, tile_k])
+            else:
+                acc = acc + _vnni_dot(a[tile_m, tile_k], b[tile_k, tile_n])
         if k_even > k_chunked:
             for tile_rest in hl.tile(k_chunked, k_even):
-                acc = acc + _vnni_dot(a[tile_m, tile_rest], b[tile_rest, tile_n])
+                if trans_b:
+                    acc = acc + _vnni_dot_t(a[tile_m, tile_rest], b[tile_n, tile_rest])
+                else:
+                    acc = acc + _vnni_dot(a[tile_m, tile_rest], b[tile_rest, tile_n])
         if k > k_even:
             # A tile as wide as the loop; past K, both operands read zeros.
             for tile_tail in hl.tile(k_even, k_even + 64, block_size=64):
-                acc = acc + _vnni_dot(a[tile_m, tile_tail], b[tile_tail, tile_n])
+                if trans_b:
+                    acc = acc + _vnni_dot_t(a[tile_m, tile_tail], b[tile_n, tile_tail])
+                else:
+                    acc = acc + _vnni_dot(a[tile_m, tile_tail], b[tile_tail, tile_n])
+        if bias is not None:
+            acc = acc + bias[tile_n]
         out[tile_m, tile_n] = epilogue(acc).to(a.dtype)
     return out
 
@@ -329,6 +354,10 @@ _FUSED_PACK_BOUND: OrderedDict[
 _FUSED_PACK_BOUND_SIZE = 64
 # K elements per chunk: the packed B chunk of a 128-column tile stays within 512 KiB.
 _MAX_K_CHUNK = 2048
+# Rows of a tile below which packing its B chunks costs more than sharing them.
+_MIN_SHARED_ROWS = 256
+# Columns of a VNNI panel of :func:`pack_b_vnni_t` (literal in its pack kernel).
+_VNNI_PANEL = 64
 
 
 def _fused_pack_tiles(m: int, n: int, k: int) -> tuple[list[int], int, int]:
@@ -336,20 +365,30 @@ def _fused_pack_tiles(m: int, n: int, k: int) -> tuple[list[int], int, int]:
     chunk), and its ``k_chunked`` and ``k_even``.
 
     Tiles are columns of up to 128 (fewest B chunk packs), as tall as one tile
-    per thread allows (512x128 best at 2K, 2048x128 at 4K). The f32 accumulator
+    per thread allows (512x128 best at 2K, 2048x128 at 4K); narrower columns
+    when that leaves tiles of fewer than ``_MIN_SHARED_ROWS`` rows. The f32 accumulator
     stays within 1 MiB, the stack promotion limit of ``pipeline.yaml``: heap
     buffers per tile cost malloc and page faults. K runs in the fewest chunks of
     at most ``_MAX_K_CHUNK``, and of at most 1 MiB of A when the last row of
     tiles is partial (its A chunks are copied into padded buffers).
     """
     threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+
+    def rows(tile_n: int) -> tuple[int, int]:
+        tiles_m = max(1, threads // -(-n // tile_n))
+        tile_m = min(
+            _round_up(-(-m // tiles_m), BLOCK_M),
+            m // BLOCK_M * BLOCK_M,
+            (1 << 18) // tile_n,
+        )
+        return tiles_m, tile_m
+
     tile_n = min(4 * BLOCK_N, n // BLOCK_N * BLOCK_N)
-    tiles_m = max(1, threads // -(-n // tile_n))
-    tile_m = min(
-        _round_up(-(-m // tiles_m), BLOCK_M),
-        m // BLOCK_M * BLOCK_M,
-        (1 << 18) // tile_n,
-    )
+    tiles_m, tile_m = rows(tile_n)
+    # Few rows: narrower columns, each B chunk packed by one tile, not several.
+    while tiles_m > 1 and tile_m < _MIN_SHARED_ROWS and tile_n > BLOCK_N:
+        tile_n //= 2
+        tiles_m, tile_m = rows(tile_n)
     max_chunk = _MAX_K_CHUNK
     if m % tile_m:
         max_chunk = min(max_chunk, max((1 << 19) // tile_m // 64 * 64, 64))
@@ -362,17 +401,21 @@ def _fused_pack_tiles(m: int, n: int, k: int) -> tuple[list[int], int, int]:
 
 
 def _matmul_fused_pack_bound(
-    a: Tensor, b: Tensor, epilogue: Callable[[Tensor], Tensor]
+    a: Tensor,
+    b: Tensor,
+    bias: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+    trans_b: bool,
 ) -> tuple[BoundKernel, tuple[hl.constexpr, ...]]:
-    """The fused-pack kernel bound to contiguous ``a``, ``b`` and ``epilogue``,
-    with its constexpr arguments.
+    """The fused-pack kernel bound to contiguous ``a``, ``b``, ``bias`` and
+    ``epilogue``, with its constexpr arguments.
 
     Cached by problem size and epilogue: the tile choice and Helion's
     specialization lookup (no fast path for callable arguments) cost tens of
     microseconds per call.
     """
-    (m, k), n = a.shape, b.shape[1]
-    key = (m, n, k, os.environ.get("OMP_NUM_THREADS"), epilogue)
+    (m, k), n = a.shape, b.shape[0] if trans_b else b.shape[1]
+    key = (m, n, k, trans_b, bias is None, os.environ.get("OMP_NUM_THREADS"), epilogue)
     if (cached := _FUSED_PACK_BOUND.get(key)) is not None:
         _FUSED_PACK_BOUND.move_to_end(key)
         return cached
@@ -384,12 +427,122 @@ def _matmul_fused_pack_bound(
             backend="mlir",
             config=helion.Config(block_sizes=block_sizes),
         )
-    consts = (hl.constexpr(k_chunked), hl.constexpr(k_even))
-    bound = _FUSED_PACK_KERNELS[tiles].bind((a, b, epilogue, *consts))
+    consts = (hl.constexpr(k_chunked), hl.constexpr(k_even), hl.constexpr(trans_b))
+    bound = _FUSED_PACK_KERNELS[tiles].bind((a, b, bias, epilogue, *consts))
     cached = _FUSED_PACK_BOUND[key] = (bound, consts)
     if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
         _FUSED_PACK_BOUND.popitem(last=False)
     return cached
+
+
+def _matmul_prepacked_vnni(
+    a3: Tensor,
+    b4: Tensor,
+    bias2: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+    pairs_chunked: hl.constexpr,
+) -> Tensor:
+    """``epilogue(a @ b + bias)`` of ``a3``, row-major ``[M, K]`` viewed as K
+    pairs ``[M, K/2, 2]``, and ``b4``, B in contiguous column panels of AMX's
+    VNNI layout ``[N/P, K/2, P, 2]`` (:func:`pack_b_vnni_t`); ``bias2`` is
+    ``[N/P, P]`` or ``None``. Tiles are one panel wide.
+
+    AMX loads both operands' tiles in place: nothing is packed per call. K
+    pairs run in chunks up to ``pairs_chunked``, then one chunk of the rest.
+    """
+    m, pairs, _ = a3.shape
+    panels, _, panel, _ = b4.shape
+
+    out = torch.empty((m, panels, panel), dtype=a3.dtype, device=a3.device)
+    for tile_m, tile_p in hl.tile([m, panels]):
+        acc = hl.zeros([tile_m, tile_p, panel], dtype=torch.float32)
+        for tile_kp in hl.tile(pairs_chunked):
+            acc = acc + torch.einsum(
+                "mcv,bcnv->mbn", a3[tile_m, tile_kp, :], b4[tile_p, tile_kp, :, :]
+            )
+        if pairs > pairs_chunked:
+            for tile_rest in hl.tile(pairs_chunked, pairs):
+                acc = acc + torch.einsum(
+                    "mcv,bcnv->mbn",
+                    a3[tile_m, tile_rest, :],
+                    b4[tile_p, tile_rest, :, :],
+                )
+        if bias2 is not None:
+            acc = acc + bias2[tile_p, :]
+        out[tile_m, tile_p, :] = epilogue(acc).to(a3.dtype)
+    return out
+
+
+_PREPACKED_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
+
+
+def _matmul_prepacked_vnni_call(
+    a: Tensor,
+    b4: Tensor,
+    n: int,
+    bias: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+) -> Tensor:
+    """:func:`matmul_prepacked_b` of a RHS packed by :func:`pack_b_vnni_t`."""
+    panels, pairs_b, panel, vnni = map(int, b4.shape)
+    m, k = map(int, a.shape)
+    n_pad = panels * panel
+    if (
+        a.dtype != torch.bfloat16
+        or b4.dtype != a.dtype
+        or (panel, vnni) != (_VNNI_PANEL, 2)
+        or k % 2
+        or 2 * pairs_b != k
+        or _round_up(n, panel) != n_pad
+    ):
+        raise ValueError(
+            f"VNNI-packed RHS {tuple(b4.shape)} {b4.dtype} is incompatible with "
+            f"a.shape={tuple(a.shape)} {a.dtype} and n={n}"
+        )
+    a3 = a.contiguous().view(m, k // 2, 2)
+    bias2 = None
+    if bias is not None:
+        bias2 = (
+            bias.reshape(1, n) if n == n_pad else pad_2d(bias.reshape(1, n), 1, n_pad)
+        ).view(panels, panel)
+    key = (
+        "prepacked",
+        m,
+        n_pad,
+        k,
+        bias is None,
+        os.environ.get("OMP_NUM_THREADS"),
+        epilogue,
+    )
+    if (cached := _FUSED_PACK_BOUND.get(key)) is None:
+        threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+        tiles_m = max(1, threads // panels)
+        tile_m = min(
+            _round_up(-(-m // tiles_m), BLOCK_M),
+            max(m // BLOCK_M * BLOCK_M, BLOCK_M),
+            (1 << 18) // panel,
+        )
+        chunks = -(-pairs_b // (_MAX_K_CHUNK // 2))
+        chunk = min(_round_up(-(-pairs_b // chunks), BLOCK_K), pairs_b)
+        pairs_chunked = pairs_b // chunk * chunk
+        tiles = (tile_m, 1, chunk, max(pairs_b - pairs_chunked, BLOCK_K))
+        if tiles not in _PREPACKED_KERNELS:
+            _PREPACKED_KERNELS[tiles] = helion.kernel(
+                _matmul_prepacked_vnni,
+                static_shapes=True,
+                backend="mlir",
+                config=helion.Config(block_sizes=list(tiles)),
+            )
+        consts = (hl.constexpr(pairs_chunked),)
+        bound = _PREPACKED_KERNELS[tiles].bind((a3, b4, bias2, epilogue, *consts))
+        cached = _FUSED_PACK_BOUND[key] = (bound, consts)
+        if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
+            _FUSED_PACK_BOUND.popitem(last=False)
+    else:
+        _FUSED_PACK_BOUND.move_to_end(key)
+    bound, consts = cached
+    out = bound(a3, b4, bias2, epilogue, *consts).view(m, n_pad)
+    return out if n == n_pad else out[:, :n]
 
 
 @helion.kernel(
@@ -498,6 +651,29 @@ def pack_b_blocked_vnni_t(
     return _pack_b_vnni_kernel_t(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
 
 
+@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+def _pack_b_vnni_panels_kernel_t(b3_t: Tensor) -> Tensor:
+    """``[N, K/2, 2]`` K pairs of transposed B into VNNI panels
+    ``[N_pad/64, K/2, 64, 2]`` (``_VNNI_PANEL`` columns, zero-padded)."""
+    n, pairs, vnni = b3_t.shape
+    panels = -(-n // 64)
+    out = torch.empty((panels, pairs, 64, vnni), dtype=b3_t.dtype, device=b3_t.device)
+    for tp, tn in hl.tile([pairs, panels * 64], block_size=[16, 64]):
+        out[tn.id, tp, :, :] = b3_t[tn, tp, :].permute(1, 0, 2)
+    return out
+
+
+def pack_b_vnni_t(b_t: Tensor) -> Tensor:
+    """Pack transposed-layout ``[N, K]`` (e.g. ``nn.Linear`` weights, K even) into
+    contiguous column panels of AMX's bf16 VNNI layout of ``b_t.T``,
+    ``[N_pad/P, K/2, P, 2]``, for :func:`matmul_prepacked_b`: each output tile
+    streams one panel."""
+    n, k = int(b_t.shape[0]), int(b_t.shape[1])
+    if k % 2:
+        raise ValueError(f"pack_b_vnni_t() needs an even K, got b_t.shape={(n, k)}")
+    return _pack_b_vnni_panels_kernel_t(b_t.contiguous().view(n, k // 2, 2))
+
+
 def supports(
     a: Tensor, b: Tensor, trans_a: bool = False, trans_b: bool = False
 ) -> bool:
@@ -581,15 +757,16 @@ def matmul(
     # The fused-pack kernel's K steps are pairs of AMX steps of 32.
     k_fused = _round_up(k, 2 * BLOCK_K)
 
-    if a.dtype == torch.bfloat16 and not trans_a and not trans_b and bias is None:
+    if a.dtype == torch.bfloat16 and not trans_a:
         if min(m, n) >= BLOCK_M and k >= 2 * BLOCK_K:
-            bound, consts = _matmul_fused_pack_bound(a, b, epilogue)
-            return bound(a, b, epilogue, *consts)
+            bound, consts = _matmul_fused_pack_bound(a, b, bias, epilogue, trans_b)
+            return bound(a, b, bias, epilogue, *consts)
         # Smaller than one tile: padded to one.
         a_p = pad_2d(a, m_pad, k_fused)
-        b_p = pad_2d(b, k_fused, n_pad)
-        bound, consts = _matmul_fused_pack_bound(a_p, b_p, epilogue)
-        return bound(a_p, b_p, epilogue, *consts)[:m, :n]
+        b_p = pad_2d(b, n_pad, k_fused) if trans_b else pad_2d(b, k_fused, n_pad)
+        bias_p = None if bias is None else pad_2d(bias.reshape(1, n), 1, n_pad)[0]
+        bound, consts = _matmul_fused_pack_bound(a_p, b_p, bias_p, epilogue, trans_b)
+        return bound(a_p, b_p, bias_p, epilogue, *consts)[:m, :n]
 
     if (
         a.dtype == torch.bfloat16
@@ -635,12 +812,16 @@ def matmul_prepacked_b(
     bias: Tensor | None = None,
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
 ) -> Tensor:
-    """Multiply row-major ``a`` by a RHS produced by ``pack_b_blocked_t``.
+    """Multiply row-major ``a`` by a RHS produced by ``pack_b_blocked_t`` or, for
+    bf16, :func:`pack_b_vnni_t`.
 
-    Only the runtime activation is packed on each call. ``n`` is the original
-    output width before padding; callers own the lifetime and invalidation of
-    ``b4`` and must repack it when the source weight changes.
+    Only the runtime activation is packed on each call (not even that for a
+    VNNI-packed RHS). ``n`` is the original output width before padding;
+    callers own the lifetime and invalidation of ``b4`` and must repack it when
+    the source weight changes.
     """
+    if a.dim() == 2 and b4.dim() == 4 and b4.shape[-1] == 2:
+        return _matmul_prepacked_vnni_call(a, b4, n, bias, epilogue)
     if a.dim() != 2 or b4.dim() != 4:
         raise ValueError(
             f"matmul_prepacked_b() expects rank-2 a and rank-4 b4, got "

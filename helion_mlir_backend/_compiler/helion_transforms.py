@@ -210,6 +210,69 @@ class VectorizePadsOp(HelionTransformDialect.Operation, name="vectorize_pads"):
         return DiagnosedSilenceableFailure.Success
 
 
+def _widen(
+    transpose: vector.TransposeOp, rewriter: transform.TransformRewriter
+) -> None:
+    """``transpose`` as one of wider integers if it keeps inner dims of at most
+    64 bits in place: each group of them is one element."""
+    source_type = ir.VectorType(transpose.vector.type)
+    permutation = list(transpose.permutation)
+    shape, rank = list(source_type.shape), source_type.rank
+    bits = _bits(source_type.element_type)
+    kept, packed = 0, 1
+    while (
+        kept < rank - 2
+        and permutation[rank - 1 - kept] == rank - 1 - kept
+        and packed * shape[rank - 1 - kept] * bits <= 64
+    ):
+        packed *= shape[rank - 1 - kept]
+        kept += 1
+    if packed == 1 or (packed * bits) & (packed * bits - 1):
+        return
+    lead = shape[: rank - kept]
+    lead_permutation = permutation[: rank - kept]
+    result_lead = [lead[dim] for dim in lead_permutation]
+    element_type = source_type.element_type
+    wide = ir.IntegerType.get_signless(packed * bits)
+    with ir.InsertionPoint(transpose), transpose.location:
+        value = vector.ShapeCastOp(
+            ir.VectorType.get([*lead, packed], element_type), transpose.vector
+        ).result
+        value = vector.BitCastOp(ir.VectorType.get([*lead, 1], wide), value).result
+        value = vector.ShapeCastOp(ir.VectorType.get(lead, wide), value).result
+        value = vector.TransposeOp(
+            ir.VectorType.get(result_lead, wide), value, lead_permutation
+        ).result
+        value = vector.ShapeCastOp(
+            ir.VectorType.get([*result_lead, 1], wide), value
+        ).result
+        value = vector.BitCastOp(
+            ir.VectorType.get([*result_lead, packed], element_type), value
+        ).result
+        value = vector.ShapeCastOp(transpose.result.type, value).result
+    rewriter.replace_op(transpose, [value])
+
+
+@_transform_op(modifies_payload=True)
+class WidenTransposesOp(HelionTransformDialect.Operation, name="widen_transposes"):
+    """Rewrite every ``vector.transpose`` in the target keeping inner dims in
+    place as a transpose of wider elements (see ``_widen``): e.g. 16x16 VNNI
+    pairs of bf16 as a 16x16 transpose of i32, which lowers to shuffles."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "WidenTransposesOp",
+        rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for transpose in _payload_ops(state, op.target, vector.TransposeOp):
+            _widen(transpose, rewriter)
+        return DiagnosedSilenceableFailure.Success
+
+
 @_transform_op(modifies_payload=True)
 class MaterializeCopiesOp(HelionTransformDialect.Operation, name="materialize_copies"):
     """Insert a ``linalg.copy`` into the destination slice of every insert in the
@@ -1209,23 +1272,49 @@ def _tile_sizes(op: ir.OpView) -> list[int] | None:
         else 0
         for bound in bounds
     ]
-    # LLVM takes many seconds on n-D vector transposes; 2-D ones are shuffles.
-    # Keeping the inner dims of both sides makes each tile contiguous reads
-    # interleaved into contiguous writes (e.g. a VNNI pack: 2 rows into pairs).
+    # LLVM takes many seconds on large n-D vector transposes. Each tile reads and
+    # writes runs of a vector (e.g. a VNNI pack: 2 rows into pairs; a transposed
+    # one: 16x16 blocks of pairs).
     if _is_transpose(op):
-        source_map, result_map = (
-            ir.AffineMapAttr(affine_map).value
-            for affine_map in linalg.get_indexing_maps(op)
-        )
-        source = [ir.AffineDimExpr(e).position for e in source_map.results]
-        result_inner = ir.AffineDimExpr(result_map.results[-1]).position
-        kept = {source[-1], result_inner}
-        if len(kept) == 1 and len(source) > 1:
-            kept.add(source[-2])
-        for dim in source:
-            if dim not in kept and bounds[dim] > 1:
-                sizes[dim] = 1
+        tiles = _transpose_tiles(op)
+        for dim, bound in enumerate(bounds):
+            size = tiles.get(dim, 1)
+            sizes[dim] = size if bound > size else 0
     return sizes
+
+
+# Bytes of a vector register: the contiguous run each transpose tile moves.
+_VECTOR_BYTES = 64
+
+
+def _bits(element_type: ir.Type) -> int:
+    if isinstance(element_type, (ir.FloatType, ir.IntegerType)):
+        return element_type.width
+    return 64
+
+
+def _transpose_tiles(op: ir.OpView) -> dict[int, int]:
+    """Tile sizes of a static transpose's loop dims reading and writing runs of
+    at least ``_VECTOR_BYTES``: its source's and result's inner dims, as far as
+    needed (others 1)."""
+    bounds = _loop_bounds(op)
+    element_type = ir.ShapedType(op.operands[0].type).element_type
+    run = max(1, _VECTOR_BYTES * 8 // _bits(element_type))
+    tiles: dict[int, int] = {}
+    for affine_map in linalg.get_indexing_maps(op):
+        need = run
+        for expr in reversed(ir.AffineMapAttr(affine_map).value.results):
+            if need <= 1:
+                break
+            dim = ir.AffineDimExpr(expr).position
+            size = _largest_divisor_at_most(bounds[dim], need)
+            tiles[dim] = max(tiles.get(dim, 1), size)
+            need = -(-need // size)
+    return tiles
+
+
+def _largest_divisor_at_most(extent: int, limit: int) -> int:
+    return max(d for d in range(1, min(extent, limit) + 1) if extent % d == 0)
 
 
 def _has_static_shape(op: ir.OpView) -> bool:
@@ -1716,6 +1805,51 @@ def vectorize_pads() -> ir.Module:
     return schedule
 
 
+def lower_transposes(strategy: str = "Shuffle16x16") -> ir.Module:
+    """Schedule: every function's vector transposes as transposes of their
+    widest elements (``WidenTransposesOp``), lowered by upstream's ``strategy``
+    (``Shuffle16x16``: 2-D ones as shuffles, 16x16 ones of 32 bits as AVX-512's
+    unpack/permute sequence)."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        WidenTransposesOp(target=funcs)
+        with ir.InsertionPoint(
+            transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
+        ):
+            transform_vector.apply_patterns_vector_lower_transpose(
+                lowering_strategy=transform_vector.VectorTransposeLowering[strategy]
+            )
+        lh_transform.cleanup(named_seq.bodyTarget)
+        transform.yield_()
+    return schedule
+
+
+def unroll_transfers(max_rank: int = 2) -> ir.Module:
+    """Schedule: every function's transfers of rank above ``max_rank`` unrolled
+    to ones of that rank (upstream ``transfer_to_scf``), flattened where
+    contiguous, and the rest unrolled to 1-D: e.g. a 16x16x2 block of a pack's
+    strided source as 16 reads of 32 elements, not staged through memory element
+    pair by pair."""
+    with schedule_boilerplate() as (schedule, named_seq):
+        with ir.InsertionPoint(
+            transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
+        ):
+            transform_vector.apply_patterns_vector_transfer_to_scf(
+                max_transfer_rank=max_rank, full_unroll=True
+            )
+        lh_transform.flatten_vector_ops(named_seq.bodyTarget)
+        with ir.InsertionPoint(
+            transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
+        ):
+            transform_vector.apply_patterns_vector_transfer_to_scf(
+                max_transfer_rank=1, full_unroll=True
+            )
+        lh_transform.cleanup(named_seq.bodyTarget)
+        transform.yield_()
+    return schedule
+
+
 def materialize_copies() -> ir.Module:
     """Schedule: large slice moves of every function as ``linalg.copy`` ops."""
     HelionTransformDialect.load()
@@ -1805,8 +1939,34 @@ class MarkOperandPacksOp(HelionTransformDialect.Operation, name="mark_operand_pa
         return DiagnosedSilenceableFailure.Success
 
 
+@_transform_op(modifies_payload=False)
+class OuterTransposeTileOp(
+    HelionTransformDialect.Operation, name="outer_transpose_tile"
+):
+    """The ``_transpose_tiles`` size of one transpose's outer loop, as a param."""
+
+    target: ext.Operand[transform.AnyOpType]
+    size: ext.Result[transform.AnyParamType[()]] = ext.infer_result()
+
+    @staticmethod
+    def run(
+        op: "OuterTransposeTileOp",
+        _rewriter: transform.TransformRewriter,
+        results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        targets = state.get_payload_ops(op.target)
+        if len(targets) != 1 or not _is_transpose(targets[0].opview):
+            return DiagnosedSilenceableFailure.SilenceableFailure
+        size = _transpose_tiles(targets[0].opview).get(0, 1)
+        i64 = ir.IntegerType.get_signless(64)
+        results.set_params(op.size, [ir.IntegerAttr.get(i64, size)])
+        return DiagnosedSilenceableFailure.Success
+
+
 def isolate_operand_packs() -> ir.Module:
-    """Schedule: tile every operand pack by 1 on its outer dim.
+    """Schedule: tile every operand pack on its outer loop, by its transpose
+    tile (``_transpose_tiles``).
 
     A loop result is no producer tile-and-fuse can fuse: the pack stays outside
     the contraction's register loops and runs once per contraction, not once
@@ -1822,7 +1982,8 @@ def isolate_operand_packs() -> ir.Module:
             op_attrs=ir.DictAttr.get({OPERAND_PACK_ATTR_NAME: ir.UnitAttr.get()}),
         )
         with lh_transform.foreach(packs) as pack:
-            structured.TileUsingForOp(pack, sizes=[1])
+            size = OuterTransposeTileOp(target=pack).size
+            structured.TileUsingForOp(pack, sizes=[size])
             transform.yield_()
         transform.yield_()
     return schedule

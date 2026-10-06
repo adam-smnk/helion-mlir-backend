@@ -1814,6 +1814,7 @@ class TestPaddedPackingAndMultiPhaseExecution:
             actual.float(), expected.float(), rtol=1e-2, atol=0.5
         )
 
+    @pytest.mark.parametrize("linear", [False, True])
     @pytest.mark.parametrize(
         "mkn",
         [
@@ -1825,19 +1826,49 @@ class TestPaddedPackingAndMultiPhaseExecution:
             (20, 50, 40),
         ],
     )
-    def test_matmul_bf16_ragged(self, mkn):
-        """bf16 matmuls of unaligned shapes, odd K included: edge tiles shifted
-        back inside the operands, the K tail masked, the epilogue fused."""
+    def test_matmul_bf16_ragged(self, mkn, linear):
+        """bf16 matmuls of unaligned shapes, odd K included: partial edge tiles,
+        the K tail masked, the epilogue fused; ``linear``: B transposed (packed
+        per tile from ``[N, K]``) with a fused bias."""
         from helion_mlir_cpu_utils.matmul import matmul
 
         m, k, n = mkn
         torch.manual_seed(7)
         a = torch.randn(m, k, dtype=torch.bfloat16)
         b = torch.randn(k, n, dtype=torch.bfloat16)
-        actual = matmul(a, b, epilogue=torch.relu)
-        expected = torch.relu(a.float() @ b.float()).to(torch.bfloat16)
+        if linear:
+            bias = torch.randn(n, dtype=torch.bfloat16)
+            actual = matmul(
+                a, b.T.contiguous(), trans_b=True, bias=bias, epilogue=torch.relu
+            )
+            expected = torch.relu(a.float() @ b.float() + bias.float())
+        else:
+            actual = matmul(a, b, epilogue=torch.relu)
+            expected = torch.relu(a.float() @ b.float())
         torch.testing.assert_close(
-            actual.float(), expected.float(), rtol=1e-2, atol=0.5
+            actual.float(), expected.to(torch.bfloat16).float(), rtol=1e-2, atol=0.5
+        )
+
+    @pytest.mark.parametrize(
+        "mkn", [(128, 512, 256), (40, 130, 100), (200, 1000, 70), (64, 4096, 64)]
+    )
+    def test_matmul_prepacked_vnni(self, mkn):
+        """A weight packed once into VNNI panels (``pack_b_vnni_t``) is read in
+        place by the fused kernel: ragged N and K included."""
+        from helion_mlir_cpu_utils.matmul import matmul_prepacked_b
+        from helion_mlir_cpu_utils.matmul import pack_b_vnni_t
+
+        m, k, n = mkn
+        torch.manual_seed(9)
+        a = torch.randn(m, k, dtype=torch.bfloat16)
+        weight = torch.randn(n, k, dtype=torch.bfloat16)
+        bias = torch.randn(n, dtype=torch.bfloat16)
+        actual = matmul_prepacked_b(
+            a, pack_b_vnni_t(weight), n=n, bias=bias, epilogue=torch.relu
+        )
+        expected = torch.relu(a.float() @ weight.float().T + bias.float())
+        torch.testing.assert_close(
+            actual.float(), expected.to(torch.bfloat16).float(), rtol=1e-2, atol=0.5
         )
 
     def test_multiphase_inplace_buffer_preservation(self):

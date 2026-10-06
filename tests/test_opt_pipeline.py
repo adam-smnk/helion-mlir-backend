@@ -19,9 +19,11 @@ from tests.harness import opt_pipeline
 from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
+from helion_mlir_backend._compiler.helion_transforms import lower_transposes
 from helion_mlir_backend._compiler.helion_transforms import materialize_operand_pads
 from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
+from helion_mlir_backend._compiler.helion_transforms import unroll_transfers
 from helion_mlir_backend._compiler.helion_transforms import version_padded_operands
 
 if TYPE_CHECKING:
@@ -295,6 +297,44 @@ def test_split_transfers_rank_reducing() -> None:
     # The read and the write, each on its in-bounds path (cleanup merges the ifs).
     assert "scf.if" in text
     assert text.count("in_bounds = [true]") == 2
+
+
+# A 16x16 block of VNNI pairs transposed, as a pack of [N, K] into [K/2, N, 2].
+PAIR_TRANSPOSE = """
+func.func @f(%v: vector<16x16x2xbf16>) -> vector<16x16x2xbf16> {
+  %t = vector.transpose %v, [1, 0, 2] : vector<16x16x2xbf16> to vector<16x16x2xbf16>
+  return %t : vector<16x16x2xbf16>
+}
+"""
+
+
+def test_lower_transposes_widens_kept_inner_dims() -> None:
+    """Pairs kept whole are one i32 each: a 16x16 transpose of i32, lowered to
+    the shuffle sequence, not per-element extracts."""
+    text = _apply(lower_transposes, PAIR_TRANSPOSE)
+    assert "vector.transpose" not in text
+    assert "vector<16x16xi32>" in text or "vector<16xi32>" in text
+    assert text.count("vector.bitcast") == 2
+    assert "vector.shuffle" in text
+
+
+# A 16x16x2 block of a strided source: rows of 32 contiguous elements.
+STRIDED_BLOCK_READ = """
+func.func @f(%m: memref<128x1024x2xbf16, strided<[4096, 2, 1]>>) -> vector<16x16x2xbf16> {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : bf16
+  %r = vector.transfer_read %m[%c0, %c0, %c0], %pad {in_bounds = [true, true, true]}
+      : memref<128x1024x2xbf16, strided<[4096, 2, 1]>>, vector<16x16x2xbf16>
+  return %r : vector<16x16x2xbf16>
+}
+"""
+
+
+def test_unroll_transfers_reads_contiguous_rows() -> None:
+    text = _apply(unroll_transfers, STRIDED_BLOCK_READ)
+    reads = re.findall(r"vector\.transfer_read[^\n]*(vector<[^>]*>)", text)
+    assert reads and set(reads) == {"vector<32xbf16>"} and len(reads) == 16
+    assert "memref.alloca" not in text
 
 
 ZERO_D_TRANSFERS = """

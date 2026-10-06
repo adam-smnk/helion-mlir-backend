@@ -79,9 +79,11 @@ def test_partial_tile_pads_only_edge_register_tiles(monkeypatch) -> None:
     args = [
         torch.randn(m, k, dtype=torch.bfloat16),
         torch.randn(k, n, dtype=torch.bfloat16),
+        None,
         mm.identity_epilogue,
         helion.language.constexpr(k_chunked),
         helion.language.constexpr(k_even),
+        helion.language.constexpr(False),
     ]
     module = inline_module(generate_mlir(kernel, args))
     features = TargetInfo.host().features + _AMX_FEATURES

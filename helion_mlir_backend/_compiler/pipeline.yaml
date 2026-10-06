@@ -71,6 +71,8 @@ Pipeline:
   # Not out of scf.forall: a value hoisted out of the parallel loop is copied per iteration.
   - schedule: "hoisting.py[gen=hoist_loops]{target_op=scf.for}"
   - schedule: "vectorization.py[gen=simplify_vector_ops]"
+  ## Transposes (e.g. of operand packs) as shuffles, of the widest elements they keep whole.
+  - schedule: "helion_transforms.py[gen=lower_transposes]"
 
   ## x86_64/lower.yaml, plus lower-vector-multi-reduction, which
   ## convert-vector-to-llvm does not include (reductions fail to JIT without it).
@@ -88,6 +90,8 @@ Pipeline:
   - schedule: "vectorization.py[gen=vectorize_all]"
   # Ops of runtime shape without evident bounds stay linalg until here.
   - pass: "func.func(convert-linalg-to-loops)"
+  ## n-D transfers as 2-D ones, contiguous ones then 1-D: no per-element staging.
+  - schedule: "helion_transforms.py[gen=unroll_transfers]"
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
   - pass: "func.func(lower-vector-multi-reduction)"
   - schedule: "helion_transforms.py[gen=legalize_for_llvm]"
