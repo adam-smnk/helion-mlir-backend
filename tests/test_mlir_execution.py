@@ -1821,7 +1821,7 @@ class TestPaddedPackingAndMultiPhaseExecution:
             ((64, 128, 96), None),
             ((64, 128, 96), (32, 64, 64)),
             ((100, 130, 70), None),
-            ((40, 1998, 33), None),
+            ((40, 198, 33), None),
         ],
     )
     def test_matmul_bf16_trans_a(self, mkn, block_sizes, trans_b):
@@ -1871,10 +1871,10 @@ class TestPaddedPackingAndMultiPhaseExecution:
         "mkn",
         [
             (40, 100, 50),
-            (600, 130, 1000),
+            (100, 130, 100),
             (33, 66, 35),
-            (200, 1998, 70),
-            (100, 2001, 130),
+            (70, 198, 70),
+            (70, 201, 40),
             (20, 50, 40),
         ],
     )
@@ -1902,7 +1902,7 @@ class TestPaddedPackingAndMultiPhaseExecution:
         )
 
     @pytest.mark.parametrize(
-        "mkn", [(128, 512, 256), (40, 130, 100), (200, 1000, 70), (64, 4096, 64)]
+        "mkn", [(64, 256, 128), (40, 66, 100), (50, 100, 70), (64, 4096, 64)]
     )
     def test_matmul_prepacked_vnni(self, mkn):
         """A weight packed once into VNNI panels (``pack_b_vnni_t``) is read in

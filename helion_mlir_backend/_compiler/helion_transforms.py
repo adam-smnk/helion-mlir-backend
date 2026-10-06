@@ -565,9 +565,12 @@ def _copy_rows(
     return copy(dest, [])
 
 
-def _feeds_contraction(value: ir.Value, packs: bool = True) -> bool:
+def _feeds_contraction(
+    value: ir.Value, packs: bool = True, branches: bool = False
+) -> bool:
     """Whether every use of ``value`` reads it, possibly reshaped or, with
-    ``packs``, transposed (e.g. packed), as a contraction input."""
+    ``packs``, transposed (e.g. packed), with ``branches`` yielded by an
+    ``scf.if``, as a contraction input."""
     uses = list(value.uses)
     for use in uses:
         owner = _opview(use.owner)
@@ -577,12 +580,15 @@ def _feeds_contraction(value: ir.Value, packs: bool = True) -> bool:
             and _is_transpose(owner)
             and use.operand_number == 0
         ):
-            if not _feeds_contraction(owner.results[0], packs):
+            if not _feeds_contraction(owner.results[0], packs, branches):
                 return False
-        elif isinstance(owner, scf.YieldOp) and isinstance(
-            branch := _opview(owner.operation.parent), scf.IfOp
+        elif (
+            branches
+            and isinstance(owner, scf.YieldOp)
+            and isinstance(branch := _opview(owner.operation.parent), scf.IfOp)
         ):
-            if not _feeds_contraction(branch.results[use.operand_number], packs):
+            result = branch.results[use.operand_number]
+            if not _feeds_contraction(result, packs, branches):
                 return False
         elif not _is_contraction_input(use):
             return False
@@ -593,13 +599,14 @@ def _materialize_pad(pad: tensor.PadOp, packed_only: bool) -> None:
     """A static zero-high-padded contraction operand as a filled tensor its
     source is copied into row by row: kernels like AMX load operand tiles from
     memory, not from vectors of masked reads. With ``packed_only``, only one read
-    through an operand pack: register tiling fuses one read directly."""
+    through an operand pack: register tiling fuses one read directly; without,
+    also one yielded by a guard (e.g. of a register tile's empty slice)."""
     result_type = ir.RankedTensorType(pad.result.type)
     if (
         list(pad.low)
         or any(pad.static_low)
         or not result_type.has_static_shape
-        or not _feeds_contraction(pad.result)
+        or not _feeds_contraction(pad.result, branches=not packed_only)
         or (packed_only and _feeds_contraction(pad.result, packs=False))
     ):
         return

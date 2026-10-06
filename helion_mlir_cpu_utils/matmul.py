@@ -62,7 +62,7 @@ def identity_epilogue(x: Tensor) -> Tensor:
 _PACK_CONFIG = helion.Config(block_sizes=[])
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pad_kernel(x: Tensor, rows: hl.constexpr, cols: hl.constexpr) -> Tensor:
     """``x`` zero-padded to ``[rows, cols]``: tiles past its end read zeros."""
     out = torch.empty((int(rows), int(cols)), dtype=x.dtype, device=x.device)
@@ -76,7 +76,7 @@ def pad_2d(x: Tensor, rows: int, cols: int) -> Tensor:
     return _pad_kernel(x, hl.constexpr(rows), hl.constexpr(cols))
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pack_a_kernel(a: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[M, K]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
     mb, kb = int(m_pad) // 32, int(k_pad) // 32
@@ -86,7 +86,7 @@ def _pack_a_kernel(a: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tenso
     return out
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pack_a_kernel_t(a_t: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
     """Pack transposed ``[K, M]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
     mb, kb = int(m_pad) // 32, int(k_pad) // 32
@@ -96,7 +96,7 @@ def _pack_a_kernel_t(a_t: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> T
     return out
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[K, N]`` into ``[N_pad/BN, K_pad/BK, BK, BN]``."""
     kb, nb = int(k_pad) // 32, int(n_pad) // 32
@@ -106,7 +106,7 @@ def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tenso
     return out
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
     """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad/BK, BK, BN]``."""
     kb, nb = int(k_pad) // 32, int(n_pad) // 32
@@ -116,7 +116,7 @@ def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> T
     return out
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pack_b_vnni_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[K, N]`` into ``[N_pad/BN, K_pad/BK, BK/2, BN, 2]``."""
     kb, nb = int(k_pad) // 32, int(n_pad) // 32
@@ -127,7 +127,7 @@ def _pack_b_vnni_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> 
     return out
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pack_b_vnni_kernel_t(
     b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr
 ) -> Tensor:
@@ -140,11 +140,7 @@ def _pack_b_vnni_kernel_t(
     return out
 
 
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, 1]),
-)
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[1, 1]))
 def _matmul_blocked_kernel(
     a4: Tensor, b4: Tensor, epilogue: Callable[[Tensor], Tensor]
 ) -> Tensor:
@@ -153,6 +149,11 @@ def _matmul_blocked_kernel(
     blocks_n, blocks_k2, block_k2, block_n = b4.shape
     assert blocks_k == blocks_k2, "major K mismatch"
     assert block_k == block_k2, "minor K mismatch"
+    # Static under dynamic shapes: the accumulator's block dims and K.
+    block_m = hl.specialize(block_m)
+    block_n = hl.specialize(block_n)
+    hl.specialize(blocks_k)
+    hl.specialize(block_k)
 
     out = torch.empty(
         (blocks_m, block_m, blocks_n, block_n),
@@ -173,11 +174,7 @@ def _matmul_blocked_kernel(
     return out
 
 
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, 1]),
-)
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[1, 1]))
 def _matmul_blocked_kernel_bias(
     a4: Tensor, b4: Tensor, bias3: Tensor, epilogue: Callable[[Tensor], Tensor]
 ) -> Tensor:
@@ -192,6 +189,12 @@ def _matmul_blocked_kernel_bias(
     blocks_n, blocks_k2, block_k2, block_n = b4.shape
     assert blocks_k == blocks_k2, "major K mismatch"
     assert block_k == block_k2, "minor K mismatch"
+    # Static under dynamic shapes: the accumulator's block dims and K.
+    block_m = hl.specialize(block_m)
+    block_n = hl.specialize(block_n)
+    hl.specialize(blocks_k)
+    hl.specialize(block_k)
+    hl.specialize(bias3.size(1))
 
     out = torch.empty(
         (blocks_m, block_m, blocks_n, block_n),
@@ -275,6 +278,9 @@ def _matmul_fused_pack(
     else:
         k2, n = b.shape
     assert k == k2, "K mismatch"
+    # With dynamic shapes, a static K keeps the K chunks unmasked.
+    k = hl.specialize(k)
+    hl.specialize(k2)
 
     if out is None:
         result = torch.empty((m, n), dtype=a.dtype, device=a.device)
@@ -317,6 +323,8 @@ _LINE_ELEMENTS = 32
 _MIN_SHARED_ROWS = 256
 # Columns of a VNNI panel of :func:`pack_b_vnni_t` (literal in its pack kernel).
 _VNNI_PANEL = 64
+# K pairs per tile of :func:`pack_b_vnni_t` (literal in its pack kernel).
+_PANEL_PAIRS = 16
 
 
 def _fused_pack_tiles(
@@ -369,7 +377,7 @@ def _fused_pack_heuristic(
     tiles_m, tile_m = rows(tile_n)
     # Few rows: narrower columns, each B chunk packed by one tile, not several.
     while tiles_m > 1 and tile_m < _MIN_SHARED_ROWS and tile_n > BLOCK_N:
-        tile_n //= 2
+        tile_n = max(tile_n // 2 // BLOCK_N * BLOCK_N, BLOCK_N)
         tiles_m, tile_m = rows(tile_n)
     while trans_a and tile_n < tile_m and 2 * tile_n <= n:
         tile_n *= 2
@@ -404,8 +412,8 @@ def _balanced_rows(m: int, cols: int, tile_m: int, threads: int) -> int:
     def rows(count: int) -> int:
         return _round_up(-(-m // count), BLOCK_M)
 
-    counts = [
-        count for count in range(fewest, 4 * fewest + 1) if rows(count) >= smallest
+    counts = [fewest] + [
+        count for count in range(fewest + 1, 4 * fewest + 1) if rows(count) >= smallest
     ]
     best = min(
         counts, key=lambda count: (-(-count * cols // threads) * rows(count), count)
@@ -452,7 +460,6 @@ def _matmul_fused_pack_bound(
     if (config := tuple(block_sizes)) not in _FUSED_PACK_KERNELS:
         _FUSED_PACK_KERNELS[config] = helion.kernel(
             _matmul_fused_pack,
-            static_shapes=True,
             backend="mlir",
             config=helion.Config(block_sizes=block_sizes),
         )
@@ -469,12 +476,21 @@ def _matmul_fused_pack_bound(
     return cached
 
 
+def _panel_dot(
+    a3: Tensor, b4: Tensor, tile_m: object, tile_p: object, tile_kp: object
+) -> Tensor:
+    return torch.einsum(
+        "mcv,bcnv->mbn", a3[tile_m, tile_kp, :], b4[tile_p, tile_kp, :, :]
+    )
+
+
 def _matmul_prepacked_vnni(
     a3: Tensor,
     b4: Tensor,
     bias2: Tensor | None,
     epilogue: Callable[[Tensor], Tensor],
     pairs_chunked: hl.constexpr,
+    pairs_even: hl.constexpr,
 ) -> Tensor:
     """``epilogue(a @ b + bias)`` of ``a3``, row-major ``[M, K]`` viewed as K
     pairs ``[M, K/2, 2]``, and ``b4``, B in contiguous column panels of AMX's
@@ -482,25 +498,32 @@ def _matmul_prepacked_vnni(
     ``[N/P, P]`` or ``None``. Tiles are one panel wide.
 
     AMX loads both operands' tiles in place: nothing is packed per call. K
-    pairs run in chunks up to ``pairs_chunked``, then one chunk of the rest.
+    pairs run in chunks up to ``pairs_chunked``, one chunk of the rest up to
+    ``pairs_even`` (whole pairs of AMX steps), then a padded chunk of 32 for
+    the remaining pairs: a ragged chunk would leave masked AMX steps, which
+    lower to per-element code.
     """
     m, pairs, _ = a3.shape
     panels, _, panel, _ = b4.shape
+    # With dynamic shapes, static K pairs keep the K chunks unmasked.
+    pairs = hl.specialize(pairs)
+    panel = hl.specialize(panel)
+    hl.specialize(b4.size(1))
+    hl.specialize(a3.size(2))
+    hl.specialize(b4.size(3))
 
     out = torch.empty((m, panels, panel), dtype=a3.dtype, device=a3.device)
     for tile_m, tile_p in hl.tile([m, panels]):
         acc = hl.zeros([tile_m, tile_p, panel], dtype=torch.float32)
-        for tile_kp in hl.tile(pairs_chunked):
-            acc = acc + torch.einsum(
-                "mcv,bcnv->mbn", a3[tile_m, tile_kp, :], b4[tile_p, tile_kp, :, :]
-            )
-        if pairs > pairs_chunked:
-            for tile_rest in hl.tile(pairs_chunked, pairs):
-                acc = acc + torch.einsum(
-                    "mcv,bcnv->mbn",
-                    a3[tile_m, tile_rest, :],
-                    b4[tile_p, tile_rest, :, :],
-                )
+        if pairs_chunked > 0:
+            for tile_kp in hl.tile(pairs_chunked):
+                acc = acc + _panel_dot(a3, b4, tile_m, tile_p, tile_kp)
+        if pairs_even > pairs_chunked:
+            for tile_rest in hl.tile(pairs_chunked, pairs_even):
+                acc = acc + _panel_dot(a3, b4, tile_m, tile_p, tile_rest)
+        if pairs > pairs_even:
+            for tile_tail in hl.tile(pairs_even, pairs_even + 32, block_size=32):
+                acc = acc + _panel_dot(a3, b4, tile_m, tile_p, tile_tail)
         if bias2 is not None:
             acc = acc + bias2[tile_p, :]
         out[tile_m, tile_p, :] = epilogue(acc).to(a3.dtype)
@@ -526,7 +549,7 @@ def _matmul_prepacked_vnni_call(
         or b4.dtype != a.dtype
         or (panel, vnni) != (_VNNI_PANEL, 2)
         or k % 2
-        or 2 * pairs_b != k
+        or 2 * pairs_b != _round_up(k, 2 * _PANEL_PAIRS)
         or _round_up(n, panel) != n_pad
     ):
         raise ValueError(
@@ -556,18 +579,18 @@ def _matmul_prepacked_vnni_call(
             max(m // BLOCK_M * BLOCK_M, BLOCK_M),
             (1 << 18) // panel,
         )
-        chunks = -(-pairs_b // (_MAX_K_CHUNK // 2))
-        chunk = min(_round_up(-(-pairs_b // chunks), BLOCK_K), pairs_b)
-        pairs_chunked = pairs_b // chunk * chunk
-        tiles = (tile_m, 1, chunk, max(pairs_b - pairs_chunked, BLOCK_K))
+        pairs_even = k // 2 // BLOCK_K * BLOCK_K
+        chunks = max(1, -(-pairs_even // (_MAX_K_CHUNK // 2)))
+        chunk = max(_round_up(-(-pairs_even // chunks), BLOCK_K), BLOCK_K)
+        pairs_chunked = pairs_even // chunk * chunk
+        tiles = (tile_m, 1, chunk, max(pairs_even - pairs_chunked, BLOCK_K))
         if tiles not in _PREPACKED_KERNELS:
             _PREPACKED_KERNELS[tiles] = helion.kernel(
                 _matmul_prepacked_vnni,
-                static_shapes=True,
                 backend="mlir",
                 config=helion.Config(block_sizes=list(tiles)),
             )
-        consts = (hl.constexpr(pairs_chunked),)
+        consts = (hl.constexpr(pairs_chunked), hl.constexpr(pairs_even))
         bound = _PREPACKED_KERNELS[tiles].bind((a3, b4, bias2, epilogue, *consts))
         cached = _FUSED_PACK_BOUND[key] = (bound, consts)
         if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
@@ -579,11 +602,7 @@ def _matmul_prepacked_vnni_call(
     return out if n == n_pad else out[:, :n]
 
 
-@helion.kernel(
-    static_shapes=True,
-    backend="mlir",
-    config=helion.Config(block_sizes=[1, 1]),
-)
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[1, 1]))
 def _matmul_blocked_kernel_affine(
     a4: Tensor,
     b4: Tensor,
@@ -597,6 +616,14 @@ def _matmul_blocked_kernel_affine(
     blocks_n, blocks_k2, block_k2, block_n = b4.shape
     assert blocks_k == blocks_k2, "major K mismatch"
     assert block_k == block_k2, "minor K mismatch"
+    # Static under dynamic shapes: the accumulator's block dims and K.
+    block_m = hl.specialize(block_m)
+    block_n = hl.specialize(block_n)
+    hl.specialize(blocks_k)
+    hl.specialize(block_k)
+    hl.specialize(bias3.size(1))
+    hl.specialize(scale3.size(1))
+    hl.specialize(post_bias3.size(1))
 
     out = torch.empty(
         (blocks_m, block_m, blocks_n, block_n),
@@ -685,7 +712,7 @@ def pack_b_blocked_vnni_t(
     return _pack_b_vnni_kernel_t(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
 
 
-@helion.kernel(static_shapes=True, backend="mlir", config=_PACK_CONFIG)
+@helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pack_b_vnni_panels_kernel_t(b3_t: Tensor) -> Tensor:
     """``[N, K/2, 2]`` K pairs of transposed B into VNNI panels
     ``[N_pad/64, K/2, 64, 2]`` (``_VNNI_PANEL`` columns, zero-padded)."""
@@ -700,12 +727,17 @@ def _pack_b_vnni_panels_kernel_t(b3_t: Tensor) -> Tensor:
 def pack_b_vnni_t(b_t: Tensor) -> Tensor:
     """Pack transposed-layout ``[N, K]`` (e.g. ``nn.Linear`` weights, K even) into
     contiguous column panels of AMX's bf16 VNNI layout of ``b_t.T``,
-    ``[N_pad/P, K/2, P, 2]``, for :func:`matmul_prepacked_b`: each output tile
-    streams one panel."""
+    ``[N_pad/P, K_pad/2, P, 2]``, for :func:`matmul_prepacked_b`: each output
+    tile streams one panel. N and K are zero-padded to whole panels first: a
+    pack tile ragged in both would compile to per-element code."""
     n, k = int(b_t.shape[0]), int(b_t.shape[1])
     if k % 2:
         raise ValueError(f"pack_b_vnni_t() needs an even K, got b_t.shape={(n, k)}")
-    return _pack_b_vnni_panels_kernel_t(b_t.contiguous().view(n, k // 2, 2))
+    n_pad, k_pad = _round_up(n, _VNNI_PANEL), _round_up(k, 2 * _PANEL_PAIRS)
+    b_t = b_t.contiguous()
+    if (n_pad, k_pad) != (n, k):
+        b_t = pad_2d(b_t, n_pad, k_pad)
+    return _pack_b_vnni_panels_kernel_t(b_t.view(n_pad, k_pad // 2, 2))
 
 
 def supports(

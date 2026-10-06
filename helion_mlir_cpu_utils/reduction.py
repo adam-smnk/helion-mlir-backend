@@ -13,9 +13,7 @@ import torch
 from torch import Tensor
 
 
-@helion.kernel(
-    static_shapes=True, backend="mlir", config=helion.Config(block_sizes=[32, 32])
-)
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[32, 32]))
 def _matvec_kernel(a: Tensor, x: Tensor) -> Tensor:
     """``a @ x`` of ``[M, K]`` and ``[K]``. Products accumulate per K lane, summed
     once at the end: a sum per K tile vectorizes across rows, reading A by

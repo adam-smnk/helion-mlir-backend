@@ -106,3 +106,49 @@ def test_partial_tile_pads_only_edge_register_tiles(monkeypatch) -> None:
     assert any(f"memref<?x{chunk}xbf16, strided<[{k}, 1]" in line for line in loads)
     # No copy of the whole partial tile's A panel.
     assert f"memref<{tile_m}x{chunk}xbf16>" not in text
+
+
+@pytest.mark.slow
+@pytest.mark.isolated
+def test_prepacked_ragged_k_contracts_only_with_amx(monkeypatch) -> None:
+    """A K pair count off the AMX step: whole chunks and a padded tail chunk all
+    reach AMX; no contraction is left to lower per element (it took minutes)."""
+    import importlib
+
+    import helion
+    import torch
+
+    mm = importlib.import_module("helion_mlir_cpu_utils.matmul")
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    m, k, n = 64, 130, 64
+    pairs = k // 2
+    pairs_even = pairs // 32 * 32
+    kernel = helion.kernel(
+        mm._matmul_prepacked_vnni,
+        static_shapes=True,
+        backend="mlir",
+        config=helion.Config(block_sizes=[32, 1, pairs_even, 32]),
+    )
+    args = [
+        torch.randn(m, k, dtype=torch.bfloat16).view(m, pairs, 2),
+        mm.pack_b_vnni_t(torch.randn(n, k, dtype=torch.bfloat16)),
+        None,
+        mm.identity_epilogue,
+        helion.language.constexpr(pairs_even),
+        helion.language.constexpr(pairs_even),
+    ]
+    module = inline_module(generate_mlir(kernel, args))
+    features = TargetInfo.host().features + _AMX_FEATURES
+    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
+        driver = BackendDriver(
+            module, "_matmul_prepacked_vnni", result_to_args=False, benchmark=False
+        )
+        driver.add_stage(pipeline_descriptor("opt"))
+        for stage in driver.stages:
+            module = stage.apply(module)
+            if "x86.amx.tile_mulf" in str(module):
+                break
+        text = str(module)
+    assert "x86.amx.tile_mulf" in text
+    assert "vector.contract" not in text
