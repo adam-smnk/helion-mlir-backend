@@ -247,6 +247,8 @@ def _matmul_fused_pack(
     a: Tensor,
     b: Tensor,
     bias: Tensor | None,
+    scale: Tensor | None,
+    shift: Tensor | None,
     epilogue: Callable[[Tensor], Tensor],
     k_chunked: hl.constexpr,
     k_even: hl.constexpr,
@@ -254,9 +256,10 @@ def _matmul_fused_pack(
     trans_b: hl.constexpr,
     out: Tensor | None = None,
 ) -> Tensor:
-    """``epilogue(a @ b + bias)`` of bf16 row-major ``[M, K]`` and ``[K, N]``
-    (``[K, M]`` with ``trans_a``, ``[N, K]`` with ``trans_b``); ``bias`` is
-    ``[N]`` or ``None``; written into ``out`` if given.
+    """``epilogue((a @ b + bias) * scale + shift)`` of bf16 row-major ``[M, K]``
+    and ``[K, N]`` (``[K, M]`` with ``trans_a``, ``[N, K]`` with ``trans_b``);
+    ``bias``, ``scale`` and ``shift`` are ``[N]`` or ``None``; written into
+    ``out`` if given.
 
     Each output tile packs the chunks it needs per K step into AMX's layouts,
     in private buffers: B's chunk always (VNNI), reused for all its rows; A's
@@ -303,6 +306,10 @@ def _matmul_fused_pack(
                 )
         if bias is not None:
             acc = acc + bias[tile_n]
+        if scale is not None:
+            acc = acc * scale[tile_n]
+        if shift is not None:
+            acc = acc + shift[tile_n]
         result[tile_m, tile_n] = epilogue(acc).to(a.dtype)
     return result
 
@@ -379,20 +386,28 @@ def _fused_pack_heuristic(
     while tiles_m > 1 and tile_m < _MIN_SHARED_ROWS and tile_n > BLOCK_N:
         tile_n = max(tile_n // 2 // BLOCK_N * BLOCK_N, BLOCK_N)
         tiles_m, tile_m = rows(tile_n)
+    # All rows in one tile: no B chunk is shared, more columns of tiles balance
+    # the threads (128x32768x32768: 15% faster at 64 columns than 128); K
+    # chunks stay those of the wider tile.
+    chunk_cols = tile_n
+    if not trans_a and tiles_m == 1 and tile_m < _MIN_SHARED_ROWS:
+        tile_n = min(tile_n, 2 * BLOCK_N)
+        tiles_m, tile_m = rows(tile_n)
     while trans_a and tile_n < tile_m and 2 * tile_n <= n:
         tile_n *= 2
         tiles_m, tile_m = rows(tile_n)
+        chunk_cols = tile_n
     tile_m = _balanced_rows(m, -(-n // tile_n), tile_m, threads)
     # A single-chunk K loop is what the AMX rewrite of a one-register-tile
     # accumulator handles.
-    packed = max(tile_n, tile_m if trans_a else 0)
+    packed = max(chunk_cols, tile_m if trans_a else 0)
     max_chunk = _MAX_K_CHUNK * 4 * BLOCK_N // packed
     # A read in place from aligned rows: one chunk while its packed B fits
     # 768 KiB (8192x5888x2944: 16% faster than two; 4096^3: 16% slower).
     if (
         not trans_a
         and not k % _LINE_ELEMENTS
-        and k_even <= _MAX_K_SINGLE * 4 * BLOCK_N // tile_n
+        and k_even <= _MAX_K_SINGLE * 4 * BLOCK_N // chunk_cols
     ):
         max_chunk = max(max_chunk, k_even)
     chunks = -(-k_even // max_chunk)
@@ -430,10 +445,13 @@ def _matmul_fused_pack_bound(
     trans_b: bool,
     out: Tensor | None = None,
     tiles: Sequence[int] | None = None,
+    scale: Tensor | None = None,
+    shift: Tensor | None = None,
 ) -> tuple[BoundKernel, tuple[hl.constexpr, ...]]:
     """The fused-pack kernel bound to contiguous ``a``, ``b``, ``bias``,
-    ``epilogue`` and ``out``, with its constexpr arguments; ``tiles`` as in
-    :func:`_fused_pack_tiles`.
+    ``scale``, ``shift``, ``epilogue`` and ``out``, with its constexpr
+    arguments; ``tiles`` as in :func:`_fused_pack_tiles`. Call it as
+    ``bound(a, b, bias, scale, shift, epilogue, *consts, out)``.
 
     Cached by problem size and epilogue: the tile choice and Helion's
     specialization lookup (no fast path for callable arguments) cost tens of
@@ -448,6 +466,8 @@ def _matmul_fused_pack_bound(
         trans_a,
         trans_b,
         bias is None,
+        scale is None,
+        shift is None,
         out is None,
         None if tiles is None else tuple(tiles),
         os.environ.get("OMP_NUM_THREADS"),
@@ -469,7 +489,9 @@ def _matmul_fused_pack_bound(
         hl.constexpr(trans_a),
         hl.constexpr(trans_b),
     )
-    bound = _FUSED_PACK_KERNELS[config].bind((a, b, bias, epilogue, *consts, out))
+    bound = _FUSED_PACK_KERNELS[config].bind(
+        (a, b, bias, scale, shift, epilogue, *consts, out)
+    )
     cached = _FUSED_PACK_BOUND[key] = (bound, consts)
     if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
         _FUSED_PACK_BOUND.popitem(last=False)
@@ -488,13 +510,16 @@ def _matmul_prepacked_vnni(
     a3: Tensor,
     b4: Tensor,
     bias2: Tensor | None,
+    scale2: Tensor | None,
+    shift2: Tensor | None,
     epilogue: Callable[[Tensor], Tensor],
     pairs_chunked: hl.constexpr,
     pairs_even: hl.constexpr,
 ) -> Tensor:
-    """``epilogue(a @ b + bias)`` of ``a3``, row-major ``[M, K]`` viewed as K
-    pairs ``[M, K/2, 2]``, and ``b4``, B in contiguous column panels of AMX's
-    VNNI layout ``[N/P, K/2, P, 2]`` (:func:`pack_b_vnni_t`); ``bias2`` is
+    """``epilogue((a @ b + bias) * scale + shift)`` of ``a3``, row-major
+    ``[M, K]`` viewed as K pairs ``[M, K/2, 2]``, and ``b4``, B in contiguous
+    column panels of AMX's VNNI layout ``[N/P, K/2, P, 2]``
+    (:func:`pack_b_vnni_t`); ``bias2``, ``scale2`` and ``shift2`` are
     ``[N/P, P]`` or ``None``. Tiles are one panel wide.
 
     AMX loads both operands' tiles in place: nothing is packed per call. K
@@ -526,6 +551,10 @@ def _matmul_prepacked_vnni(
                 acc = acc + _panel_dot(a3, b4, tile_m, tile_p, tile_tail)
         if bias2 is not None:
             acc = acc + bias2[tile_p, :]
+        if scale2 is not None:
+            acc = acc * scale2[tile_p, :]
+        if shift2 is not None:
+            acc = acc + shift2[tile_p, :]
         out[tile_m, tile_p, :] = epilogue(acc).to(a3.dtype)
     return out
 
@@ -539,6 +568,8 @@ def _matmul_prepacked_vnni_call(
     n: int,
     bias: Tensor | None,
     epilogue: Callable[[Tensor], Tensor],
+    scale: Tensor | None = None,
+    shift: Tensor | None = None,
 ) -> Tensor:
     """:func:`matmul_prepacked_b` of a RHS packed by :func:`pack_b_vnni_t`."""
     panels, pairs_b, panel, vnni = map(int, b4.shape)
@@ -557,17 +588,22 @@ def _matmul_prepacked_vnni_call(
             f"a.shape={tuple(a.shape)} {a.dtype} and n={n}"
         )
     a3 = a.contiguous().view(m, k // 2, 2)
-    bias2 = None
-    if bias is not None:
-        bias2 = (
-            bias.reshape(1, n) if n == n_pad else pad_2d(bias.reshape(1, n), 1, n_pad)
-        ).view(panels, panel)
+
+    def panels2(vector: Tensor | None) -> Tensor | None:
+        if vector is None:
+            return None
+        row = vector.reshape(1, n)
+        return (row if n == n_pad else pad_2d(row, 1, n_pad)).view(panels, panel)
+
+    bias2, scale2, shift2 = panels2(bias), panels2(scale), panels2(shift)
     key = (
         "prepacked",
         m,
         n_pad,
         k,
         bias is None,
+        scale is None,
+        shift is None,
         os.environ.get("OMP_NUM_THREADS"),
         epilogue,
     )
@@ -591,14 +627,16 @@ def _matmul_prepacked_vnni_call(
                 config=helion.Config(block_sizes=list(tiles)),
             )
         consts = (hl.constexpr(pairs_chunked), hl.constexpr(pairs_even))
-        bound = _PREPACKED_KERNELS[tiles].bind((a3, b4, bias2, epilogue, *consts))
+        bound = _PREPACKED_KERNELS[tiles].bind(
+            (a3, b4, bias2, scale2, shift2, epilogue, *consts)
+        )
         cached = _FUSED_PACK_BOUND[key] = (bound, consts)
         if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
             _FUSED_PACK_BOUND.popitem(last=False)
     else:
         _FUSED_PACK_BOUND.move_to_end(key)
     bound, consts = cached
-    out = bound(a3, b4, bias2, epilogue, *consts).view(m, n_pad)
+    out = bound(a3, b4, bias2, scale2, shift2, epilogue, *consts).view(m, n_pad)
     return out if n == n_pad else out[:, :n]
 
 
@@ -783,8 +821,11 @@ def matmul(
     bias: Tensor | None = None,
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
     block_sizes: Sequence[int] | None = None,
+    scale: Tensor | None = None,
+    shift: Tensor | None = None,
 ) -> Tensor:
-    """``epilogue((A.T if trans_a else A) @ (B.T if trans_b else B) + bias)``.
+    """``epilogue((op(A) @ op(B) + bias) * scale + shift)``, ``op`` transposing
+    with ``trans_a``/``trans_b``.
 
     No pre-packing. bf16 runs the fused kernel (:func:`_matmul_fused_pack`): B
     is packed per output tile, A read in place (with ``trans_a``, packed per
@@ -792,9 +833,10 @@ def matmul(
     one tile are zero-padded to one; ``block_sizes`` (tile rows, columns, K
     chunk) overrides its tile choice. Otherwise both
     operands are packed into 32x32 blocks by separate kernels, zero-padded to
-    block multiples (:func:`_matmul_blocked_kernel`). ``bias`` is ``[N]``,
-    broadcast over rows. ``epilogue`` is fused into the same kernel as the
-    contraction (see module docstring), not a separate pass.
+    block multiples (:func:`_matmul_blocked_kernel`). ``bias``, ``scale`` and
+    ``shift`` are ``[N]`` (``scale``/``shift`` also ``[1]``), broadcast over
+    rows. ``epilogue`` is fused into the same kernel as the contraction (see
+    module docstring), not a separate pass.
 
     Raises ``ValueError`` if the operands aren't otherwise compatible (mismatched
     dtype/device/rank/contracted-dim -- see :func:`supports`) instead of
@@ -823,20 +865,41 @@ def matmul(
     k_pad = _round_up(k, BLOCK_K)
 
     if a.dtype == torch.bfloat16:
+        scale = _affine_vector(scale, n, n, a)
+        shift = _affine_vector(shift, n, n, a)
         if min(m, n) >= BLOCK_M and k >= 2 * BLOCK_K:
             bound, consts = _matmul_fused_pack_bound(
-                a, b, bias, epilogue, trans_a, trans_b, tiles=block_sizes
+                a,
+                b,
+                bias,
+                epilogue,
+                trans_a,
+                trans_b,
+                tiles=block_sizes,
+                scale=scale,
+                shift=shift,
             )
-            return bound(a, b, bias, epilogue, *consts)
+            return bound(a, b, bias, scale, shift, epilogue, *consts)
         # Smaller than one tile: padded to one (K to pairs of AMX steps of 32).
         k_fused = _round_up(k, 2 * BLOCK_K)
         a_p = pad_2d(a, k_fused, m_pad) if trans_a else pad_2d(a, m_pad, k_fused)
         b_p = pad_2d(b, n_pad, k_fused) if trans_b else pad_2d(b, k_fused, n_pad)
-        bias_p = None if bias is None else pad_2d(bias.reshape(1, n), 1, n_pad)[0]
-        bound, consts = _matmul_fused_pack_bound(
-            a_p, b_p, bias_p, epilogue, trans_a, trans_b, tiles=block_sizes
+        bias_p, scale_p, shift_p = (
+            None if v is None else pad_2d(v.reshape(1, n), 1, n_pad)[0]
+            for v in (bias, scale, shift)
         )
-        return bound(a_p, b_p, bias_p, epilogue, *consts)[:m, :n]
+        bound, consts = _matmul_fused_pack_bound(
+            a_p,
+            b_p,
+            bias_p,
+            epilogue,
+            trans_a,
+            trans_b,
+            tiles=block_sizes,
+            scale=scale_p,
+            shift=shift_p,
+        )
+        return bound(a_p, b_p, bias_p, scale_p, shift_p, epilogue, *consts)[:m, :n]
 
     a4 = (
         pack_a_blocked_t(a, m_pad=m_pad, k_pad=k_pad)
@@ -848,7 +911,17 @@ def matmul(
         if trans_b
         else pack_b_blocked(b, k_pad=k_pad, n_pad=n_pad)
     )
-    if bias is None:
+    if scale is not None or shift is not None:
+        blocks = (n_pad // BLOCK_N, 1, BLOCK_N)
+        out4 = _matmul_blocked_kernel_affine(
+            a4,
+            b4,
+            _affine_vector(bias, n, n_pad, a, 0.0).reshape(blocks),
+            _affine_vector(scale, n, n_pad, a, 1.0).reshape(blocks),
+            _affine_vector(shift, n, n_pad, a, 0.0).reshape(blocks),
+            epilogue,
+        )
+    elif bias is None:
         out4 = _matmul_blocked_kernel(a4, b4, epilogue)
     else:
         bias_padded = _pad_to(bias.reshape(1, -1), (1, n_pad)).reshape(-1)
@@ -858,15 +931,37 @@ def matmul(
     return out[:m, :n]
 
 
+def _affine_vector(
+    vector: Tensor | None, n: int, n_pad: int, like: Tensor, fill: float | None = None
+) -> Tensor | None:
+    """``vector`` (``[1]`` or ``[n]``) as a contiguous ``[n_pad]`` in ``like``'s
+    dtype; ``None`` stays ``None`` unless ``fill`` is given."""
+    if vector is None:
+        if fill is None:
+            return None
+        return torch.full((n_pad,), fill, dtype=like.dtype, device=like.device)
+    if vector.numel() not in (1, n) or vector.dim() > 1:
+        raise ValueError(
+            f"affine vector must be scalar or have shape (1,) or ({n},), "
+            f"got {tuple(vector.shape)}"
+        )
+    vector = vector.to(dtype=like.dtype, device=like.device).reshape(-1)
+    if vector.numel() == 1:
+        return vector.expand(n_pad).contiguous()
+    return _pad_to(vector.reshape(1, -1), (1, n_pad)).reshape(-1)
+
+
 def matmul_prepacked_b(
     a: Tensor,
     b4: Tensor,
     n: int,
     bias: Tensor | None = None,
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
+    scale: Tensor | None = None,
+    shift: Tensor | None = None,
 ) -> Tensor:
     """Multiply row-major ``a`` by a RHS produced by ``pack_b_blocked_t`` or, for
-    bf16, :func:`pack_b_vnni_t`.
+    bf16, :func:`pack_b_vnni_t`; ``scale``/``shift`` as in :func:`matmul`.
 
     Only the runtime activation is packed on each call (not even that for a
     VNNI-packed RHS). ``n`` is the original output width before padding;
@@ -874,7 +969,19 @@ def matmul_prepacked_b(
     the source weight changes.
     """
     if a.dim() == 2 and b4.dim() == 4 and b4.shape[-1] == 2:
-        return _matmul_prepacked_vnni_call(a, b4, n, bias, epilogue)
+        return _matmul_prepacked_vnni_call(
+            a,
+            b4,
+            n,
+            bias,
+            epilogue,
+            _affine_vector(scale, n, n, a),
+            _affine_vector(shift, n, n, a),
+        )
+    if scale is not None or shift is not None:
+        return matmul_prepacked_b_affine(
+            a, b4, n, bias, _affine_vector(scale, n, n, a, 1.0), shift, epilogue
+        )
     if a.dim() != 2 or b4.dim() != 4:
         raise ValueError(
             f"matmul_prepacked_b() expects rank-2 a and rank-4 b4, got "
@@ -994,6 +1101,6 @@ def bmm(a: Tensor, b: Tensor) -> Tensor:
             bound, consts = _matmul_fused_pack_bound(
                 a[i], b[i], None, identity_epilogue, False, False, out[i]
             )
-            bound(a[i], b[i], None, identity_epilogue, *consts, out[i])
+            bound(a[i], b[i], None, None, None, identity_epilogue, *consts, out[i])
         return out
     return torch.stack([matmul(a[i], b[i]) for i in range(a.shape[0])])

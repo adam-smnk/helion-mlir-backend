@@ -23,7 +23,10 @@ from .matmul import pack_b_blocked_vnni
 from .matmul import pack_b_blocked_vnni_t
 from .matmul import pack_b_vnni_t
 from .matmul import supports
+from .normalization import group_norm
+from .normalization import softmax
 from .reduction import matvec
+from .reduction import row_sum
 from .reduction import supports_matvec
 
 __all__ = [
@@ -31,6 +34,7 @@ __all__ = [
     "AffineLinearCache",
     "LinearCache",
     "bmm",
+    "group_norm",
     "identity_epilogue",
     "leaky_relu",
     "linear",
@@ -47,7 +51,9 @@ __all__ = [
     "pack_b_blocked_vnni_t",
     "pack_b_vnni_t",
     "relu",
+    "row_sum",
     "scalar_mul",
+    "softmax",
     "supports",
     "supports_matvec",
 ]

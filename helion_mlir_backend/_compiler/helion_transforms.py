@@ -10,6 +10,7 @@ from lighthouse.schedule.builders import schedule_boilerplate
 import lighthouse.transform as lh_transform
 from mlir import ir
 from mlir.dialects import transform
+from mlir.dialects.transform import math as transform_math
 from mlir.dialects.transform import structured
 from mlir.dialects.transform import tensor as transform_tensor
 from mlir.dialects.transform import vector as transform_vector
@@ -278,6 +279,18 @@ def promote_buffers_to_stack(max_alloc_size_in_bytes: int = 262144) -> ir.Module
             "promote-buffers-to-stack",
             options={"max-alloc-size-in-bytes": max_alloc_size_in_bytes},
         )
+        transform.yield_()
+    return schedule
+
+
+def approximate_math() -> ir.Module:
+    """Schedule: math functions (``exp``, ``tanh``, ``erf``, ...) as polynomial
+    approximations: LLVM lowers a vector one to a libm call per element."""
+    with schedule_boilerplate() as (schedule, named_seq):
+        with ir.InsertionPoint(
+            transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
+        ):
+            transform_math.ApplyPolynomialApproximationPatternsOp()
         transform.yield_()
     return schedule
 

@@ -413,6 +413,12 @@ ops of `_compiler/mlir_transforms/` (one module per op), replace or are added to
   contiguous, and the rest unrolled to 1-D. `convert-vector-to-scf` otherwise stages an
   n-D transfer of a strided source through a stack buffer, one inner-dim vector (a
   bf16 pair) at a time.
+- `approximate_math`, before `legalize_for_llvm`, rewrites math functions (`exp`,
+  `tanh`, `erf`, `log`, ...) as polynomials with upstream's approximation patterns,
+  through `transform.apply_patterns.math.polynomial_approximation`. This transform op
+  exists only in the local LLVM build (`mlir/include/mlir/Dialect/Math/TransformOps`,
+  not upstream yet). Without it LLVM lowers a vector `math.exp` to one scalar `expf`
+  call per element (level2/37's Swish epilogue: 1000 us of a 1600 us kernel).
 - `legalize_for_llvm`, before the LLVM lowering, rewrites what upstream's lowering
   rejects or gets wrong. 0-d transfers (lowered upstream only on memrefs of unit inner
   stride) and i1 transfers (LLVM packs an i1 vector into bits, while a memref holds

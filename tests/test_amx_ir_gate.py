@@ -80,6 +80,8 @@ def test_partial_tile_pads_only_edge_register_tiles(monkeypatch) -> None:
         torch.randn(m, k, dtype=torch.bfloat16),
         torch.randn(k, n, dtype=torch.bfloat16),
         None,
+        None,
+        None,
         mm.identity_epilogue,
         helion.language.constexpr(k_chunked),
         helion.language.constexpr(k_even),
@@ -133,6 +135,8 @@ def test_prepacked_ragged_k_contracts_only_with_amx(monkeypatch) -> None:
     args = [
         torch.randn(m, k, dtype=torch.bfloat16).view(m, pairs, 2),
         mm.pack_b_vnni_t(torch.randn(n, k, dtype=torch.bfloat16)),
+        None,
+        None,
         None,
         mm.identity_epilogue,
         helion.language.constexpr(pairs_even),

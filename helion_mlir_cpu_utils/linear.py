@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import NamedTuple
 
+import torch
+
 from .matmul import identity_epilogue
 from .matmul import matmul
 from .matmul import matmul_prepacked_b
-from .matmul import matmul_prepacked_b_affine
 from .matmul import pack_b_blocked_t
+from .matmul import pack_b_vnni_t
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -57,6 +59,14 @@ def _combine_biases(biases: tuple[Tensor, ...], x: Tensor) -> Tensor | None:
     return bias
 
 
+def _pack_weight(weight: Tensor) -> Tensor:
+    """``[N, K]`` weight packed for :func:`matmul_prepacked_b`: AMX's VNNI
+    panels for bf16 with an even K, else 32x32 blocks."""
+    if weight.dtype == torch.bfloat16 and not weight.shape[1] % 2:
+        return pack_b_vnni_t(weight)
+    return pack_b_blocked_t(weight)
+
+
 def linear(
     x: Tensor,
     layer: nn.Linear,
@@ -97,7 +107,7 @@ def linear(
         bias = _combine_biases(source_biases, x)
         cache = LinearCache(
             key,
-            pack_b_blocked_t(weight),
+            _pack_weight(weight),
             bias,
             int(layer.out_features),
         )
@@ -122,7 +132,21 @@ def linear_affine(
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
     cache: AffineLinearCache | None = None,
 ) -> tuple[Tensor, AffineLinearCache | None]:
-    """Run ``epilogue(linear(x) * post_scale + post_bias)``."""
+    """Run ``epilogue((linear(x)) * post_scale + post_bias)``; ``post_scale`` and
+    ``post_bias`` are ``[1]`` or ``[out_features]``. Cached like :func:`linear`."""
+    use_cache = os.environ.get(CACHE_PREPACKED_WEIGHTS_ENV, "").strip() == "1"
+    if x.dtype == torch.bfloat16 and not use_cache:
+        bias = None if layer.bias is None else layer.bias.to(dtype=x.dtype)
+        result = matmul(
+            x,
+            layer.weight.to(dtype=x.dtype, device=x.device),
+            trans_b=True,
+            bias=bias,
+            epilogue=epilogue,
+            scale=post_scale,
+            shift=post_bias,
+        )
+        return result, None
     key = (
         _parameter_key(layer.weight),
         _parameter_key(layer.bias),
@@ -131,7 +155,6 @@ def linear_affine(
         x.dtype,
         x.device,
     )
-    use_cache = os.environ.get(CACHE_PREPACKED_WEIGHTS_ENV, "").strip() == "1"
     if not use_cache or cache is None or cache.key != key:
         weight = layer.weight.detach().to(dtype=x.dtype, device=x.device)
         bias = (
@@ -141,7 +164,7 @@ def linear_affine(
         )
         cache = AffineLinearCache(
             key,
-            pack_b_blocked_t(weight),
+            _pack_weight(weight),
             bias,
             post_scale.detach().to(dtype=x.dtype, device=x.device),
             None
@@ -150,13 +173,13 @@ def linear_affine(
             int(layer.out_features),
         )
 
-    result = matmul_prepacked_b_affine(
+    result = matmul_prepacked_b(
         x,
         cache.packed_weight,
         cache.out_features,
         cache.bias,
+        epilogue,
         cache.post_scale,
         cache.post_bias,
-        epilogue,
     )
     return result, cache if use_cache else None

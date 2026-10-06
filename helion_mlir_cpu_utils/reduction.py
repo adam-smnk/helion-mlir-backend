@@ -7,10 +7,15 @@ element of A once, so its speed is A's bandwidth.
 
 from __future__ import annotations
 
+import os
+from typing import Callable
+
 import helion
 import helion.language as hl
 import torch
 from torch import Tensor
+
+from .matmul import identity_epilogue
 
 
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[32, 32]))
@@ -57,3 +62,40 @@ def matvec(a: Tensor, b: Tensor) -> Tensor:
         )
     m, k = a.shape
     return _matvec_kernel(a, b.reshape(k)).reshape(m, 1)
+
+
+def _row_sum_kernel(x: Tensor, epilogue: Callable[[Tensor], Tensor]) -> Tensor:
+    """``epilogue`` of the f32 row sums of ``[M, N]``, as ``[M, 1]``."""
+    m, n = x.shape
+    hl.specialize(n)
+    block_n = hl.register_block_size(n)
+    out = torch.empty((m, 1), dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            acc = acc + x[tile_m, tile_n].to(torch.float32)
+        out[tile_m, :] = epilogue(acc.sum(-1, keepdim=True)).to(x.dtype)
+    return out
+
+
+_ROW_SUM_KERNELS: dict[tuple[int, int], helion.Kernel] = {}
+
+
+def row_sum(
+    x: Tensor, epilogue: Callable[[Tensor], Tensor] = identity_epilogue
+) -> Tensor:
+    """``epilogue(x.sum(1, keepdim=True))`` of a 2-D ``x``, summed in f32; rows
+    split evenly over the threads."""
+    if x.dim() != 2:
+        raise ValueError(f"row_sum() expects a 2-D tensor, got {tuple(x.shape)}")
+    m, n = map(int, x.shape)
+    threads = int(os.environ.get("OMP_NUM_THREADS", torch.get_num_threads()))
+    # The column block is registered first.
+    block_sizes = (min(n, 512), max(1, min(32, -(-m // threads))))
+    if block_sizes not in _ROW_SUM_KERNELS:
+        _ROW_SUM_KERNELS[block_sizes] = helion.kernel(
+            _row_sum_kernel,
+            backend="mlir",
+            config=helion.Config(block_sizes=list(block_sizes)),
+        )
+    return _ROW_SUM_KERNELS[block_sizes](x.contiguous(), epilogue)
