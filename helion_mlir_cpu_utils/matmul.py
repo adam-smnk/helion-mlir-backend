@@ -578,7 +578,8 @@ def _matmul_prepacked_vnni_call(
     if (
         a.dtype != torch.bfloat16
         or b4.dtype != a.dtype
-        or (panel, vnni) != (_VNNI_PANEL, 2)
+        or vnni != 2
+        or panel % BLOCK_N
         or k % 2
         or 2 * pairs_b != _round_up(k, 2 * _PANEL_PAIRS)
         or _round_up(n, panel) != n_pad
@@ -600,6 +601,7 @@ def _matmul_prepacked_vnni_call(
         "prepacked",
         m,
         n_pad,
+        panel,
         k,
         bias is None,
         scale is None,
@@ -616,7 +618,11 @@ def _matmul_prepacked_vnni_call(
             (1 << 18) // panel,
         )
         pairs_even = k // 2 // BLOCK_K * BLOCK_K
-        chunks = max(1, -(-pairs_even // (_MAX_K_CHUNK // 2)))
+        # Packed B per K chunk: 512 KiB, 256 KiB for tiles of few rows, which
+        # stream the weight (128x32768x32768 at 256 columns: 8.7 ms, 9.2 at 512 KiB).
+        chunk_bytes = (256 if tile_m < _MIN_SHARED_ROWS else 512) << 10
+        max_pairs = max(chunk_bytes // (panel * 2 * b4.element_size()), BLOCK_K)
+        chunks = max(1, -(-pairs_even // max_pairs))
         chunk = max(_round_up(-(-pairs_even // chunks), BLOCK_K), BLOCK_K)
         pairs_chunked = pairs_even // chunk * chunk
         tiles = (tile_m, 1, chunk, max(pairs_even - pairs_chunked, BLOCK_K))
@@ -750,32 +756,61 @@ def pack_b_blocked_vnni_t(
     return _pack_b_vnni_kernel_t(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
 
 
-@helion.kernel(backend="mlir", config=_PACK_CONFIG)
-def _pack_b_vnni_panels_kernel_t(b3_t: Tensor) -> Tensor:
-    """``[N, K/2, 2]`` K pairs of transposed B into VNNI panels
-    ``[N_pad/64, K/2, 64, 2]`` (``_VNNI_PANEL`` columns, zero-padded)."""
+def _pack_b_vnni_panels_kernel_t(b3_t: Tensor, panel: hl.constexpr) -> Tensor:
+    """``[N, K/2, 2]`` K pairs of transposed B (N a multiple of ``panel``) into
+    VNNI panels ``[N/panel, K/2, panel, 2]``."""
     n, pairs, vnni = b3_t.shape
-    panels = -(-n // 64)
-    out = torch.empty((panels, pairs, 64, vnni), dtype=b3_t.dtype, device=b3_t.device)
-    for tp, tn in hl.tile([pairs, panels * 64], block_size=[16, 64]):
+    panel = int(panel)
+    out = torch.empty(
+        (n // panel, pairs, panel, vnni), dtype=b3_t.dtype, device=b3_t.device
+    )
+    for tp, tn in hl.tile([pairs, n]):
         out[tn.id, tp, :, :] = b3_t[tn, tp, :].permute(1, 0, 2)
     return out
 
 
-def pack_b_vnni_t(b_t: Tensor) -> Tensor:
+_PANEL_PACK_KERNELS: dict[int, helion.Kernel] = {}
+
+
+def vnni_panel(m: int, n: int) -> int:
+    """Columns of :func:`pack_b_vnni_t` panels for ``m`` rows: the widest (up to
+    256) that still gives every thread a tile of at least ``_MIN_SHARED_ROWS``
+    rows, or one of all rows. Wider panels reuse each A row over more columns
+    (1024x8192x8192: 64 columns 3118 us, 256: 2458)."""
+    threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+    row_tiles = max(1, m // _MIN_SHARED_ROWS)
+    for panel in (256, 128):
+        if -(-n // panel) * row_tiles >= threads:
+            return panel
+    return _VNNI_PANEL
+
+
+def pack_b_vnni_t(b_t: Tensor, panel: int = _VNNI_PANEL) -> Tensor:
     """Pack transposed-layout ``[N, K]`` (e.g. ``nn.Linear`` weights, K even) into
     contiguous column panels of AMX's bf16 VNNI layout of ``b_t.T``,
-    ``[N_pad/P, K_pad/2, P, 2]``, for :func:`matmul_prepacked_b`: each output
-    tile streams one panel. N and K are zero-padded to whole panels first: a
-    pack tile ragged in both would compile to per-element code."""
+    ``[N_pad/P, K_pad/2, P, 2]`` with ``P = panel`` (a multiple of 32), for
+    :func:`matmul_prepacked_b`: each output tile streams one panel. N and K are
+    zero-padded to whole panels first: a pack tile ragged in both would compile
+    to per-element code."""
     n, k = int(b_t.shape[0]), int(b_t.shape[1])
-    if k % 2:
-        raise ValueError(f"pack_b_vnni_t() needs an even K, got b_t.shape={(n, k)}")
-    n_pad, k_pad = _round_up(n, _VNNI_PANEL), _round_up(k, 2 * _PANEL_PAIRS)
+    if k % 2 or panel % BLOCK_N:
+        raise ValueError(
+            f"pack_b_vnni_t() needs an even K and a panel of a multiple of "
+            f"{BLOCK_N} columns, got b_t.shape={(n, k)}, panel={panel}"
+        )
+    n_pad, k_pad = _round_up(n, panel), _round_up(k, 2 * _PANEL_PAIRS)
     b_t = b_t.contiguous()
     if (n_pad, k_pad) != (n, k):
         b_t = pad_2d(b_t, n_pad, k_pad)
-    return _pack_b_vnni_panels_kernel_t(b_t.view(n_pad, k_pad // 2, 2))
+    if panel not in _PANEL_PACK_KERNELS:
+        _PANEL_PACK_KERNELS[panel] = helion.kernel(
+            _pack_b_vnni_panels_kernel_t,
+            backend="mlir",
+            config=helion.Config(block_sizes=[_PANEL_PAIRS, panel]),
+        )
+    return _PANEL_PACK_KERNELS[panel](
+        b_t.view(n_pad, k_pad // 2, 2), hl.constexpr(panel)
+    )
 
 
 def supports(

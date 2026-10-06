@@ -14,6 +14,7 @@ from .matmul import matmul
 from .matmul import matmul_prepacked_b
 from .matmul import pack_b_blocked_t
 from .matmul import pack_b_vnni_t
+from .matmul import vnni_panel
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -59,11 +60,11 @@ def _combine_biases(biases: tuple[Tensor, ...], x: Tensor) -> Tensor | None:
     return bias
 
 
-def _pack_weight(weight: Tensor) -> Tensor:
-    """``[N, K]`` weight packed for :func:`matmul_prepacked_b`: AMX's VNNI
-    panels for bf16 with an even K, else 32x32 blocks."""
+def _pack_weight(weight: Tensor, rows: int) -> Tensor:
+    """``[N, K]`` weight packed for :func:`matmul_prepacked_b` of ``rows`` rows:
+    AMX's VNNI panels for bf16 with an even K, else 32x32 blocks."""
     if weight.dtype == torch.bfloat16 and not weight.shape[1] % 2:
-        return pack_b_vnni_t(weight)
+        return pack_b_vnni_t(weight, vnni_panel(rows, int(weight.shape[0])))
     return pack_b_blocked_t(weight)
 
 
@@ -101,13 +102,14 @@ def linear(
         tuple(_parameter_key(bias) for bias in source_biases),
         x.dtype,
         x.device,
+        x.shape[0],
     )
     if cache is None or cache.key != key:
         weight = layer.weight.detach().to(dtype=x.dtype, device=x.device)
         bias = _combine_biases(source_biases, x)
         cache = LinearCache(
             key,
-            _pack_weight(weight),
+            _pack_weight(weight, int(x.shape[0])),
             bias,
             int(layer.out_features),
         )
@@ -154,6 +156,7 @@ def linear_affine(
         _parameter_key(post_bias),
         x.dtype,
         x.device,
+        x.shape[0],
     )
     if not use_cache or cache is None or cache.key != key:
         weight = layer.weight.detach().to(dtype=x.dtype, device=x.device)
@@ -164,7 +167,7 @@ def linear_affine(
         )
         cache = AffineLinearCache(
             key,
-            _pack_weight(weight),
+            _pack_weight(weight, int(x.shape[0])),
             bias,
             post_scale.detach().to(dtype=x.dtype, device=x.device),
             None
