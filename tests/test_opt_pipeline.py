@@ -16,6 +16,7 @@ import torch
 
 from tests.harness import opt_pipeline
 
+from helion_mlir_backend._compiler.helion_transforms import align_operand_rows
 from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
@@ -318,6 +319,43 @@ def test_lower_transposes_widens_kept_inner_dims() -> None:
     assert "vector.shuffle" in text
 
 
+# A 32x16 block of bf16 transposed (e.g. a transposed A tile).
+NARROW_TRANSPOSE = """
+func.func @f(%v: vector<32x16xbf16>) -> vector<16x32xbf16> {
+  %t = vector.transpose %v, [1, 0] : vector<32x16xbf16> to vector<16x32xbf16>
+  return %t : vector<16x32xbf16>
+}
+"""
+
+
+def test_lower_transposes_pairs_narrow_elements() -> None:
+    """Row pairs interleaved, then a 16x16 transpose of the i32 pairs: shuffles
+    only."""
+    text = _apply(lower_transposes, NARROW_TRANSPOSE)
+    assert "vector.transpose" not in text
+    assert "vector.bitcast" in text
+    assert "vector.shuffle" in text
+    assert ": bf16 from" not in text
+
+
+# A [K, M] tile of bf16 packed into VNNI pairs [M, K/2, 2] (a transposed A).
+PAIR_PACK_TRANSPOSE = """
+func.func @f(%v: vector<16x2x32xbf16>) -> vector<32x16x2xbf16> {
+  %t = vector.transpose %v, [2, 0, 1] : vector<16x2x32xbf16> to vector<32x16x2xbf16>
+  return %t : vector<32x16x2xbf16>
+}
+"""
+
+
+def test_lower_transposes_merges_adjacent_dims() -> None:
+    """K/2 and the pair stay adjacent: a 32x32 transpose of bf16, lowered to
+    shuffles, not per element."""
+    text = _apply(lower_transposes, PAIR_PACK_TRANSPOSE)
+    assert "vector.transpose" not in text
+    assert "vector.shuffle" in text
+    assert ": bf16 from" not in text
+
+
 # A 16x16x2 block of a strided source: rows of 32 contiguous elements.
 STRIDED_BLOCK_READ = """
 func.func @f(%m: memref<128x1024x2xbf16, strided<[4096, 2, 1]>>) -> vector<16x16x2xbf16> {
@@ -505,6 +543,94 @@ def test_version_padded_operands_sinks_reshaped_static_pad() -> None:
         r"tensor\.pad[\s\S]*?\} : tensor<[^>]*> to (tensor<[^>]*>)", text
     )
     assert padded and set(padded) == {"tensor<64xf32>"}
+
+
+# Register tiles along N reading the same A tile in place, from rows of
+# ``{cols}`` bf16 elements.
+_ROW_TILE_OPERAND = """
+func.func @f(%a: tensor<64x{cols}xbf16>, %b: tensor<32x128xbf16>,
+             %c: tensor<32x128xf32>, %m: index) -> tensor<32x128xf32> {{
+  %c0 = arith.constant 0 : index
+  %c32 = arith.constant 32 : index
+  %c128 = arith.constant 128 : index
+  %r = scf.for %j = %c0 to %c128 step %c32 iter_args(%acc = %c) -> (tensor<32x128xf32>) {{
+    %row = affine.apply affine_map<()[s0] -> (s0 * 32)>()[%m]
+    %s = tensor.extract_slice %a[%row, 0] [32, 32] [1, 1]
+        : tensor<64x{cols}xbf16> to tensor<32x32xbf16>
+    %bs = tensor.extract_slice %b[0, %j] [32, 32] [1, 1]
+        : tensor<32x128xbf16> to tensor<32x32xbf16>
+    %cs = tensor.extract_slice %acc[0, %j] [32, 32] [1, 1]
+        : tensor<32x128xf32> to tensor<32x32xf32>
+    %mm = linalg.matmul ins(%s, %bs : tensor<32x32xbf16>, tensor<32x32xbf16>)
+                        outs(%cs : tensor<32x32xf32>) -> tensor<32x32xf32>
+    %next = tensor.insert_slice %mm into %acc[0, %j] [32, 32] [1, 1]
+        : tensor<32x32xf32> into tensor<32x128xf32>
+    scf.yield %next : tensor<32x128xf32>
+  }}
+  return %r : tensor<32x128xf32>
+}}
+"""
+
+
+def test_align_operand_rows_copies_misaligned_rows_once() -> None:
+    """Rows of 36 bf16 (72 bytes) are copied into an aligned buffer, before
+    the loop over N tiles: once per A tile."""
+    text = _apply(align_operand_rows, _ROW_TILE_OPERAND.format(cols=36))
+    assert "linalg.copy" in text
+    assert text.index("-> (tensor<32x32xbf16>)") < text.index("-> (tensor<32x128xf32>)")
+
+
+def test_align_operand_rows_reads_aligned_rows_in_place() -> None:
+    text = _apply(align_operand_rows, _ROW_TILE_OPERAND.format(cols=64))
+    assert "linalg.copy" not in text
+    # Hoisted all the same: the A tile does not vary along N.
+    assert text.index("tensor.extract_slice %arg0") < text.index("scf.for")
+
+
+# GUARDED_PADDED_OPERAND of a source with misaligned rows (36 bf16).
+GUARDED_MISALIGNED_OPERAND = """
+func.func @f(%a: tensor<64x36xbf16>, %b: tensor<32x32xbf16>, %c: tensor<32x32xf32>,
+             %n: index) -> tensor<32x32xf32> {
+  %c0 = arith.constant 0 : index
+  %zero = arith.constant 0.0 : bf16
+  %empty = arith.cmpi eq, %n, %c0 : index
+  %high = affine.apply affine_map<()[s0] -> (32 - s0)>()[%n]
+  %lhs = scf.if %empty -> (tensor<32x32xbf16>) {
+    %g = tensor.generate {
+    ^bb0(%i: index, %j: index):
+      tensor.yield %zero : bf16
+    } : tensor<32x32xbf16>
+    scf.yield %g : tensor<32x32xbf16>
+  } else {
+    %s = tensor.extract_slice %a[0, 0] [%n, 32] [1, 1] : tensor<64x36xbf16> to tensor<?x32xbf16>
+    %p = tensor.pad %s low[0, 0] high[%high, 0] {
+    ^bb0(%i: index, %j: index):
+      tensor.yield %zero : bf16
+    } : tensor<?x32xbf16> to tensor<32x32xbf16>
+    scf.yield %p : tensor<32x32xbf16>
+  }
+  %r = linalg.matmul ins(%lhs, %b : tensor<32x32xbf16>, tensor<32x32xbf16>)
+                     outs(%c : tensor<32x32xf32>) -> tensor<32x32xf32>
+  return %r : tensor<32x32xf32>
+}
+"""
+
+
+def test_misaligned_padded_operand_is_copied_unversioned() -> None:
+    """Misaligned rows are never read in place: no version, and the guard of
+    the empty slice folds into the row copy (which fills every row)."""
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.parse(GUARDED_MISALIGNED_OPERAND)
+        for make_schedule in (version_padded_operands, materialize_operand_pads):
+            schedule = make_schedule()
+            schedule.body.operations[0].apply(module.operation)
+            module.operation.verify()
+        text = str(module)
+    assert text.count("linalg.matmul") == 1
+    assert "tensor.generate" not in text
+    assert "tensor.pad" not in text
+    assert "tensor.cast" not in text
+    assert "linalg.copy" in text
 
 
 _TILE_A = "!x86.amx.tile<16x32xbf16>"

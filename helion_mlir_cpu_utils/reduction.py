@@ -1,32 +1,38 @@
 """Matrix-vector product (gemv) on Helion's MLIR backend.
 
-Implemented as a matmul against a zero-padded ``B`` rather than a dedicated
-1-D-output reduction kernel: Helion's own gemv-shaped kernel (a single
-``hl.tile`` output dim reducing a full row via ``torch.einsum``) crashes for
-bf16 at LLVM translation -- the register-tiling schedule materializes the
-2-D reduction operand as an ``!llvm.array<N x vector<Mxbf16>>`` stack buffer
-and casts it to a native ``vector<NxMxbf16>`` for ``vector.contract``, and
-that specific array-to-vector cast has no LLVM lowering pattern for bf16.
-Padding ``B`` out to the AMX block width and reusing the proven
-:func:`matmul` kernel sidesteps that broken codegen path entirely and keeps
-real (AMX) vectorization instead of forcing the scalar (non-AMX) pipeline,
-which works but is ~7x slower than this at M=2048,K=8192 bf16 (measured).
-The tradeoff is BLOCK_N-times more FLOPs than a true gemv; still faster than
-the scalar-pipeline workaround, though slower than eager PyTorch's
-memory-bound gemv for this shape.
+A memory-bound row reduction: each tile of rows multiplies its K-wide slices
+by the vector's and sums them, in f32. No matrix unit: a gemv reads every
+element of A once, so its speed is A's bandwidth.
 """
 
 from __future__ import annotations
 
+import helion
+import helion.language as hl
 import torch
 from torch import Tensor
 
-from .matmul import BLOCK_N
-from .matmul import matmul
+
+@helion.kernel(
+    static_shapes=True, backend="mlir", config=helion.Config(block_sizes=[32, 32])
+)
+def _matvec_kernel(a: Tensor, x: Tensor) -> Tensor:
+    """``a @ x`` of ``[M, K]`` and ``[K]``. Products accumulate per K lane, summed
+    once at the end: a sum per K tile vectorizes across rows, reading A by
+    columns."""
+    m, k = a.shape
+    block_k = hl.register_block_size(k)
+    out = torch.empty([m], dtype=a.dtype, device=a.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_k], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            acc = acc + a[tile_m, tile_k].float() * x[tile_k].float()[None, :]
+        out[tile_m] = acc.sum(-1).to(a.dtype)
+    return out
 
 
 def supports_matvec(a: Tensor, b: Tensor) -> bool:
-    """Whether the padded-matmul gemv path can handle this pair of operands."""
+    """Whether :func:`matvec` can handle this pair of operands."""
     if a.dtype != b.dtype or a.dtype not in (torch.float32, torch.bfloat16):
         return False
     if a.device.type != "cpu" or b.device.type != "cpu":
@@ -51,7 +57,5 @@ def matvec(a: Tensor, b: Tensor) -> Tensor:
             "float32 or bfloat16, both on cpu. Check supports_matvec() before "
             "calling, or use torch.matmul directly for unsupported cases."
         )
-    k = a.shape[1]
-    b_padded = torch.zeros(k, BLOCK_N, dtype=b.dtype, device=a.device)
-    b_padded[:, 0] = b[:, 0]
-    return matmul(a, b_padded)[:, :1]
+    m, k = a.shape
+    return _matvec_kernel(a, b.reshape(k)).reshape(m, 1)

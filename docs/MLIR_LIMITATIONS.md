@@ -157,14 +157,22 @@ Current behavior:
   `examples/block_packing_mlir.py`).
 - When every block size divides its loop and the loops stay inside the tensors,
   the IR has only static sizes.
+- A grid tile that may be partial is lowered twice, on an `scf.if` per such dim:
+  a full version with static sizes (no padded loads, no masked stores) and the
+  partial one above. Full tiles of a ragged problem run the same code as an
+  aligned problem.
+- In a partial tile, a zero-padded contraction operand is padded per register
+  tile, not per grid tile (section 15, `version_padded_operands`): register
+  tiles inside the operand read it in place, only the edge one copies its rows
+  into a zero-filled buffer, and one past the operand reads zeros. A 2000x2048x2048
+  bf16 GEMM went from 530 to 413 us (2048x2048x2048: 355 us).
 
 Limits:
 - A tile offset that may point before the start of a tensor (`x[tile.index - 1]`
   style negative offsets from the first tile) is rejected.
-- A padded tile read transposed (`b_t[tn, tk].permute(1, 0)`) keeps a permuted
-  vector read, which the optimizing pipeline does not split: every such tile takes
-  the masked path, which is slower (much slower for bf16 on CPUs without
-  AVX512_BF16, where LLVM scalarizes masked bf16 loads).
+- Register tiles of a partial grid tile past the operand's end still run the
+  contraction (on zeros), and the edge tile's padded copy is redone for every
+  register tile of the other parallel dim.
 
 ## 10) Multi-Output Kernels
 
@@ -303,6 +311,37 @@ pipeline with two stages left out or narrowed:
   compile).
 
 These stages from `_compiler/helion_transforms.py` replace or are added to it:
+- `materialize_operand_pads{packed_only}`, after `linalg-categorize-ops`: a static
+  zero-padded operand read through an operand pack (e.g. B of a partial tile, packed
+  into VNNI) becomes a buffer its source is copied into row by row, each row a 1-D
+  padded read (2-D masked transfers lower through memory; odd-length bf16 rows crashed
+  LLVM). AMX loads operand tiles from memory, not from vectors of masked reads.
+- `isolate_operand_packs`: an operand pack (a static transpose only read by
+  contractions) is tiled on its outer loop by its transpose block (see
+  `vectorize_linalg`): a loop result, which tile-and-fuse does not fuse, so it runs once
+  per contraction, not per register tile.
+- `version_padded_operands` and `materialize_operand_pads`, after the parallel register
+  tile-and-fuse, which fuses a zero-padded operand into each register tile (upstream's
+  pad tiling: a pad of the clamped source slice, guarded by an `scf.if` producing the
+  padding value when the slice is empty). The contraction, and the reshapes it reads the
+  pad through, are moved into both branches of that guard, then branched on the pad's
+  runtime padding being zero: that version reads the source in place (`tensor.cast` to
+  the static shape, valid exactly then). Each version keeps its own contraction, so no
+  `scf.if` yields buffers of different layouts (fully dynamic strides, which AMX tile
+  loads reject). The remaining pads, and the guard's constant tensors, become buffers
+  written row by row (copied or filled per row: a whole-buffer fill was unrolled into
+  one op per vector, a whole constant into one huge vector).
+  A pad of a source whose rows do not start at cache-line multiples (e.g. bf16 A with
+  K = 2949) is not versioned: read in place it would need a copy anyway. Its guard is
+  folded instead: the row copy fills every row, so it yields the guard's constant when
+  the slice is empty.
+- `align_operand_rows`, right after: a contraction input read in place from rows not
+  at cache-line multiples is copied row by row into an aligned buffer (an AMX tile load
+  of a misaligned row touches two lines: +60% on 8192x5888x2949 bf16). Then every
+  contraction input's producer (slice, copy, guarded pad) is hoisted out of the
+  `scf.for` loops it does not vary in, so an A tile is copied once, not once per
+  register tile along N (partial tiles copying A 4x per tile left threads idle at the
+  barrier: 8205x5921x2949 bf16 went from 12.2 ms to 7.9 ms).
 - `pin_transposes`, before the register-level tiling: a static transpose of at most 4096
   elements with no linalg producer or user (a tile moved to another layout, such as
   `b[tk, tn].reshape(16, 2, 32).permute(0, 2, 1)`) is annotated with zero tile sizes,
@@ -331,9 +370,11 @@ These stages from `_compiler/helion_transforms.py` replace or are added to it:
   are tiled by 32 first, and so are bounds above 32 that are not multiples of 32. All
   extents above 32 of any op, static or not, whose vectors would exceed 4096 elements
   are tiled by 32 too (LLVM otherwise spends seconds to minutes on them: a 32-row
-  softmax tile of 1024 columns compiled in about 110 s, now about 1 s). Transposes of
-  rank 3 or more are tiled by 1 on all but their source's two inner dims: LLVM took
-  about 19 s on one 16x2x32 vector transpose, while 2-D ones are a few shuffles. A masked
+  softmax tile of 1024 columns compiled in about 110 s, now about 1 s). A transpose is
+  tiled into blocks that read and write runs of at least 64 bytes on both sides (its
+  source's and result's inner dims as far as needed, 1 elsewhere): a VNNI pack of
+  `[K, N]` into 32-column rows of pairs, one of `[N, K]` into 16x16 blocks of pairs
+  (tiled by 1 on the outer dim, the latter was copied pair by pair). A masked
   add-contraction becomes an unmasked one of
   operands zeroed where masked off (upstream's x86 contraction patterns rewrite inside
   `vector.mask` regions, which the verifier rejects). Ops that cannot be tiled or that
@@ -349,6 +390,28 @@ These stages from `_compiler/helion_transforms.py` replace or are added to it:
   vector dim is not a power of two in bytes (LLVM pads each inner vector), and it loops
   forever on rank-reducing transfers. Transfers with a permutation map (transposed
   tiles) are not split.
+- `lower_transposes`, after `simplify_vector_ops`: vector transposes are decomposed into
+  2-D transposes of elements of at least 32 bits where possible. Source dims that stay
+  adjacent are merged first (packing a transposed A tile `[K/2, 2, M]` into VNNI pairs
+  `[M, K/2, 2]` is a 2-D `[K, M]` transpose). Leading dims kept in
+  place are unrolled; inner dims of at most 64 bits kept in place are one wider integer
+  (a bitcast each way: a 16x16 block of bf16 pairs is a 16x16 i32 transpose); a 2-D
+  transpose of narrower elements is a two-operand shuffle per row pair, each read as one
+  row of wider integers, followed by a transpose of the pairs (a 32x16 bf16 block: 16
+  two-row interleaves and a 16x16 i32 transpose). Wide 2-D transposes are split into
+  16x16 blocks. Otherwise rows read apart were concatenated element by element, and
+  upstream lowered any shape but 16x16 to one shuffle of the flattened vector (the
+  per-tile transposed A pack was ~2600 extract/insert pairs per block: 1.4 ms of a
+  2048x4096x8192 GEMM, now ~0.3 ms).
+  Transposes are then lowered by upstream's `shuffle_16x16` strategy (2-D ones as
+  shuffles, 16x16 ones of 32 bits as AVX-512's unpack/permute sequence) instead of
+  per-element extracts and inserts. Packing `nn.Linear`-style `[N, K]` bf16 weights per
+  tile went from about 330 us to about 20 us per 128x4096x4096 layer.
+- `unroll_transfers`, before `flatten_vector_ops`: transfers of rank above 2 are
+  unrolled to rank 2 (upstream `transfer_to_scf`, fully unrolled), flattened where
+  contiguous, and the rest unrolled to 1-D. `convert-vector-to-scf` otherwise stages an
+  n-D transfer of a strided source through a stack buffer, one inner-dim vector (a
+  bf16 pair) at a time.
 - `legalize_for_llvm`, before the LLVM lowering, rewrites what upstream's lowering
   rejects or gets wrong. 0-d transfers (lowered upstream only on memrefs of unit inner
   stride) and i1 transfers (LLVM packs an i1 vector into bits, while a memref holds
@@ -360,9 +423,10 @@ These stages from `_compiler/helion_transforms.py` replace or are added to it:
 - `hoist_allocas`, after `convert-vector-to-scf` (run ahead of lighthouse's LLVM
   lowering): the stack buffers staging n-D masked transfers are placed in the loops
   holding the transfers, and the LLVM lowering of an `alloca` in a loop grows the
-  stack every iteration. Each moves to the entry of its `omp.parallel` region (one
-  buffer per thread) or function: a packed GEMM with partial K tiles overflowed the
-  OpenMP thread stacks.
+  stack every iteration. Each static one moves out of its outermost loop, to that
+  loop's block (so buffers of exclusive `scf.if` branches don't add up), or to the
+  entry of its `omp.parallel` region (one buffer per thread) or function: a packed
+  GEMM with partial K tiles overflowed the OpenMP thread stacks.
 
 ## 16) Autotuning
 

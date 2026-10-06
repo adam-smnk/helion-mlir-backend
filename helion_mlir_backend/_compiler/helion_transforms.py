@@ -57,6 +57,7 @@ from mlir.dialects import memref
 from mlir.dialects import scf
 from mlir.dialects import tensor
 from mlir.dialects import transform
+from mlir.dialects import ub
 from mlir.dialects import vector
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 from mlir.dialects.transform import structured
@@ -210,15 +211,48 @@ class VectorizePadsOp(HelionTransformDialect.Operation, name="vectorize_pads"):
         return DiagnosedSilenceableFailure.Success
 
 
-def _widen(
-    transpose: vector.TransposeOp, rewriter: transform.TransformRewriter
-) -> None:
-    """``transpose`` as one of wider integers if it keeps inner dims of at most
-    64 bits in place: each group of them is one element."""
-    source_type = ir.VectorType(transpose.vector.type)
-    permutation = list(transpose.permutation)
-    shape, rank = list(source_type.shape), source_type.rank
-    bits = _bits(source_type.element_type)
+# Side of the 2-D transposes of 32-bit elements upstream lowers to shuffles.
+_TRANSPOSE_BLOCK = 16
+
+
+def _transposed(value: ir.Value, permutation: list[int]) -> ir.Value:
+    """``value`` transposed by ``permutation``, as 2-D transposes of elements of
+    at least 32 bits where possible, which LLVM lowers to shuffles: dims that
+    stay adjacent are merged; leading dims kept in place are unrolled; inner
+    dims of at most 64 bits kept in place are one wider integer each; a 2-D
+    transpose of narrower elements is an interleave of row pairs followed by a
+    transpose of the pairs; wide 2-D transposes are split into 16x16 blocks."""
+    vector_type = ir.VectorType(value.type)
+    shape, rank = list(vector_type.shape), vector_type.rank
+    element_type = vector_type.element_type
+    bits = _bits(element_type)
+    if permutation == list(range(rank)):
+        return value
+    result_shape = [shape[dim] for dim in permutation]
+    # Runs of source dims kept adjacent and in order, in result order.
+    groups: list[list[int]] = []
+    for dim in permutation:
+        if groups and groups[-1][-1] + 1 == dim:
+            groups[-1].append(dim)
+        else:
+            groups.append([dim])
+    if len(groups) < rank:
+        order = sorted(range(len(groups)), key=lambda group: groups[group][0])
+        merged = [math.prod(shape[dim] for dim in groups[group]) for group in order]
+        value = vector.ShapeCastOp(ir.VectorType.get(merged, element_type), value)
+        value = _transposed(value.result, [order.index(g) for g in range(len(groups))])
+        return vector.ShapeCastOp(
+            ir.VectorType.get(result_shape, element_type), value
+        ).result
+    if rank > 2 and permutation[0] == 0 and shape[0] > 1:
+        result: ir.Value = ub.PoisonOp(
+            ir.VectorType.get(result_shape, element_type)
+        ).result
+        for index in range(shape[0]):
+            part = vector.ExtractOp(value, [], [index]).result
+            part = _transposed(part, [dim - 1 for dim in permutation[1:]])
+            result = vector.InsertOp(part, result, [], [index]).result
+        return result
     kept, packed = 0, 1
     while (
         kept < rank - 2
@@ -227,37 +261,91 @@ def _widen(
     ):
         packed *= shape[rank - 1 - kept]
         kept += 1
-    if packed == 1 or (packed * bits) & (packed * bits - 1):
-        return
-    lead = shape[: rank - kept]
-    lead_permutation = permutation[: rank - kept]
-    result_lead = [lead[dim] for dim in lead_permutation]
-    element_type = source_type.element_type
-    wide = ir.IntegerType.get_signless(packed * bits)
-    with ir.InsertionPoint(transpose), transpose.location:
+    if packed > 1 and not (packed * bits) & (packed * bits - 1):
+        lead = shape[: rank - kept]
+        result_lead = result_shape[: rank - kept]
+        wide = ir.IntegerType.get_signless(packed * bits)
         value = vector.ShapeCastOp(
-            ir.VectorType.get([*lead, packed], element_type), transpose.vector
+            ir.VectorType.get([*lead, packed], element_type), value
         ).result
         value = vector.BitCastOp(ir.VectorType.get([*lead, 1], wide), value).result
         value = vector.ShapeCastOp(ir.VectorType.get(lead, wide), value).result
-        value = vector.TransposeOp(
-            ir.VectorType.get(result_lead, wide), value, lead_permutation
-        ).result
+        value = _transposed(value, permutation[: rank - kept])
         value = vector.ShapeCastOp(
             ir.VectorType.get([*result_lead, 1], wide), value
         ).result
         value = vector.BitCastOp(
             ir.VectorType.get([*result_lead, packed], element_type), value
         ).result
-        value = vector.ShapeCastOp(transpose.result.type, value).result
+        return vector.ShapeCastOp(
+            ir.VectorType.get(result_shape, element_type), value
+        ).result
+    if rank == 2 and bits < 32 and shape[0] > 2 and shape[0] % 2 == 0:
+        rows, cols = shape
+        # One two-row shuffle per pair, read as wider elements: rows read apart
+        # are never concatenated element by element.
+        interleave = [row * cols + col for col in range(cols) for row in (0, 1)]
+        wide = ir.IntegerType.get_signless(2 * bits)
+        pairs: ir.Value = ub.PoisonOp(ir.VectorType.get([rows // 2, cols], wide)).result
+        for index in range(rows // 2):
+            top = vector.ExtractOp(value, [], [2 * index]).result
+            bottom = vector.ExtractOp(value, [], [2 * index + 1]).result
+            pair = vector.shuffle(top, bottom, interleave)
+            pair = vector.BitCastOp(ir.VectorType.get([cols], wide), pair).result
+            pairs = vector.InsertOp(pair, pairs, [], [index]).result
+        return vector.BitCastOp(
+            ir.VectorType.get(result_shape, element_type),
+            _transposed(pairs, [1, 0]),
+        ).result
+    block = _TRANSPOSE_BLOCK
+    if (
+        rank == 2
+        and bits >= 32
+        and shape != [block, block]
+        and not shape[0] % block
+        and not shape[1] % block
+    ):
+        # Upstream lowers 16x16 blocks to shuffles, larger ones to one huge
+        # shuffle of the flattened vector.
+        result = ub.PoisonOp(ir.VectorType.get(result_shape, element_type)).result
+        block_type = ir.VectorType.get([block, block], element_type)
+        for row in range(0, shape[0], block):
+            for col in range(0, shape[1], block):
+                part = vector.ExtractStridedSliceOp(
+                    block_type, value, [row, col], [block, block], [1, 1]
+                ).result
+                part = _transposed(part, [1, 0])
+                result = vector.InsertStridedSliceOp(
+                    part, result, [col, row], [1, 1]
+                ).result
+        return result
+    return vector.TransposeOp(
+        ir.VectorType.get(result_shape, element_type), value, permutation
+    ).result
+
+
+def _widen(
+    transpose: vector.TransposeOp, rewriter: transform.TransformRewriter
+) -> None:
+    """``transpose`` decomposed by ``_transposed``, if that changes it."""
+    permutation = list(transpose.permutation)
+    with ir.InsertionPoint(transpose), transpose.location:
+        value = _transposed(transpose.vector, permutation)
+    if (
+        isinstance(value, ir.OpResult)
+        and isinstance(value.owner.opview, vector.TransposeOp)
+        and value.owner.opview.vector == transpose.vector
+    ):
+        value.owner.erase()
+        return
     rewriter.replace_op(transpose, [value])
 
 
 @_transform_op(modifies_payload=True)
 class WidenTransposesOp(HelionTransformDialect.Operation, name="widen_transposes"):
-    """Rewrite every ``vector.transpose`` in the target keeping inner dims in
-    place as a transpose of wider elements (see ``_widen``): e.g. 16x16 VNNI
-    pairs of bf16 as a 16x16 transpose of i32, which lowers to shuffles."""
+    """Decompose every ``vector.transpose`` in the target into 2-D transposes of
+    elements of at least 32 bits where possible (see ``_transposed``): e.g. 16x16
+    VNNI pairs of bf16 as a 16x16 transpose of i32, which lowers to shuffles."""
 
     target: ext.Operand[transform.AnyOpType]
 
@@ -491,6 +579,11 @@ def _feeds_contraction(value: ir.Value, packs: bool = True) -> bool:
         ):
             if not _feeds_contraction(owner.results[0], packs):
                 return False
+        elif isinstance(owner, scf.YieldOp) and isinstance(
+            branch := _opview(owner.operation.parent), scf.IfOp
+        ):
+            if not _feeds_contraction(branch.results[use.operand_number], packs):
+                return False
         elif not _is_contraction_input(use):
             return False
     return bool(uses)
@@ -545,8 +638,79 @@ def _materialize_pad(pad: tensor.PadOp, packed_only: bool) -> None:
             copied = tensor.ExpandShapeOp(
                 result_type, copied, groups, [], static_output_shape=shape
             ).result
+    guard = _empty_guard(pad)
     pad.result.replace_all_uses_with(copied)
     pad.operation.erase()
+    if guard is not None:
+        _inline_else(guard)
+
+
+def _constant(value: ir.Value) -> ir.Attribute | None:
+    if isinstance(value, ir.OpResult) and isinstance(
+        value.owner.opview, arith.ConstantOp
+    ):
+        return value.owner.opview.value
+    return None
+
+
+def _yielded_constant(op: tensor.PadOp | tensor.GenerateOp) -> ir.Attribute | None:
+    return _constant(list(op.regions[0].blocks[0].operations)[-1].operands[0])
+
+
+def _empty_guard(pad: tensor.PadOp) -> scf.IfOp | None:
+    """The ``scf.if`` yielding ``pad`` unless a size of the slice it pads is
+    zero, then a tensor of its padding (tiling's guard of a pad's empty
+    slices), else ``None``. Copied row by row (see ``_copy_rows``), the pad
+    yields the same then: every row is filled."""
+    parent = _opview(pad.operation.parent)
+    uses = list(pad.result.uses)
+    if (
+        not isinstance(parent, scf.IfOp)
+        or len(parent.results) != 1
+        or len(uses) != 1
+        or not isinstance(_opview(uses[0].owner), scf.YieldOp)
+        or len(parent.regions[1].blocks) != 1
+        or pad.operation.block != parent.regions[1].blocks[0]
+    ):
+        return None
+    generated = list(parent.regions[0].blocks[0].operations)[-1].operands[0]
+    padding = _yielded_constant(pad)
+    if (
+        padding is None
+        or not isinstance(generated, ir.OpResult)
+        or not isinstance(generated.owner.opview, tensor.GenerateOp)
+        or _yielded_constant(generated.owner.opview) != padding
+    ):
+        return None
+    condition = parent.condition
+    compare = condition.owner.opview if isinstance(condition, ir.OpResult) else None
+    if (
+        not isinstance(compare, arith.CmpIOp)
+        or ir.IntegerAttr(compare.predicate).value != arith.CmpIPredicate.eq
+        or _constant(compare.rhs) != ir.IntegerAttr.get(ir.IndexType.get(), 0)
+    ):
+        return None
+    source = pad.source
+    while isinstance(source, ir.OpResult) and isinstance(
+        source.owner.opview, (tensor.ExpandShapeOp, tensor.CollapseShapeOp)
+    ):
+        source = source.owner.opview.src
+    if not isinstance(source, ir.OpResult) or not isinstance(
+        source.owner.opview, tensor.ExtractSliceOp
+    ):
+        return None
+    if not any(size == compare.lhs for size in source.owner.opview.sizes):
+        return None
+    return parent
+
+
+def _inline_else(branch: scf.IfOp) -> None:
+    """Replace ``branch`` by its else branch."""
+    ops = list(branch.regions[1].blocks[0].operations)
+    for op in ops[:-1]:
+        op.move_before(branch)
+    branch.results[0].replace_all_uses_with(ops[-1].operands[0])
+    branch.operation.erase()
 
 
 def _materialize_generate(generate: tensor.GenerateOp) -> None:
@@ -686,15 +850,23 @@ def _versionable_pad(value: ir.Value, chain: _Chain) -> tensor.PadOp | None:
         not isinstance(pad, tensor.PadOp)
         or not ir.RankedTensorType(pad.result.type).has_static_shape
         or _runtime_padding(pad) is None
+        or _pads_misaligned_rows(pad)
     ):
         return None
     return pad
 
 
+def _pads_misaligned_rows(pad: tensor.PadOp) -> bool:
+    """Whether ``pad`` reads a slice of misaligned rows (see
+    ``_misaligned_rows``): read in place, they would need a copy anyway."""
+    found = _expanded_slice(pad.source, ir.RankedTensorType(pad.result.type).shape)
+    return found is not None and _misaligned_rows(*found[:2])
+
+
 def _sinkable_branch(value: ir.Value, chain: _Chain) -> scf.IfOp | None:
     """The side-effect-free ``scf.if`` defining ``value``, only read by
-    ``chain``, with a branch yielding a pad (e.g. tiling's guard of a pad's
-    empty slices), else ``None``."""
+    ``chain``, with a branch yielding a versionable pad (e.g. tiling's guard of
+    a pad's empty slices), else ``None``."""
     branch = _only_read_by(value, chain)
     if (
         not isinstance(branch, scf.IfOp)
@@ -708,9 +880,12 @@ def _sinkable_branch(value: ir.Value, chain: _Chain) -> scf.IfOp | None:
         if not all(op.name.startswith(_PURE_DIALECTS) for op in ops[:-1]):
             return None
         yielded = ops[-1].operands[0]
-        padded |= isinstance(yielded, ir.OpResult) and isinstance(
+        if isinstance(yielded, ir.OpResult) and isinstance(
             yielded.owner.opview, tensor.PadOp
-        )
+        ):
+            if _pads_misaligned_rows(yielded.owner.opview):
+                return None
+            padded = True
     return branch if padded else None
 
 
@@ -829,6 +1004,194 @@ class VersionPaddedOperandsOp(
         ]
         for contraction in contractions:
             _version_operands(contraction)
+        return DiagnosedSilenceableFailure.Success
+
+
+# Bytes of a cache line: rows of operand tiles read in place start at multiples.
+_LINE_BYTES = 64
+
+
+def _misaligned_rows(slice_op: tensor.ExtractSliceOp, sizes: Sequence[int]) -> bool:
+    """Whether ``slice_op``, of static ``sizes``, reads rows not starting at
+    cache-line multiples of each other: the stride of a dim outside the
+    slice's contiguous inner run, in the static tensor it slices (through
+    slices) stored row-major, is not a multiple of a cache line."""
+    source = slice_op.source
+    while isinstance(source, ir.OpResult) and isinstance(
+        source.owner.opview, tensor.ExtractSliceOp
+    ):
+        source = source.owner.opview.source
+    source_type = ir.RankedTensorType(source.type)
+    if not source_type.has_static_shape or source_type.rank != len(sizes):
+        return False
+    source_shape = source_type.shape
+    bits = _bits(source_type.element_type)
+    run = len(sizes) - 1
+    while run > 0 and sizes[run] == source_shape[run]:
+        run -= 1
+    stride = math.prod(source_shape[run:])
+    for dim in range(run - 1, -1, -1):
+        if sizes[dim] > 1 and stride * bits // 8 % _LINE_BYTES:
+            return True
+        stride *= source_shape[dim]
+    return False
+
+
+def _within(op: ir.Operation, ancestor: ir.Operation) -> bool:
+    ancestor = ancestor.operation
+    while op is not None:
+        if op.operation == ancestor:
+            return True
+        op = op.parent
+    return False
+
+
+def _defined_within(value: ir.Value, ancestor: ir.Operation) -> bool:
+    owner = value.owner if isinstance(value, ir.OpResult) else value.owner.owner
+    return _within(owner, ancestor)
+
+
+# Ops without memory effects on tensors, with those nested in them.
+_HOISTABLE = (
+    "tensor.",
+    "arith.",
+    "affine.",
+    "linalg.",
+    "scf.for",
+    "scf.if",
+    "scf.yield",
+)
+
+
+def _nested_ops(op: ir.Operation) -> Iterator[ir.Operation]:
+    yield op
+    for region in op.regions:
+        for block in region.blocks:
+            for inner in block.operations:
+                yield from _nested_ops(inner.operation)
+
+
+def _invariant_ops(
+    op: ir.Operation, loop: ir.Operation, ops: list[ir.Operation]
+) -> bool:
+    """Add ``op``, of ``loop``'s body, and the ops of its body it reads to
+    ``ops``, producers first, if none has memory effects or reads the loop's
+    induction variable or iteration arguments."""
+    if any(op == found for found in ops):
+        return True
+    for inner in _nested_ops(op):
+        if not inner.name.startswith(_HOISTABLE) or any(
+            isinstance(value.type, ir.MemRefType) for value in inner.operands
+        ):
+            return False
+        for value in inner.operands:
+            if not _defined_within(value, loop) or _defined_within(value, op):
+                continue
+            if (
+                not isinstance(value, ir.OpResult)
+                or value.owner.operation.parent.operation != loop.operation
+                or not _invariant_ops(value.owner.operation, loop, ops)
+            ):
+                return False
+    ops.append(op)
+    return True
+
+
+def _hoist(value: ir.Value) -> None:
+    """Move the op defining ``value``, with the ops it reads, out of the
+    ``scf.for`` loops it does not vary in (e.g. an operand tile's copy out of
+    the loop over the tiles of the other operand)."""
+    while isinstance(value, ir.OpResult):
+        loop = value.owner.operation.parent
+        ops: list[ir.Operation] = []
+        if (
+            loop is None
+            or loop.name != "scf.for"
+            or not _invariant_ops(value.owner.operation, loop, ops)
+        ):
+            return
+        for op in ops:
+            op.move_before(loop)
+
+
+def _expanded_slice(
+    value: ir.Value, shape: Sequence[int]
+) -> tuple[tensor.ExtractSliceOp, list[int], ir.OpView | None] | None:
+    """The slice ``value`` of static ``shape`` is, through casts and expanded
+    shapes; the slice's static shape and the op reading it on the way (``None``
+    if ``value`` is the slice), else ``None``."""
+    shape, user = list(shape), None
+    while isinstance(value, ir.OpResult):
+        op = value.owner.opview
+        if isinstance(op, tensor.ExtractSliceOp):
+            return op, shape, user
+        if isinstance(op, tensor.CastOp):
+            value = op.source
+        elif isinstance(op, tensor.ExpandShapeOp):
+            shape = [
+                math.prod(
+                    shape[ir.IntegerAttr(dim).value] for dim in ir.ArrayAttr(group)
+                )
+                for group in ir.ArrayAttr(op.reassociation)
+            ]
+            value = op.src
+        else:
+            return None
+        user = op
+    return None
+
+
+def _align_rows(contraction: ir.OpView) -> None:
+    """Copy each input of ``contraction`` read in place, through reshapes and
+    casts to a static shape, as a slice of misaligned rows into a buffer of
+    its own, row by row."""
+    for index in range(len(contraction.operands) - len(contraction.results)):
+        chain, value = _operand_chain(contraction, index)
+        if not isinstance(value.type, ir.RankedTensorType):
+            continue
+        value_type = ir.RankedTensorType(value.type)
+        if not value_type.has_static_shape:
+            continue
+        found = _expanded_slice(value, value_type.shape)
+        if found is None or not _misaligned_rows(*found[:2]):
+            continue
+        slice_op, shape, user = found
+        reader, operand = chain[0] if user is None else (user, 0)
+        with ir.InsertionPoint(reader), slice_op.location:
+            element_type = value_type.element_type
+            sliced = slice_op.result
+            static_type = ir.RankedTensorType.get(shape, element_type)
+            if sliced.type != static_type:
+                sliced = tensor.CastOp(static_type, sliced).result
+            empty = tensor.EmptyOp(shape, element_type).result
+            copied = _copy_rows(sliced, empty, shape)
+            if copied.type != slice_op.result.type:
+                copied = tensor.CastOp(slice_op.result.type, copied).result
+        reader.operation.operands[operand] = copied
+
+
+@_transform_op(modifies_payload=True)
+class AlignOperandRowsOp(HelionTransformDialect.Operation, name="align_operand_rows"):
+    """Give every contraction input in the target read in place from rows that
+    do not start at cache-line multiples (e.g. a bf16 A of odd K) a copy with
+    aligned rows (see ``_align_rows``): AMX tile loads of misaligned rows
+    touch two cache lines per row. Then hoist every contraction input out of
+    the loops it does not vary in (see ``_hoist``), so each copy is reused."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "AlignOperandRowsOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for found in _payload_ops(state, op.target, ir.OpView):
+            if _is_linalg(found) and linalg.isa_contraction_op(found):
+                _align_rows(found)
+                for index in range(len(found.operands) - len(found.results)):
+                    _hoist(_operand_chain(found, index)[1])
         return DiagnosedSilenceableFailure.Success
 
 
@@ -1884,6 +2247,18 @@ def version_padded_operands() -> ir.Module:
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
         VersionPaddedOperandsOp(target=funcs)
+        lh_transform.cleanup(named_seq.bodyTarget)
+        transform.yield_()
+    return schedule
+
+
+def align_operand_rows() -> ir.Module:
+    """Schedule: copy contraction inputs read in place from misaligned rows
+    into buffers of aligned rows."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        AlignOperandRowsOp(target=funcs)
         lh_transform.cleanup(named_seq.bodyTarget)
         transform.yield_()
     return schedule

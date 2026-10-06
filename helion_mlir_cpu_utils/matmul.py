@@ -1,28 +1,28 @@
-"""Blocked (mmt4d-style) matmul on Helion's MLIR backend.
+"""Matmul on Helion's MLIR backend: AMX-friendly kernels with fused epilogues.
 
-The contraction runs on operands in the block layout the AMX lowering expects:
+bf16 runs :func:`_matmul_fused_pack`: each output tile packs the B chunk it
+needs per K step (``[K, N]`` or, with ``trans_b``, ``[N, K]``) into AMX's VNNI
+layout in a private buffer; A is read in place or, with ``trans_a`` (``[K, M]``),
+packed per tile too. Partial edge tiles are padded by the compiler; full tiles
+run unpadded.
+:func:`matmul_prepacked_b` with a weight packed once by :func:`pack_b_vnni_t`
+skips the per-call pack: AMX reads both operands in place.
+
+Other cases (f32) pack both operands into the blocked (mmt4d-style)
+layout and run :func:`_matmul_blocked_kernel`:
 
     A = [M/BM, K/BK, BM, BK]
     B = [N/BN, K/BK, BK, BN]
     C = [M/BM, BM, N/BN, BN]   <- a free view of row-major [M, N]
 
-Packing is *not* hoisted out of :func:`matmul`: both operands are packed on every
-call, so the work matches what an eager ``torch.matmul`` does with plain
-row-major inputs. Each packing kernel copies one 32x32 block per loop iteration
-and pads in the same pass: a load past the end of the operand reads zeros.
-:func:`pack_b_blocked_vnni` stores B's blocks in the VNNI layout of AMX's bf16
-tiles instead. Row-major bf16 operands skip the separate packing:
-:func:`_matmul_fused_pack` packs B per output tile and pads only partial
-edge tiles.
+Each packing kernel copies one 32x32 block per loop iteration and pads in the
+same pass: a load past the end of the operand reads zeros. Storing C as
+``[M/BM, BM, N/BN, BN]`` removes a separate unpack pass.
 
-Storing C as ``[M/BM, BM, N/BN, BN]`` rather than ``[M/BM, N/BN, BM, BN]`` is
-what removes the separate unpack pass -- the result is reinterpreted as
-``[M, N]`` by a metadata-only view.
-
-An optional bias and epilogue are fused into the accumulator before the store
-(see ``linear_bf16_blocked_mlir`` in ``benchmarks/helion_mlp_bf16.py`` for the pattern this
-follows), so a fused linear+activation costs one kernel instead of a matmul
-kernel followed by a separate elementwise kernel.
+Packing is *not* hoisted out of :func:`matmul`: the work matches what an eager
+``torch.matmul`` does with plain row-major inputs. An optional bias and epilogue
+are fused into the accumulator before the store, so a fused linear+activation
+costs one kernel instead of a matmul kernel followed by an elementwise one.
 """
 
 from __future__ import annotations
@@ -40,6 +40,8 @@ from torch import Tensor
 import helion_mlir_backend  # noqa: F401
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from helion.runtime.kernel import BoundKernel
 
 # AMX bf16 register tile. All three extents must divide by this to use the
@@ -210,83 +212,31 @@ def _matmul_blocked_kernel_bias(
     return out
 
 
-def _matmul_vnni(
-    a4: Tensor, b4: Tensor, epilogue: Callable[[Tensor], Tensor]
+def _chunk_dot(
+    a: Tensor,
+    b: Tensor,
+    tile_m: object,
+    tile_n: object,
+    tile_k: object,
+    trans_a: bool,
+    trans_b: bool,
 ) -> Tensor:
-    """``[MB, BM, K/2, 2] x [NB, K/2, BN, 2] -> [MB, BM, NB, BN]``, epilogue fused in.
-
-    ``a4`` is a free view of row-major A: AMX loads its tiles with A's row stride.
-    ``b4`` is B in VNNI panels, the layout of AMX's bf16 B tiles.
-    """
-    blocks_m, block_m, pairs, vnni = a4.shape
-    blocks_n, pairs2, block_n, vnni2 = b4.shape
-    assert pairs == pairs2, "K mismatch"
-    assert vnni == vnni2, "VNNI factor mismatch"
-
-    out = torch.empty(
-        (blocks_m, block_m, blocks_n, block_n),
-        dtype=a4.dtype,
-        device=a4.device,
-    )
-    for tile_blocks_m, tile_blocks_n in hl.tile([blocks_m, blocks_n]):
-        acc = hl.zeros(
-            [tile_blocks_m, tile_blocks_n, block_m, block_n], dtype=torch.float32
-        )
-        acc = acc + torch.einsum(
-            "amcv,bcnv->abmn",
-            a4[tile_blocks_m, :, :, :],
-            b4[tile_blocks_n, :, :, :],
-        )
-        y = epilogue(acc)
-        out[tile_blocks_m, :, tile_blocks_n, :] = y.permute(0, 2, 1, 3).to(a4.dtype)
-    return out
-
-
-_VNNI_KERNELS: dict[tuple[int, int], helion.Kernel] = {}
-
-
-def _largest_divisor_at_most(extent: int, limit: int) -> int:
-    return max(d for d in range(1, max(1, min(extent, limit)) + 1) if extent % d == 0)
-
-
-def _vnni_tiles(blocks_m: int, blocks_n: int) -> tuple[int, int]:
-    """Output tile, in 32x32 blocks: about one tile per thread, few columns each.
-
-    Every core packing and then reading the same B panels keeps those panels out
-    of other cores' caches: B packed into lines that many cores read in the
-    previous call costs several times more (invalidations) than the GEMM saves.
-    """
-    threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
-    tile_n = _largest_divisor_at_most(blocks_n, 4)
-    per_thread = max(1, blocks_m * (blocks_n // tile_n) // max(1, threads))
-    return _largest_divisor_at_most(blocks_m, per_thread), tile_n
-
-
-def _matmul_vnni_kernel(blocks_m: int, blocks_n: int) -> helion.Kernel:
-    tiles = _vnni_tiles(blocks_m, blocks_n)
-    if tiles not in _VNNI_KERNELS:
-        _VNNI_KERNELS[tiles] = helion.kernel(
-            _matmul_vnni,
-            static_shapes=True,
-            backend="mlir",
-            config=helion.Config(block_sizes=list(tiles)),
-        )
-    return _VNNI_KERNELS[tiles]
-
-
-def _vnni_dot(a: Tensor, b: Tensor) -> Tensor:
-    """``a @ b`` of ``[M, K]`` and ``[K, N]`` tiles, ``b`` packed into the VNNI
-    layout of AMX's bf16 B tiles (``[K/2, N, 2]``)."""
-    a3 = a.reshape(a.size(0), a.size(1) // 2, 2)
-    b3 = b.reshape(b.size(0) // 2, 2, b.size(1)).permute(0, 2, 1)
-    return torch.einsum("mcv,cnv->mn", a3, b3)
-
-
-def _vnni_dot_t(a: Tensor, b_t: Tensor) -> Tensor:
-    """``a @ b_t.T`` of ``[M, K]`` and ``[N, K]`` tiles, ``b_t`` packed into the
-    VNNI layout of AMX's bf16 B tiles (``[K/2, N, 2]``)."""
-    a3 = a.reshape(a.size(0), a.size(1) // 2, 2)
-    b3 = b_t.reshape(b_t.size(0), b_t.size(1) // 2, 2).permute(1, 0, 2)
+    """``a @ b`` of bf16 ``[M, K]`` and ``[K, N]`` (``a`` ``[K, M]`` with
+    ``trans_a``, ``b`` ``[N, K]`` with ``trans_b``) on one tile and K chunk,
+    each operand packed into the VNNI layout of AMX tiles: ``[M, K/2, 2]``
+    and ``[K/2, N, 2]``."""
+    if trans_a:
+        a_tile = a[tile_k, tile_m]
+        a3 = a_tile.reshape(a_tile.size(0) // 2, 2, a_tile.size(1)).permute(2, 0, 1)
+    else:
+        a_tile = a[tile_m, tile_k]
+        a3 = a_tile.reshape(a_tile.size(0), a_tile.size(1) // 2, 2)
+    if trans_b:
+        b_tile = b[tile_n, tile_k]
+        b3 = b_tile.reshape(b_tile.size(0), b_tile.size(1) // 2, 2).permute(1, 0, 2)
+    else:
+        b_tile = b[tile_k, tile_n]
+        b3 = b_tile.reshape(b_tile.size(0) // 2, 2, b_tile.size(1)).permute(0, 2, 1)
     return torch.einsum("mcv,cnv->mn", a3, b3)
 
 
@@ -297,53 +247,58 @@ def _matmul_fused_pack(
     epilogue: Callable[[Tensor], Tensor],
     k_chunked: hl.constexpr,
     k_even: hl.constexpr,
+    trans_a: hl.constexpr,
     trans_b: hl.constexpr,
+    out: Tensor | None = None,
 ) -> Tensor:
-    """``epilogue(a @ b + bias)`` of row-major ``[M, K]`` and ``[K, N]`` (``[N, K]``
-    with ``trans_b``); ``bias`` is ``[N]`` or ``None``.
+    """``epilogue(a @ b + bias)`` of bf16 row-major ``[M, K]`` and ``[K, N]``
+    (``[K, M]`` with ``trans_a``, ``[N, K]`` with ``trans_b``); ``bias`` is
+    ``[N]`` or ``None``; written into ``out`` if given.
 
-    Each output tile packs the VNNI B chunk it needs per K step into a private
-    buffer and reuses it for all its rows: packed B never leaves the core
-    (a separate pack kernel's output is read by many cores, and rewriting
-    those lines on the next call costs more than the GEMM saves).
+    Each output tile packs the chunks it needs per K step into AMX's layouts,
+    in private buffers: B's chunk always (VNNI), reused for all its rows; A's
+    with ``trans_a``, reused for all its columns. Packed operands never leave
+    the core (a separate pack kernel's output is read by many cores, and
+    rewriting those lines on the next call costs more than the GEMM saves).
 
     Tiles past the end of M or N are partial (zero-padded loads, masked
     stores); the compiler runs full tiles without padding. K runs in chunks up
     to ``k_chunked``, one chunk of the rest up to ``k_even`` (a multiple of 64:
     whole AMX steps), then a partial chunk of 64 for the remaining columns.
     """
-    m, k = a.shape
+    if trans_a:
+        k, m = a.shape
+    else:
+        m, k = a.shape
     if trans_b:
         n, k2 = b.shape
     else:
         k2, n = b.shape
     assert k == k2, "K mismatch"
 
-    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    if out is None:
+        result = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    else:
+        result = out
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k_chunked):
-            if trans_b:
-                acc = acc + _vnni_dot_t(a[tile_m, tile_k], b[tile_n, tile_k])
-            else:
-                acc = acc + _vnni_dot(a[tile_m, tile_k], b[tile_k, tile_n])
+            acc = acc + _chunk_dot(a, b, tile_m, tile_n, tile_k, trans_a, trans_b)
         if k_even > k_chunked:
             for tile_rest in hl.tile(k_chunked, k_even):
-                if trans_b:
-                    acc = acc + _vnni_dot_t(a[tile_m, tile_rest], b[tile_n, tile_rest])
-                else:
-                    acc = acc + _vnni_dot(a[tile_m, tile_rest], b[tile_rest, tile_n])
+                acc = acc + _chunk_dot(
+                    a, b, tile_m, tile_n, tile_rest, trans_a, trans_b
+                )
         if k > k_even:
             # A tile as wide as the loop; past K, both operands read zeros.
             for tile_tail in hl.tile(k_even, k_even + 64, block_size=64):
-                if trans_b:
-                    acc = acc + _vnni_dot_t(a[tile_m, tile_tail], b[tile_n, tile_tail])
-                else:
-                    acc = acc + _vnni_dot(a[tile_m, tile_tail], b[tile_tail, tile_n])
+                acc = acc + _chunk_dot(
+                    a, b, tile_m, tile_n, tile_tail, trans_a, trans_b
+                )
         if bias is not None:
             acc = acc + bias[tile_n]
-        out[tile_m, tile_n] = epilogue(acc).to(a.dtype)
-    return out
+        result[tile_m, tile_n] = epilogue(acc).to(a.dtype)
+    return result
 
 
 _FUSED_PACK_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
@@ -352,26 +307,53 @@ _FUSED_PACK_BOUND: OrderedDict[
     tuple[object, ...], tuple[BoundKernel, tuple[hl.constexpr, ...]]
 ] = OrderedDict()
 _FUSED_PACK_BOUND_SIZE = 64
-# K elements per chunk: the packed B chunk of a 128-column tile stays within 512 KiB.
+# K elements per chunk of a 128-column tile: its packed B chunk stays within 512 KiB.
 _MAX_K_CHUNK = 2048
+# K elements of a 128-column tile run as one chunk (768 KiB of packed B).
+_MAX_K_SINGLE = 3072
+# bf16 elements of a cache line.
+_LINE_ELEMENTS = 32
 # Rows of a tile below which packing its B chunks costs more than sharing them.
 _MIN_SHARED_ROWS = 256
 # Columns of a VNNI panel of :func:`pack_b_vnni_t` (literal in its pack kernel).
 _VNNI_PANEL = 64
 
 
-def _fused_pack_tiles(m: int, n: int, k: int) -> tuple[list[int], int, int]:
+def _fused_pack_tiles(
+    m: int,
+    n: int,
+    k: int,
+    trans_a: bool = False,
+    tiles: Sequence[int] | None = None,
+) -> tuple[list[int], int, int]:
     """Block sizes of :func:`_matmul_fused_pack` (rows, columns, K chunk, rest
-    chunk), and its ``k_chunked`` and ``k_even``.
+    chunk), and its ``k_chunked`` and ``k_even``; ``tiles`` (rows, columns, K
+    chunk) overrides the choice below.
 
     Tiles are columns of up to 128 (fewest B chunk packs), as tall as one tile
     per thread allows (512x128 best at 2K, 2048x128 at 4K); narrower columns
-    when that leaves tiles of fewer than ``_MIN_SHARED_ROWS`` rows. The f32 accumulator
-    stays within 1 MiB, the stack promotion limit of ``pipeline.yaml``: heap
-    buffers per tile cost malloc and page faults. K runs in the fewest chunks of
-    at most ``_MAX_K_CHUNK``, and of at most 1 MiB of A when the last row of
-    tiles is partial (its A chunks are copied into padded buffers).
+    when that leaves tiles of fewer than ``_MIN_SHARED_ROWS`` rows. With
+    ``trans_a``, A chunks are packed per tile too: columns widen until tiles
+    are about square, which balances the two packs. Rows of tiles are evened
+    out: a ragged M leaves no near-empty last row of tiles, which would run
+    whole register tiles of padding. The f32 accumulator stays within 1 MiB,
+    the stack promotion limit of ``pipeline.yaml``: heap buffers per tile cost
+    malloc and page faults. K runs in the fewest chunks whose packed operands
+    stay within 512 KiB each.
     """
+    k_even = k // (2 * BLOCK_K) * 2 * BLOCK_K
+    if tiles is not None:
+        tile_m, tile_n, tile_k = tiles
+    else:
+        tile_m, tile_n, tile_k = _fused_pack_heuristic(m, n, k, k_even, trans_a)
+    k_chunked = k_even // tile_k * tile_k
+    rest = max(k_even - k_chunked, 2 * BLOCK_K)
+    return [tile_m, tile_n, tile_k, rest], k_chunked, k_even
+
+
+def _fused_pack_heuristic(
+    m: int, n: int, k: int, k_even: int, trans_a: bool
+) -> tuple[int, int, int]:
     threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
 
     def rows(tile_n: int) -> tuple[int, int]:
@@ -389,15 +371,46 @@ def _fused_pack_tiles(m: int, n: int, k: int) -> tuple[list[int], int, int]:
     while tiles_m > 1 and tile_m < _MIN_SHARED_ROWS and tile_n > BLOCK_N:
         tile_n //= 2
         tiles_m, tile_m = rows(tile_n)
-    max_chunk = _MAX_K_CHUNK
-    if m % tile_m:
-        max_chunk = min(max_chunk, max((1 << 19) // tile_m // 64 * 64, 64))
-    k_even = k // (2 * BLOCK_K) * 2 * BLOCK_K
+    while trans_a and tile_n < tile_m and 2 * tile_n <= n:
+        tile_n *= 2
+        tiles_m, tile_m = rows(tile_n)
+    tile_m = _balanced_rows(m, -(-n // tile_n), tile_m, threads)
+    # A single-chunk K loop is what the AMX rewrite of a one-register-tile
+    # accumulator handles.
+    packed = max(tile_n, tile_m if trans_a else 0)
+    max_chunk = _MAX_K_CHUNK * 4 * BLOCK_N // packed
+    # A read in place from aligned rows: one chunk while its packed B fits
+    # 768 KiB (8192x5888x2944: 16% faster than two; 4096^3: 16% slower).
+    if (
+        not trans_a
+        and not k % _LINE_ELEMENTS
+        and k_even <= _MAX_K_SINGLE * 4 * BLOCK_N // tile_n
+    ):
+        max_chunk = max(max_chunk, k_even)
     chunks = -(-k_even // max_chunk)
     tile_k = _round_up(-(-k_even // chunks), 2 * BLOCK_K)
-    k_chunked = k_even // tile_k * tile_k
-    rest = max(k_even - k_chunked, 2 * BLOCK_K)
-    return [tile_m, tile_n, tile_k, rest], k_chunked, k_even
+    return tile_m, tile_n, tile_k
+
+
+def _balanced_rows(m: int, cols: int, tile_m: int, threads: int) -> int:
+    """Rows of tiles at most ``tile_m`` (and, if it is, at least
+    ``_MIN_SHARED_ROWS``) whose busiest thread computes the fewest rows: tiles
+    in waves of ``threads``, the last wave as long as the others. Ties go to
+    the fewest tiles. E.g. 8205 rows by 47 columns of tiles on 64 threads:
+    8 rows of tiles of 1056 (6 waves), not 5 of 1664 (4 waves, 8% slower)."""
+    fewest = -(-m // tile_m)
+    smallest = min(_MIN_SHARED_ROWS, tile_m)
+
+    def rows(count: int) -> int:
+        return _round_up(-(-m // count), BLOCK_M)
+
+    counts = [
+        count for count in range(fewest, 4 * fewest + 1) if rows(count) >= smallest
+    ]
+    best = min(
+        counts, key=lambda count: (-(-count * cols // threads) * rows(count), count)
+    )
+    return rows(best)
 
 
 def _matmul_fused_pack_bound(
@@ -405,30 +418,51 @@ def _matmul_fused_pack_bound(
     b: Tensor,
     bias: Tensor | None,
     epilogue: Callable[[Tensor], Tensor],
+    trans_a: bool,
     trans_b: bool,
+    out: Tensor | None = None,
+    tiles: Sequence[int] | None = None,
 ) -> tuple[BoundKernel, tuple[hl.constexpr, ...]]:
-    """The fused-pack kernel bound to contiguous ``a``, ``b``, ``bias`` and
-    ``epilogue``, with its constexpr arguments.
+    """The fused-pack kernel bound to contiguous ``a``, ``b``, ``bias``,
+    ``epilogue`` and ``out``, with its constexpr arguments; ``tiles`` as in
+    :func:`_fused_pack_tiles`.
 
     Cached by problem size and epilogue: the tile choice and Helion's
     specialization lookup (no fast path for callable arguments) cost tens of
     microseconds per call.
     """
-    (m, k), n = a.shape, b.shape[0] if trans_b else b.shape[1]
-    key = (m, n, k, trans_b, bias is None, os.environ.get("OMP_NUM_THREADS"), epilogue)
+    m, k = a.shape[::-1] if trans_a else a.shape
+    n = b.shape[0] if trans_b else b.shape[1]
+    key = (
+        m,
+        n,
+        k,
+        trans_a,
+        trans_b,
+        bias is None,
+        out is None,
+        None if tiles is None else tuple(tiles),
+        os.environ.get("OMP_NUM_THREADS"),
+        epilogue,
+    )
     if (cached := _FUSED_PACK_BOUND.get(key)) is not None:
         _FUSED_PACK_BOUND.move_to_end(key)
         return cached
-    block_sizes, k_chunked, k_even = _fused_pack_tiles(m, n, k)
-    if (tiles := tuple(block_sizes)) not in _FUSED_PACK_KERNELS:
-        _FUSED_PACK_KERNELS[tiles] = helion.kernel(
+    block_sizes, k_chunked, k_even = _fused_pack_tiles(m, n, k, trans_a, tiles)
+    if (config := tuple(block_sizes)) not in _FUSED_PACK_KERNELS:
+        _FUSED_PACK_KERNELS[config] = helion.kernel(
             _matmul_fused_pack,
             static_shapes=True,
             backend="mlir",
             config=helion.Config(block_sizes=block_sizes),
         )
-    consts = (hl.constexpr(k_chunked), hl.constexpr(k_even), hl.constexpr(trans_b))
-    bound = _FUSED_PACK_KERNELS[tiles].bind((a, b, bias, epilogue, *consts))
+    consts = (
+        hl.constexpr(k_chunked),
+        hl.constexpr(k_even),
+        hl.constexpr(trans_a),
+        hl.constexpr(trans_b),
+    )
+    bound = _FUSED_PACK_KERNELS[config].bind((a, b, bias, epilogue, *consts, out))
     cached = _FUSED_PACK_BOUND[key] = (bound, consts)
     if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
         _FUSED_PACK_BOUND.popitem(last=False)
@@ -716,18 +750,19 @@ def matmul(
     trans_b: bool = False,
     bias: Tensor | None = None,
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
+    block_sizes: Sequence[int] | None = None,
 ) -> Tensor:
     """``epilogue((A.T if trans_a else A) @ (B.T if trans_b else B) + bias)``.
 
-    Packs both operands (and ``bias``, if given) on every call -- no
-    pre-packing. ``bias`` is ``[N]``, broadcast over rows. ``epilogue`` is
-    fused into the same kernel as the contraction (see module docstring),
-    not a separate pass.
-
-    Shapes not divisible by the AMX block size are zero-padded up to the next
-    multiple before packing, then the result is sliced back down -- the extra
-    padded rows/cols/K-elements are all zero, so they don't affect the real
-    output (see :func:`supports`).
+    No pre-packing. bf16 runs the fused kernel (:func:`_matmul_fused_pack`): B
+    is packed per output tile, A read in place (with ``trans_a``, packed per
+    tile too), partial edge tiles handle any shape, and operands smaller than
+    one tile are zero-padded to one; ``block_sizes`` (tile rows, columns, K
+    chunk) overrides its tile choice. Otherwise both
+    operands are packed into 32x32 blocks by separate kernels, zero-padded to
+    block multiples (:func:`_matmul_blocked_kernel`). ``bias`` is ``[N]``,
+    broadcast over rows. ``epilogue`` is fused into the same kernel as the
+    contraction (see module docstring), not a separate pass.
 
     Raises ``ValueError`` if the operands aren't otherwise compatible (mismatched
     dtype/device/rank/contracted-dim -- see :func:`supports`) instead of
@@ -754,36 +789,22 @@ def matmul(
     m_pad = _round_up(m, BLOCK_M)
     n_pad = _round_up(n, BLOCK_N)
     k_pad = _round_up(k, BLOCK_K)
-    # The fused-pack kernel's K steps are pairs of AMX steps of 32.
-    k_fused = _round_up(k, 2 * BLOCK_K)
 
-    if a.dtype == torch.bfloat16 and not trans_a:
+    if a.dtype == torch.bfloat16:
         if min(m, n) >= BLOCK_M and k >= 2 * BLOCK_K:
-            bound, consts = _matmul_fused_pack_bound(a, b, bias, epilogue, trans_b)
+            bound, consts = _matmul_fused_pack_bound(
+                a, b, bias, epilogue, trans_a, trans_b, tiles=block_sizes
+            )
             return bound(a, b, bias, epilogue, *consts)
-        # Smaller than one tile: padded to one.
-        a_p = pad_2d(a, m_pad, k_fused)
+        # Smaller than one tile: padded to one (K to pairs of AMX steps of 32).
+        k_fused = _round_up(k, 2 * BLOCK_K)
+        a_p = pad_2d(a, k_fused, m_pad) if trans_a else pad_2d(a, m_pad, k_fused)
         b_p = pad_2d(b, n_pad, k_fused) if trans_b else pad_2d(b, k_fused, n_pad)
         bias_p = None if bias is None else pad_2d(bias.reshape(1, n), 1, n_pad)[0]
-        bound, consts = _matmul_fused_pack_bound(a_p, b_p, bias_p, epilogue, trans_b)
-        return bound(a_p, b_p, bias_p, epilogue, *consts)[:m, :n]
-
-    if (
-        a.dtype == torch.bfloat16
-        and not trans_a
-        and bias is None
-        and (m, k) == (m_pad, k_fused)
-        and a.is_contiguous()
-    ):
-        b4 = (
-            pack_b_blocked_vnni_t(b, k_pad=k_pad, n_pad=n_pad)
-            if trans_b
-            else pack_b_blocked_vnni(b, k_pad=k_pad, n_pad=n_pad)
+        bound, consts = _matmul_fused_pack_bound(
+            a_p, b_p, bias_p, epilogue, trans_a, trans_b, tiles=block_sizes
         )
-        a4 = a.view(m // BLOCK_M, BLOCK_M, k // 2, 2)
-        b4 = b4.view(n_pad // BLOCK_N, k // 2, BLOCK_N, 2)
-        out4 = _matmul_vnni_kernel(m // BLOCK_M, n_pad // BLOCK_N)(a4, b4, epilogue)
-        return out4.reshape(m, n_pad)[:, :n]
+        return bound(a_p, b_p, bias_p, epilogue, *consts)[:m, :n]
 
     a4 = (
         pack_a_blocked_t(a, m_pad=m_pad, k_pad=k_pad)
@@ -921,7 +942,8 @@ def matmul_prepacked_b_affine(
 
 
 def bmm(a: Tensor, b: Tensor) -> Tensor:
-    """Batched ``A @ B``; each batch slice is packed and contracted independently.
+    """Batched ``A @ B``; each batch slice is contracted by its own fully
+    parallel kernel call (bf16: written in place into the batched result).
 
     A genuine single-kernel batched version (one extra leading tile dimension
     threaded through the pack + contract kernels) was prototyped and measured
@@ -931,4 +953,15 @@ def bmm(a: Tensor, b: Tensor) -> Tensor:
     than launching one fully-parallel kernel per batch slice. Kept as the
     simpler, faster loop.
     """
+    batch, m, k = a.shape
+    n = b.shape[2]
+    if a.dtype == torch.bfloat16 and min(m, n) >= BLOCK_M and k >= 2 * BLOCK_K:
+        a, b = a.contiguous(), b.contiguous()
+        out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+        for i in range(batch):
+            bound, consts = _matmul_fused_pack_bound(
+                a[i], b[i], None, identity_epilogue, False, False, out[i]
+            )
+            bound(a[i], b[i], None, identity_epilogue, *consts, out[i])
+        return out
     return torch.stack([matmul(a[i], b[i]) for i in range(a.shape[0])])

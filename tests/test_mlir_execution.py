@@ -1814,6 +1814,58 @@ class TestPaddedPackingAndMultiPhaseExecution:
             actual.float(), expected.float(), rtol=1e-2, atol=0.5
         )
 
+    @pytest.mark.parametrize("trans_b", [False, True])
+    @pytest.mark.parametrize(
+        "mkn, block_sizes",
+        [
+            ((64, 128, 96), None),
+            ((64, 128, 96), (32, 64, 64)),
+            ((100, 130, 70), None),
+            ((40, 1998, 33), None),
+        ],
+    )
+    def test_matmul_bf16_trans_a(self, mkn, block_sizes, trans_b):
+        """bf16 with A given as ``[K, M]``: packed per tile by the fused kernel,
+        with its tile choice or the given ``block_sizes``."""
+        from helion_mlir_cpu_utils.matmul import matmul
+
+        m, k, n = mkn
+        torch.manual_seed(10)
+        a = torch.randn(m, k, dtype=torch.bfloat16)
+        b = torch.randn(k, n, dtype=torch.bfloat16)
+        actual = matmul(
+            a.T.contiguous(),
+            b.T.contiguous() if trans_b else b,
+            trans_a=True,
+            trans_b=trans_b,
+            block_sizes=block_sizes,
+        )
+        expected = (a.float() @ b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=1e-2, atol=0.5
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_bmm_and_matvec(self, dtype):
+        """bmm writes each batch slice in place; matvec is a row reduction."""
+        from helion_mlir_cpu_utils.matmul import bmm
+        from helion_mlir_cpu_utils.reduction import matvec
+
+        torch.manual_seed(11)
+        a = torch.randn(3, 100, 130, dtype=dtype)
+        b = torch.randn(3, 130, 70, dtype=dtype)
+        atol = 1e-3 if dtype == torch.float32 else 0.5
+        torch.testing.assert_close(
+            bmm(a, b).float(), torch.bmm(a, b).float(), rtol=1e-2, atol=atol
+        )
+        x = torch.randn(130, 1, dtype=dtype)
+        torch.testing.assert_close(
+            matvec(a[0], x).float(),
+            (a[0].float() @ x.float()).to(dtype).float(),
+            rtol=1e-2,
+            atol=atol,
+        )
+
     @pytest.mark.parametrize("linear", [False, True])
     @pytest.mark.parametrize(
         "mkn",

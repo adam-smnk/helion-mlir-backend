@@ -43,6 +43,9 @@ Pipeline:
   ## their padded operands into buffers.
   - schedule: "helion_transforms.py[gen=version_padded_operands]"
   - schedule: "helion_transforms.py[gen=materialize_operand_pads]"
+  ## Operands read in place from rows not at cache-line multiples (e.g. odd K)
+  ## are copied once per register tile into aligned rows.
+  - schedule: "helion_transforms.py[gen=align_operand_rows]"
 
   ## Reduction register tiles: annotate K-like dims and tile ops individually.
   # Tiling clears the pins; operand packs must not be tiled into tiny ops either.
