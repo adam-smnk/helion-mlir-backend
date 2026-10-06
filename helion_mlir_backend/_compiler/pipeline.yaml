@@ -25,6 +25,8 @@ Pipeline:
 
   ## Normalize ops to category.
   - pass: "linalg-categorize-ops"
+  ## Partial tiles' zero-padded operands read through packs are copied into buffers.
+  - schedule: "helion_transforms.py[gen=materialize_operand_pads]{packed_only=True}"
   ## Operand packs (e.g. VNNI B tiles) run once per contraction, not per register tile.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
   - schedule: "helion_transforms.py[gen=isolate_operand_packs]"
@@ -37,6 +39,10 @@ Pipeline:
                                   use_forall=False
                                 }
   - include: cleanup.yaml
+  ## Register tiles padding nothing read operands in place; only edge tiles copy
+  ## their padded operands into buffers.
+  - schedule: "helion_transforms.py[gen=version_padded_operands]"
+  - schedule: "helion_transforms.py[gen=materialize_operand_pads]"
 
   ## Reduction register tiles: annotate K-like dims and tile ops individually.
   # Tiling clears the pins; operand packs must not be tiled into tiny ops either.

@@ -192,6 +192,25 @@ def test_outer_forall_is_normalized() -> None:
     assert "affine_map<(d0) -> (d0 * 8 + 8)>" in text
 
 
+@helion.kernel(backend="mlir", static_shapes=True, config=_cfg(4, 8))
+def scale_2d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        out[tm, tn] = x[tm, tn] * 2.0
+    return out
+
+
+def test_partial_tiles_are_versioned() -> None:
+    """A tile that may be partial is lowered twice per dim: full (static, no
+    padded loads) and partial (Helion's tile mask)."""
+    x = torch.randn(10, 20)
+    torch.testing.assert_close(scale_2d(x), x * 2.0)
+    text = str(generate_mlir(scale_2d, [x]))
+    assert text.count("scf.if") == 3
+    assert "tensor<4x8xf32>" in text
+    assert text.count("tensor.pad") == 3
+
+
 @helion.kernel(backend="mlir", static_shapes=True, config=_cfg(32, 32, 32))
 def f32_matmul_32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()

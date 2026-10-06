@@ -51,3 +51,55 @@ def test_blocked_bf16_matmul_reaches_amx(case: str) -> None:
     assert "x86.amx.tile_mulf" in ops, (
         f"no AMX contraction produced (saw {sorted(ops)})"
     )
+
+
+@pytest.mark.slow
+@pytest.mark.isolated
+def test_partial_tile_pads_only_edge_register_tiles(monkeypatch) -> None:
+    """In a partial M tile, register tiles of full rows read A in place by AMX;
+    only the edge ones copy A rows into a register-tile buffer."""
+    import importlib
+
+    import helion
+    import torch
+
+    mm = importlib.import_module("helion_mlir_cpu_utils.matmul")
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    m, n, k = 232, 64, 128
+    block_sizes, k_chunked, k_even = mm._fused_pack_tiles(m, n, k)
+    tile_m, chunk = block_sizes[0], block_sizes[2]
+    assert m % tile_m > 32  # a partial tile with a full and a partial register tile
+    kernel = helion.kernel(
+        mm._matmul_fused_pack,
+        static_shapes=True,
+        backend="mlir",
+        config=helion.Config(block_sizes=block_sizes),
+    )
+    args = [
+        torch.randn(m, k, dtype=torch.bfloat16),
+        torch.randn(k, n, dtype=torch.bfloat16),
+        mm.identity_epilogue,
+        helion.language.constexpr(k_chunked),
+        helion.language.constexpr(k_even),
+    ]
+    module = inline_module(generate_mlir(kernel, args))
+    features = TargetInfo.host().features + _AMX_FEATURES
+    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
+        driver = BackendDriver(
+            module, "_matmul_fused_pack", result_to_args=False, benchmark=False
+        )
+        driver.add_stage(pipeline_descriptor("opt"))
+        for stage in driver.stages:
+            module = stage.apply(module)
+            module.operation.verify()
+            if "x86.amx.tile_mulf" in str(module):
+                break
+        text = str(module)
+    assert "x86.amx.tile_mulf" in text
+    assert "vector.contract" not in text
+    loads = [line for line in text.splitlines() if "x86.amx.tile_load" in line]
+    # Full register tiles of the partial tile read A, of runtime rows, in place.
+    assert any(f"memref<?x{chunk}xbf16, strided<[{k}, 1]" in line for line in loads)
+    # No copy of the whole partial tile's A panel.
+    assert f"memref<{tile_m}x{chunk}xbf16>" not in text

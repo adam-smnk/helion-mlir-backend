@@ -1814,6 +1814,32 @@ class TestPaddedPackingAndMultiPhaseExecution:
             actual.float(), expected.float(), rtol=1e-2, atol=0.5
         )
 
+    @pytest.mark.parametrize(
+        "mkn",
+        [
+            (40, 100, 50),
+            (600, 130, 1000),
+            (33, 66, 35),
+            (200, 1998, 70),
+            (100, 2001, 130),
+            (20, 50, 40),
+        ],
+    )
+    def test_matmul_bf16_ragged(self, mkn):
+        """bf16 matmuls of unaligned shapes, odd K included: edge tiles shifted
+        back inside the operands, the K tail masked, the epilogue fused."""
+        from helion_mlir_cpu_utils.matmul import matmul
+
+        m, k, n = mkn
+        torch.manual_seed(7)
+        a = torch.randn(m, k, dtype=torch.bfloat16)
+        b = torch.randn(k, n, dtype=torch.bfloat16)
+        actual = matmul(a, b, epilogue=torch.relu)
+        expected = torch.relu(a.float() @ b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=1e-2, atol=0.5
+        )
+
     def test_multiphase_inplace_buffer_preservation(self):
         """Multi-phase kernel preserves Phase 0's zeros in unwritten slice."""
 

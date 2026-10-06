@@ -5,6 +5,7 @@ f32 only: bf16 needs AMX hardware to execute (covered at IR level by test_amx_ir
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import helion
@@ -18,8 +19,10 @@ from tests.harness import opt_pipeline
 from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
+from helion_mlir_backend._compiler.helion_transforms import materialize_operand_pads
 from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
+from helion_mlir_backend._compiler.helion_transforms import version_padded_operands
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -353,6 +356,115 @@ def test_fold_empty_slices_sizes_temporaries_per_register_tile() -> None:
     text = _apply(fold_empty_slices, REGISTER_TILE_TEMPORARY)
     assert "tensor.empty() : tensor<1x32xf32>" in text
     assert "tensor.empty() : tensor<4x32xf32>" not in text
+
+
+# A register tile of a partial tile's padded operand, as tiling fuses the pad: a
+# guard for an empty source slice, else a pad of the slice.
+GUARDED_PADDED_OPERAND = """
+func.func @f(%a: tensor<?x64xf32>, %b: tensor<64x32xf32>, %c: tensor<32x32xf32>,
+             %n: index) -> tensor<32x32xf32> {
+  %c0 = arith.constant 0 : index
+  %zero = arith.constant 0.0 : f32
+  %empty = arith.cmpi eq, %n, %c0 : index
+  %high = affine.apply affine_map<()[s0] -> (32 - s0)>()[%n]
+  %lhs = scf.if %empty -> (tensor<32x64xf32>) {
+    %g = tensor.generate {
+    ^bb0(%i: index, %j: index):
+      tensor.yield %zero : f32
+    } : tensor<32x64xf32>
+    scf.yield %g : tensor<32x64xf32>
+  } else {
+    %s = tensor.extract_slice %a[0, 0] [%n, 64] [1, 1] : tensor<?x64xf32> to tensor<?x64xf32>
+    %p = tensor.pad %s low[0, 0] high[%high, 0] {
+    ^bb0(%i: index, %j: index):
+      tensor.yield %zero : f32
+    } : tensor<?x64xf32> to tensor<32x64xf32>
+    scf.yield %p : tensor<32x64xf32>
+  }
+  %r = linalg.matmul ins(%lhs, %b : tensor<32x64xf32>, tensor<64x32xf32>)
+                     outs(%c : tensor<32x32xf32>) -> tensor<32x32xf32>
+  return %r : tensor<32x32xf32>
+}
+"""
+
+
+def test_version_padded_operands() -> None:
+    """The contraction is sunk into the guard and branched on the pad padding
+    nothing: all padding, the source in place, or the padded source."""
+    text = _apply(version_padded_operands, GUARDED_PADDED_OPERAND)
+    assert text.count("linalg.matmul") == 3
+    assert text.count("scf.if") == 2
+    assert text.count("tensor.pad") == 1
+    assert "tensor.cast" in text or "[32, 64] [1, 1]" in text
+
+
+def test_materialize_versioned_operand_pad_by_rows() -> None:
+    """Only the padded version copies its operand, row by row into a register
+    tile buffer, filling the rows past the source."""
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.parse(GUARDED_PADDED_OPERAND)
+        for make_schedule in (version_padded_operands, materialize_operand_pads):
+            schedule = make_schedule()
+            schedule.body.operations[0].apply(module.operation)
+            module.operation.verify()
+        text = str(module)
+    assert "tensor.pad" not in text
+    assert "tensor.generate" not in text
+    assert "linalg.copy" in text
+    assert "linalg.fill" in text
+    assert text.count("linalg.matmul") == 3
+
+
+# A K-tail register tile: rows padded at runtime, columns statically, read
+# through reshapes (e.g. into VNNI pairs and back).
+GUARDED_TAIL_OPERAND = """
+func.func @f(%a: tensor<?x16xf32>, %b: tensor<64x32xf32>, %c: tensor<32x32xf32>,
+             %n: index) -> tensor<32x32xf32> {
+  %c0 = arith.constant 0 : index
+  %zero = arith.constant 0.0 : f32
+  %empty = arith.cmpi eq, %n, %c0 : index
+  %high = affine.apply affine_map<()[s0] -> (32 - s0)>()[%n]
+  %lhs = scf.if %empty -> (tensor<32x64xf32>) {
+    %g = tensor.generate {
+    ^bb0(%i: index, %j: index):
+      tensor.yield %zero : f32
+    } : tensor<32x64xf32>
+    scf.yield %g : tensor<32x64xf32>
+  } else {
+    %s = tensor.extract_slice %a[0, 0] [%n, 16] [1, 1] : tensor<?x16xf32> to tensor<?x16xf32>
+    %p = tensor.pad %s low[0, 0] high[%high, 48] {
+    ^bb0(%i: index, %j: index):
+      tensor.yield %zero : f32
+    } : tensor<?x16xf32> to tensor<32x64xf32>
+    scf.yield %p : tensor<32x64xf32>
+  }
+  %pairs = tensor.expand_shape %lhs [[0], [1, 2]] output_shape [32, 32, 2]
+      : tensor<32x64xf32> into tensor<32x32x2xf32>
+  %rows = tensor.collapse_shape %pairs [[0], [1, 2]]
+      : tensor<32x32x2xf32> into tensor<32x64xf32>
+  %r = linalg.matmul ins(%rows, %b : tensor<32x64xf32>, tensor<64x32xf32>)
+                     outs(%c : tensor<32x32xf32>) -> tensor<32x32xf32>
+  return %r : tensor<32x32xf32>
+}
+"""
+
+
+def test_version_padded_operands_sinks_reshaped_static_pad() -> None:
+    """A statically padded operand is never read in place, but its guard is
+    sunk so the pad, read through the reshapes, is materialized by rows."""
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.parse(GUARDED_TAIL_OPERAND)
+        for make_schedule in (version_padded_operands, materialize_operand_pads):
+            schedule = make_schedule()
+            schedule.body.operations[0].apply(module.operation)
+            module.operation.verify()
+        text = str(module)
+    assert text.count("linalg.matmul") == 2
+    assert "tensor.cast" not in text
+    padded = re.findall(
+        r"tensor\.pad[\s\S]*?\} : tensor<[^>]*> to (tensor<[^>]*>)", text
+    )
+    assert padded and set(padded) == {"tensor<64xf32>"}
 
 
 _TILE_A = "!x86.amx.tile<16x32xbf16>"

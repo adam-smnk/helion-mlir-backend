@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import helion.language._tracing_ops as tracing_ops
 from mlir.dialects import affine as affine_d
+from mlir.dialects import arith as arith_d
 from mlir.dialects import scf as scf_d
 import mlir.ir as ir
 import torch
@@ -134,21 +135,64 @@ def _emit_forall(
             grid_ids, bounds, forall.induction_variables, strict=True
         ):
             _bind_grid_iv(ctx, block_id, bound, trip_iv)
-        regions = {}
-        for name, shared in zip(names, forall.inner_iter_args, strict=True):
-            regions[name] = _owned_region(ctx, name, shared, owned[name])
-            ctx.tensors.bind(
-                name, emit.extract_slice(shared, *regions[name]), owned[name]
-            )
-        ctx.lower_graph(graph)
+        shared = dict(zip(names, forall.inner_iter_args, strict=True))
+        regions = {
+            name: _owned_region(ctx, name, shared[name], owned[name]) for name in names
+        }
+        region_values = {
+            name: emit.extract_slice(shared[name], *regions[name]) for name in names
+        }
+        partial = [
+            block_id for block_id in grid_ids if block_id in ctx.block_id_to_valid
+        ]
+        values = _lower_tile(ctx, graph, region_values, owned, partial)
         in_parallel = scf_d.InParallelOp()
         with ir.InsertionPoint(in_parallel.block):
-            for name, shared in zip(names, forall.inner_iter_args, strict=True):
-                emit.parallel_insert_slice(
-                    ctx.tensors.value(name), shared, *regions[name]
-                )
+            for name, value in zip(names, values, strict=True):
+                emit.parallel_insert_slice(value, shared[name], *regions[name])
     for name, result in zip(names, forall.results, strict=True):
         ctx.tensors.bind(name, result)
+
+
+def _lower_tile(
+    ctx: BuildContext,
+    graph: torch.fx.Graph,
+    region_values: dict[str, ir.Value],
+    owned: dict[str, dict[int, OwnedDim]],
+    partial: list[int],
+) -> list[ir.Value]:
+    """Lower one forall iteration on ``region_values``, the regions it owns of
+    the tensors it writes; their final values.
+
+    A tile that may be partial along ``partial`` grid dims is versioned on being
+    full, one dim at a time: a full tile is lowered with static sizes (no padded
+    loads or masked stores), only a partial one with Helion's tile mask. Every
+    version works on the same region values, so they stay in place.
+    """
+    if not partial:
+        for name, value in region_values.items():
+            ctx.tensors.bind(name, value, owned[name])
+        ctx.lower_graph(graph)
+        return [ctx.tensors.value(name) for name in region_values]
+    block_id, rest = partial[0], partial[1:]
+    valid = ctx.block_id_to_valid[block_id]
+    tile = ctx.geometry.tile_extent(block_id)
+    is_full = arith_d.cmpi(arith_d.CmpIPredicate.eq, valid, ctx.index_const(tile))
+    if_op = scf_d.IfOp(
+        is_full, [value.type for value in region_values.values()], has_else=True
+    )
+    with ir.InsertionPoint(if_op.then_block):
+        ctx.bind_loop(
+            block_id,
+            ctx.block_id_to_iv[block_id],
+            ctx.block_id_to_bounds[block_id],
+            span=tile,
+        )
+        scf_d.YieldOp(_lower_tile(ctx, graph, region_values, owned, rest))
+    ctx.block_id_to_valid[block_id] = valid
+    with ir.InsertionPoint(if_op.else_block):
+        scf_d.YieldOp(_lower_tile(ctx, graph, region_values, owned, rest))
+    return list(if_op.results)
 
 
 def _emit_sequential(

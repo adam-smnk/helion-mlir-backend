@@ -127,9 +127,9 @@ def _payload_ops(
     return found
 
 
-def _pad_value(pad: tensor.PadOp) -> ir.Value | None:
-    """The pad's constant padding value, usable before the pad, if it has one."""
-    body = pad.region.blocks[0]
+def _pad_value(pad: tensor.PadOp | tensor.GenerateOp) -> ir.Value | None:
+    """The pad's (or generate's) constant value, usable before it, if it has one."""
+    body = pad.regions[0].blocks[0]
     value = list(body.operations)[-1].operands[0]
     if isinstance(value, ir.OpResult) and isinstance(
         value.owner.opview, arith.ConstantOp
@@ -213,7 +213,8 @@ class VectorizePadsOp(HelionTransformDialect.Operation, name="vectorize_pads"):
 @_transform_op(modifies_payload=True)
 class MaterializeCopiesOp(HelionTransformDialect.Operation, name="materialize_copies"):
     """Insert a ``linalg.copy`` into the destination slice of every insert in the
-    target of a static slice of more than ``_MAX_VECTOR_ELEMENTS`` elements."""
+    target of a static slice of more than ``_MAX_VECTOR_ELEMENTS`` elements, and
+    a row-by-row copy for a runtime-shaped slice."""
 
     target: ext.Operand[transform.AnyOpType]
 
@@ -238,12 +239,12 @@ def _materialize_copy(insert: tensor.InsertSliceOp) -> None:
         return
     source_type = ir.RankedTensorType(source.type)
     sizes = list(insert.static_sizes)
-    if (
-        not source_type.has_static_shape
-        or math.prod(source_type.shape) <= _MAX_VECTOR_ELEMENTS
-        or [size for size in sizes if size != 1]
-        != [dim for dim in source_type.shape if dim != 1]
-    ):
+    if not source_type.has_static_shape:
+        _materialize_row_copy(insert, source)
+        return
+    if math.prod(source_type.shape) <= _MAX_VECTOR_ELEMENTS or [
+        size for size in sizes if size != 1
+    ] != [dim for dim in source_type.shape if dim != 1]:
         return
     # Ops of an scf.forall's in_parallel region go before it.
     anchor = insert
@@ -262,6 +263,510 @@ def _materialize_copy(insert: tensor.InsertSliceOp) -> None:
         ).result
         copied = linalg.copy(source, outs=[destination])
     insert.operation.operands[0] = copied
+
+
+def _materialize_row_copy(insert: tensor.InsertSliceOp, source: ir.Value) -> None:
+    """Copy a runtime-shaped ``source`` into the destination slice of
+    ``insert`` row by row (see ``_copy_rows``): a bufferized ``memref.copy``
+    of a strided slice is an element-wise runtime library call."""
+    source_type = ir.RankedTensorType(source.type)
+    if insert.source != source or source_type.rank != len(insert.static_sizes):
+        return
+    anchor = insert
+    if isinstance(insert, tensor.ParallelInsertSliceOp):
+        anchor = insert.operation.parent
+    with ir.InsertionPoint(anchor), insert.location:
+        destination = tensor.ExtractSliceOp(
+            source_type,
+            insert.dest,
+            insert.offsets,
+            insert.sizes,
+            insert.strides,
+            static_offsets=insert.static_offsets,
+            static_sizes=insert.static_sizes,
+            static_strides=insert.static_strides,
+        ).result
+        copied = _copy_rows(source, destination, _sizes(source))
+    insert.operation.operands[0] = copied
+
+
+def _sizes(value: ir.Value) -> list[ir.Value | int]:
+    value_type = ir.RankedTensorType(value.type)
+    index_type = ir.IndexType.get()
+    return [
+        tensor.DimOp(value, arith.ConstantOp(index_type, dim).result).result
+        if value_type.is_dynamic_dim(dim)
+        else value_type.shape[dim]
+        for dim in range(value_type.rank)
+    ]
+
+
+def _copy_rows(
+    source: ir.Value,
+    dest: ir.Value,
+    sizes: list[ir.Value | int],
+    padding: ir.Value | None = None,
+) -> ir.Value:
+    """Copy ``source`` of ``sizes`` into the leading corner of ``dest`` one
+    innermost row at a time: 1-D copies vectorize to plain masked loads and
+    stores, n-D ones to transfers lowered through memory. With ``padding``, every
+    row of the static ``dest`` is written: a row of ``source`` padded past its
+    end, other rows filled."""
+    index_type = ir.IndexType.get()
+    dynamic = ir.ShapedType.get_dynamic_size()
+    rank = len(sizes)
+    cols = sizes[-1]
+    static_cols = cols if isinstance(cols, int) else dynamic
+    dynamic_cols = [] if isinstance(cols, int) else [cols]
+    element_type = ir.RankedTensorType(source.type).element_type
+    row_type = ir.RankedTensorType.get([static_cols], element_type)
+    dest_shape = ir.RankedTensorType(dest.type).shape
+    width = dest_shape[-1]
+    zero = arith.ConstantOp(index_type, 0).result
+    one = arith.ConstantOp(index_type, 1).result
+
+    def constant(size: ir.Value | int) -> ir.Value:
+        return (
+            size
+            if not isinstance(size, int)
+            else arith.ConstantOp(index_type, size).result
+        )
+
+    def write_row(buffer: ir.Value, rows: list[ir.Value]) -> ir.Value:
+        args = (
+            rows,
+            dynamic_cols,
+            [],
+            [dynamic] * len(rows) + [0],
+            [1] * len(rows) + [static_cols],
+            [1] * rank,
+        )
+        source_row = tensor.extract_slice(row_type, source, *args)
+        if padding is None or static_cols == width:
+            dest_row = tensor.extract_slice(row_type, buffer, *args)
+            copied = linalg.copy(source_row, outs=[dest_row])
+            return tensor.insert_slice(copied, buffer, *args)
+        high = arith.SubIOp(
+            arith.ConstantOp(index_type, width).result,
+            tensor.DimOp(source_row, zero).result,
+        ).result
+        padded = tensor.PadOp(
+            ir.RankedTensorType.get([width], element_type),
+            source_row,
+            [],
+            [high],
+            [0],
+            [dynamic],
+        )
+        body = padded.regions[0].blocks.append(index_type)
+        with ir.InsertionPoint(body):
+            tensor.YieldOp(padding)
+        return tensor.insert_slice(padded.result, buffer, *full_row(rows))
+
+    def full_row(rows: list[ir.Value]) -> tuple:
+        return (
+            rows,
+            [],
+            [],
+            [dynamic] * len(rows) + [0],
+            [1] * len(rows) + [width],
+            [1] * rank,
+        )
+
+    def fill_row(buffer: ir.Value, rows: list[ir.Value]) -> ir.Value:
+        dest_row = tensor.extract_slice(
+            ir.RankedTensorType.get([width], element_type), buffer, *full_row(rows)
+        )
+        filled = linalg.fill(padding, outs=[dest_row])
+        return tensor.insert_slice(filled, buffer, *full_row(rows))
+
+    def copy(buffer: ir.Value, rows: list[ir.Value]) -> ir.Value:
+        if len(rows) == rank - 1:
+            inside = None
+            if padding is not None:
+                for row, size, extent in zip(rows, sizes, dest_shape, strict=False):
+                    if size == extent:
+                        continue
+                    row_inside = arith.CmpIOp(
+                        arith.CmpIPredicate.ult, row, constant(size)
+                    ).result
+                    inside = (
+                        row_inside
+                        if inside is None
+                        else arith.AndIOp(inside, row_inside).result
+                    )
+            if inside is None:
+                return write_row(buffer, rows)
+            branch = scf.IfOp(inside, [buffer.type], has_else=True)
+            with ir.InsertionPoint(branch.then_block):
+                scf.YieldOp([write_row(buffer, rows)])
+            with ir.InsertionPoint(branch.else_block):
+                scf.YieldOp([fill_row(buffer, rows)])
+            return branch.results[0]
+        bound = constant(sizes[len(rows)] if padding is None else dest_shape[len(rows)])
+        loop = scf.ForOp(zero, bound, one, [buffer])
+        with ir.InsertionPoint(loop.body):
+            scf.YieldOp(
+                [copy(loop.inner_iter_args[0], [*rows, loop.induction_variable])]
+            )
+        return loop.results[0]
+
+    return copy(dest, [])
+
+
+def _feeds_contraction(value: ir.Value, packs: bool = True) -> bool:
+    """Whether every use of ``value`` reads it, possibly reshaped or, with
+    ``packs``, transposed (e.g. packed), as a contraction input."""
+    uses = list(value.uses)
+    for use in uses:
+        owner = _opview(use.owner)
+        if isinstance(owner, (tensor.ExpandShapeOp, tensor.CollapseShapeOp)) or (
+            packs
+            and _is_linalg(owner)
+            and _is_transpose(owner)
+            and use.operand_number == 0
+        ):
+            if not _feeds_contraction(owner.results[0], packs):
+                return False
+        elif not _is_contraction_input(use):
+            return False
+    return bool(uses)
+
+
+def _materialize_pad(pad: tensor.PadOp, packed_only: bool) -> None:
+    """A static zero-high-padded contraction operand as a filled tensor its
+    source is copied into row by row: kernels like AMX load operand tiles from
+    memory, not from vectors of masked reads. With ``packed_only``, only one read
+    through an operand pack: register tiling fuses one read directly."""
+    result_type = ir.RankedTensorType(pad.result.type)
+    if (
+        list(pad.low)
+        or any(pad.static_low)
+        or not result_type.has_static_shape
+        or not _feeds_contraction(pad.result)
+        or (packed_only and _feeds_contraction(pad.result, packs=False))
+    ):
+        return
+    with ir.InsertionPoint(pad), pad.location:
+        padding = _pad_value(pad)
+        if padding is None:
+            return
+        shape = list(result_type.shape)
+        sizes = _sizes(pad.source)
+        # Rows are the trailing dims past the last padded one, collapsed: a
+        # reshape may have left full dims inner to it (e.g. VNNI pairs).
+        last = len(shape) - 1
+        while last > 0 and sizes[last] == shape[last]:
+            last -= 1
+        inner = list(range(last + 1, len(shape)))
+        groups = [[dim] for dim in range(last + 1)] + [inner]
+        source = pad.source
+        if len(inner) > 1:
+            source_shape = ir.RankedTensorType(source.type).shape
+            source = tensor.CollapseShapeOp(
+                ir.RankedTensorType.get(
+                    [*source_shape[: last + 1], math.prod(shape[last + 1 :])],
+                    result_type.element_type,
+                ),
+                source,
+                groups,
+            ).result
+        rows_shape = (
+            [*shape[: last + 1], math.prod(shape[last + 1 :])]
+            if len(inner) > 1
+            else shape
+        )
+        empty = tensor.EmptyOp(rows_shape, result_type.element_type).result
+        copied = _copy_rows(source, empty, _sizes(source), padding)
+        if len(inner) > 1:
+            copied = tensor.ExpandShapeOp(
+                result_type, copied, groups, [], static_output_shape=shape
+            ).result
+    pad.result.replace_all_uses_with(copied)
+    pad.operation.erase()
+
+
+def _materialize_generate(generate: tensor.GenerateOp) -> None:
+    """A static constant contraction operand (e.g. tiling's all-padding tile)
+    filled one row, its trailing dims collapsed, at a time: register tiling
+    unrolls a whole fill into one op per vector."""
+    result_type = ir.RankedTensorType(generate.result.type)
+    rank = result_type.rank
+    if (
+        not result_type.has_static_shape
+        or rank < 2
+        or not _feeds_contraction(generate.result)
+    ):
+        return
+    with ir.InsertionPoint(generate), generate.location:
+        value = _pad_value(generate)
+        if value is None:
+            return
+        shape = list(result_type.shape)
+        rows, width = shape[0], math.prod(shape[1:])
+        element_type = result_type.element_type
+        index_type = ir.IndexType.get()
+        empty = tensor.EmptyOp([rows, width], element_type).result
+        loop = scf.ForOp(
+            arith.ConstantOp(index_type, 0).result,
+            arith.ConstantOp(index_type, rows).result,
+            arith.ConstantOp(index_type, 1).result,
+            [empty],
+        )
+        with ir.InsertionPoint(loop.body):
+            buffer = loop.inner_iter_args[0]
+            row = (
+                [loop.induction_variable],
+                [],
+                [],
+                [ir.ShapedType.get_dynamic_size(), 0],
+                [1, width],
+                [1, 1],
+            )
+            row_type = ir.RankedTensorType.get([width], element_type)
+            filled = linalg.fill(
+                value, outs=[tensor.extract_slice(row_type, buffer, *row)]
+            )
+            scf.YieldOp([tensor.insert_slice(filled, buffer, *row)])
+        filled = loop.results[0]
+        if rank > 2:
+            filled = tensor.ExpandShapeOp(
+                result_type,
+                filled,
+                [[0], list(range(1, rank))],
+                [],
+                static_output_shape=shape,
+            ).result
+    generate.result.replace_all_uses_with(filled)
+    generate.operation.erase()
+
+
+@_transform_op(modifies_payload=True)
+class MaterializeOperandPadsOp(
+    HelionTransformDialect.Operation, name="materialize_operand_pads"
+):
+    """Materialize every zero-high-padded contraction operand in the target
+    (see ``_materialize_pad``) and, unless ``packed_only``, every constant one
+    (see ``_materialize_generate``)."""
+
+    target: ext.Operand[transform.AnyOpType]
+    packed_only: ir.IntegerAttr = ext.attribute(
+        default_factory=lambda: ir.IntegerAttr.get(ir.IntegerType.get_signless(64), 0)
+    )
+
+    @staticmethod
+    def run(
+        op: "MaterializeOperandPadsOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        packed_only = bool(ir.IntegerAttr(op.packed_only).value)
+        for pad in _payload_ops(state, op.target, tensor.PadOp):
+            _materialize_pad(pad, packed_only)
+        if not packed_only:
+            for generate in _payload_ops(state, op.target, tensor.GenerateOp):
+                _materialize_generate(generate)
+        return DiagnosedSilenceableFailure.Success
+
+
+# Ops of these dialects have no memory effects.
+_PURE_DIALECTS = ("tensor.", "arith.", "affine.")
+
+# An operand read through reshapes: (op, operand index of the value read) from
+# the first reshape to the consumer.
+_Chain = list[tuple[ir.OpView, int]]
+
+
+def _runtime_padding(pad: tensor.PadOp) -> list[ir.Value] | None:
+    """The runtime padding amounts of ``pad`` if all others are zero, else ``None``."""
+    dynamic = ir.ShapedType.get_dynamic_size()
+    if any(
+        amount not in (0, dynamic) for amount in [*pad.static_low, *pad.static_high]
+    ):
+        return None
+    return [*pad.low, *pad.high] or None
+
+
+def _operand_chain(consumer: ir.OpView, index: int) -> tuple[_Chain, ir.Value]:
+    """The reshapes in ``consumer``'s block, each only read by the next, that
+    operand ``index`` of ``consumer`` is read through; the value reshaped."""
+    chain = [(consumer, index)]
+    value = consumer.operands[index]
+    while isinstance(value, ir.OpResult):
+        op = value.owner.opview
+        if (
+            not isinstance(op, (tensor.ExpandShapeOp, tensor.CollapseShapeOp))
+            or op.operation.block != consumer.operation.block
+            or len(list(value.uses)) != 1
+        ):
+            break
+        chain.insert(0, (op, 0))
+        value = op.operands[0]
+    return chain, value
+
+
+def _only_read_by(value: ir.Value, chain: _Chain) -> ir.OpView | None:
+    """The op defining ``value`` if it is only read by the first op of
+    ``chain``, in its block."""
+    if not isinstance(value, ir.OpResult) or len(list(value.uses)) != 1:
+        return None
+    op = value.owner.opview
+    return op if op.operation.block == chain[0][0].operation.block else None
+
+
+def _versionable_pad(value: ir.Value, chain: _Chain) -> tensor.PadOp | None:
+    """The pad of runtime padding and static shape defining ``value``, only
+    read by ``chain``, else ``None``."""
+    pad = _only_read_by(value, chain)
+    if (
+        not isinstance(pad, tensor.PadOp)
+        or not ir.RankedTensorType(pad.result.type).has_static_shape
+        or _runtime_padding(pad) is None
+    ):
+        return None
+    return pad
+
+
+def _sinkable_branch(value: ir.Value, chain: _Chain) -> scf.IfOp | None:
+    """The side-effect-free ``scf.if`` defining ``value``, only read by
+    ``chain``, with a branch yielding a pad (e.g. tiling's guard of a pad's
+    empty slices), else ``None``."""
+    branch = _only_read_by(value, chain)
+    if (
+        not isinstance(branch, scf.IfOp)
+        or len(branch.results) != 1
+        or len(branch.regions[1].blocks) != 1
+    ):
+        return None
+    padded = False
+    for region in branch.regions:
+        ops = list(region.blocks[0].operations)
+        if not all(op.name.startswith(_PURE_DIALECTS) for op in ops[:-1]):
+            return None
+        yielded = ops[-1].operands[0]
+        padded |= isinstance(yielded, ir.OpResult) and isinstance(
+            yielded.owner.opview, tensor.PadOp
+        )
+    return branch if padded else None
+
+
+def _clone_chain(chain: _Chain, value: ir.Value) -> list[ir.OpView]:
+    """Copies of ``chain`` at the insertion point reading ``value``."""
+    copies = []
+    for op, index in chain:
+        copy = op.operation.clone()
+        copy.operation.operands[index] = value
+        value = copy.results[0]
+        copies.append(copy)
+    return copies
+
+
+def _replace(chain: _Chain, branch: scf.IfOp) -> None:
+    consumer = chain[-1][0]
+    for old, new in zip(consumer.results, branch.results, strict=True):
+        old.replace_all_uses_with(new)
+    for op, _ in reversed(chain):
+        op.operation.erase()
+
+
+def _sink_into_branch(chain: _Chain, branch: scf.IfOp) -> list[ir.OpView]:
+    """Move ``branch``, read by ``chain``, to its consumer and ``chain`` into
+    each of its branches; the consumer's copies."""
+    consumer = chain[-1][0]
+    with ir.InsertionPoint(consumer), consumer.location:
+        sunk = scf.IfOp(
+            branch.condition, [r.type for r in consumer.results], has_else=True
+        )
+    copies = []
+    for region, block in zip(
+        branch.regions, (sunk.then_block, sunk.else_block), strict=True
+    ):
+        ops = list(region.blocks[0].operations)
+        with ir.InsertionPoint(block), consumer.location:
+            cloned = _clone_chain(chain, ops[-1].operands[0])
+            for op in ops[:-1]:
+                op.move_before(cloned[0])
+            scf.YieldOp(list(cloned[-1].results))
+        copies.append(cloned[-1])
+    _replace(chain, sunk)
+    branch.operation.erase()
+    return copies
+
+
+def _version_on_pad(chain: _Chain, pad: tensor.PadOp) -> list[ir.OpView]:
+    """Branch ``chain``'s consumer on ``pad``, read by ``chain``, padding
+    nothing at runtime: then it reads the pad's source in place; the copies."""
+    consumer = chain[-1][0]
+    with ir.InsertionPoint(consumer), consumer.location:
+        zero = arith.ConstantOp(ir.IndexType.get(), 0).result
+        unpadded = None
+        for amount in _runtime_padding(pad):
+            is_zero = arith.CmpIOp(arith.CmpIPredicate.eq, amount, zero).result
+            unpadded = (
+                is_zero if unpadded is None else arith.AndIOp(unpadded, is_zero).result
+            )
+        branch = scf.IfOp(unpadded, [r.type for r in consumer.results], has_else=True)
+    with ir.InsertionPoint(branch.then_block), consumer.location:
+        # The source has the pad's shape when it pads nothing.
+        source = tensor.CastOp(pad.result.type, pad.source).result
+        in_place = _clone_chain(chain, source)
+        scf.YieldOp(list(in_place[-1].results))
+    with ir.InsertionPoint(branch.else_block), consumer.location:
+        padded = _clone_chain(chain, pad.result)
+        pad.operation.move_before(padded[0])
+        scf.YieldOp(list(padded[-1].results))
+    _replace(chain, branch)
+    return [in_place[-1], padded[-1]]
+
+
+def _version_operands(consumer: ir.OpView, done: frozenset[int] = frozenset()) -> None:
+    """Version ``consumer`` on each runtime-padded input not in ``done`` (see
+    ``_version_on_pad``), first sunk into the branches defining it, so each
+    reads its pad directly."""
+    for index in range(len(consumer.operands) - len(consumer.results)):
+        if index in done:
+            continue
+        chain, value = _operand_chain(consumer, index)
+        branch = _sinkable_branch(value, chain)
+        if branch is not None:
+            for copy in _sink_into_branch(chain, branch):
+                _version_operands(copy, done)
+            return
+        pad = _versionable_pad(value, chain)
+        if pad is not None:
+            for copy in _version_on_pad(chain, pad):
+                _version_operands(copy, done | {index})
+            return
+
+
+@_transform_op(modifies_payload=True)
+class VersionPaddedOperandsOp(
+    HelionTransformDialect.Operation, name="version_padded_operands"
+):
+    """Branch every contraction in the target on each of its runtime-padded
+    inputs padding nothing: tiles of a partial tile but the edge ones read the
+    source in place, and only the edge tiles are padded."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "VersionPaddedOperandsOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        contractions = [
+            found
+            for found in _payload_ops(state, op.target, ir.OpView)
+            if _is_linalg(found)
+            and linalg.isa_contraction_op(found)
+            and len(found.results) == 1
+        ]
+        for contraction in contractions:
+            _version_operands(contraction)
+        return DiagnosedSilenceableFailure.Success
 
 
 def _moved_slice(value: ir.Value) -> ir.Value | None:
@@ -979,9 +1484,11 @@ class LegalizeForLLVMOp(HelionTransformDialect.Operation, name="legalize_for_llv
 
 @_transform_op(modifies_payload=True)
 class HoistAllocasOp(HelionTransformDialect.Operation, name="hoist_allocas"):
-    """Move every static ``memref.alloca`` in the target to the entry of its
+    """Move every static ``memref.alloca`` in the target out of the loops of its
     ``alloca_scope``, ``omp.parallel`` region or function: in a loop, its
-    lowering grows the stack every iteration until the scope ends."""
+    lowering grows the stack every iteration until the scope ends. It goes to
+    the entry of the block holding the outermost such loop, so buffers of
+    exclusive ``scf.if`` branches above the loops do not add up."""
 
     target: ext.Operand[transform.AnyOpType]
 
@@ -993,13 +1500,20 @@ class HoistAllocasOp(HelionTransformDialect.Operation, name="hoist_allocas"):
         state: transform.TransformState,
     ) -> DiagnosedSilenceableFailure:
         scopes = ("memref.alloca_scope", "omp.parallel", "func.func")
+        loops = ("scf.for", "scf.while", "scf.parallel", "scf.forall")
         for alloca in _payload_ops(state, op.target, memref.AllocaOp):
             if list(alloca.operands):
                 continue
+            outermost = None
             parent = alloca.operation.parent
             while parent.name not in scopes:
+                if parent.name in loops:
+                    outermost = parent
                 parent = parent.parent
-            entry = parent.regions[0].blocks[0]
+            if outermost is None:
+                entry = parent.regions[0].blocks[0]
+            else:
+                entry = outermost.block
             alloca.operation.move_before(entry.operations[0])
         return DiagnosedSilenceableFailure.Success
 
@@ -1208,6 +1722,35 @@ def materialize_copies() -> ir.Module:
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
         MaterializeCopiesOp(target=funcs)
+        transform.yield_()
+    return schedule
+
+
+def materialize_operand_pads(packed_only: bool = False) -> ir.Module:
+    """Schedule: every function's zero-padded contraction operands in memory
+    (with ``packed_only``, those read through an operand pack)."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        MaterializeOperandPadsOp(
+            target=funcs,
+            packed_only=ir.IntegerAttr.get(
+                ir.IntegerType.get_signless(64), int(packed_only)
+            ),
+        )
+        lh_transform.cleanup(named_seq.bodyTarget)
+        transform.yield_()
+    return schedule
+
+
+def version_padded_operands() -> ir.Module:
+    """Schedule: branch every function's contractions on their runtime-padded
+    inputs padding nothing."""
+    HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        VersionPaddedOperandsOp(target=funcs)
+        lh_transform.cleanup(named_seq.bodyTarget)
         transform.yield_()
     return schedule
 
