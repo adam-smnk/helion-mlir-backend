@@ -315,6 +315,8 @@ def _matmul_fused_pack(
 
 
 _FUSED_PACK_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
+# Helion flags the host-side `out is None` check as an unfused tensor operation.
+_OUT_CHECK_WARNINGS = [helion.exc.TensorOperationInWrapper]
 # LRU: epilogues created per call must not pile up (each entry pins its epilogue).
 _FUSED_PACK_BOUND: OrderedDict[
     tuple[object, ...], tuple[BoundKernel, tuple[hl.constexpr, ...]]
@@ -482,6 +484,7 @@ def _matmul_fused_pack_bound(
             _matmul_fused_pack,
             backend="mlir",
             config=helion.Config(block_sizes=block_sizes),
+            ignore_warnings=_OUT_CHECK_WARNINGS,
         )
     consts = (
         hl.constexpr(k_chunked),
@@ -515,12 +518,14 @@ def _matmul_prepacked_vnni(
     epilogue: Callable[[Tensor], Tensor],
     pairs_chunked: hl.constexpr,
     pairs_even: hl.constexpr,
+    out: Tensor | None = None,
 ) -> Tensor:
     """``epilogue((a @ b + bias) * scale + shift)`` of ``a3``, row-major
     ``[M, K]`` viewed as K pairs ``[M, K/2, 2]``, and ``b4``, B in contiguous
     column panels of AMX's VNNI layout ``[N/P, K/2, P, 2]``
     (:func:`pack_b_vnni_t`); ``bias2``, ``scale2`` and ``shift2`` are
-    ``[N/P, P]`` or ``None``. Tiles are one panel wide.
+    ``[N/P, P]`` or ``None``. Tiles are one panel wide; written into ``out``
+    (``[M, N/P, P]``) if given.
 
     AMX loads both operands' tiles in place: nothing is packed per call. K
     pairs run in chunks up to ``pairs_chunked``, one chunk of the rest up to
@@ -537,7 +542,10 @@ def _matmul_prepacked_vnni(
     hl.specialize(a3.size(2))
     hl.specialize(b4.size(3))
 
-    out = torch.empty((m, panels, panel), dtype=a3.dtype, device=a3.device)
+    if out is None:
+        result = torch.empty((m, panels, panel), dtype=a3.dtype, device=a3.device)
+    else:
+        result = out
     for tile_m, tile_p in hl.tile([m, panels]):
         acc = hl.zeros([tile_m, tile_p, panel], dtype=torch.float32)
         if pairs_chunked > 0:
@@ -555,8 +563,8 @@ def _matmul_prepacked_vnni(
             acc = acc * scale2[tile_p, :]
         if shift2 is not None:
             acc = acc + shift2[tile_p, :]
-        out[tile_m, tile_p, :] = epilogue(acc).to(a3.dtype)
-    return out
+        result[tile_m, tile_p, :] = epilogue(acc).to(a3.dtype)
+    return result
 
 
 _PREPACKED_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
@@ -571,7 +579,12 @@ def _matmul_prepacked_vnni_call(
     scale: Tensor | None = None,
     shift: Tensor | None = None,
 ) -> Tensor:
-    """:func:`matmul_prepacked_b` of a RHS packed by :func:`pack_b_vnni_t`."""
+    """:func:`matmul_prepacked_b` of a RHS packed by :func:`pack_b_vnni_t`.
+
+    Rows past the last whole row tile run as a second call, zero-padded to
+    whole register tiles: a partial row tile lowers to per-element code (about
+    35 ms for one tile, 12x the whole GEMM at 131104x256x1536).
+    """
     panels, pairs_b, panel, vnni = map(int, b4.shape)
     m, k = map(int, a.shape)
     n_pad = panels * panel
@@ -597,27 +610,73 @@ def _matmul_prepacked_vnni_call(
         return (row if n == n_pad else pad_2d(row, 1, n_pad)).view(panels, panel)
 
     bias2, scale2, shift2 = panels2(bias), panels2(scale), panels2(shift)
+    operands = (b4, bias2, scale2, shift2, epilogue)
+    tile_m = _prepacked_tile_m(m, panels, panel)
+    bulk = m // tile_m * tile_m
+    if bulk == m:
+        bound, consts = _prepacked_bound(a3, *operands, tile_m)
+        out = bound(a3, *operands, *consts).view(m, n_pad)
+        return out if n == n_pad else out[:, :n]
+
+    rest = _round_up(m - bulk, BLOCK_M)
+    out3 = torch.empty((bulk + rest, panels, panel), dtype=a.dtype, device=a.device)
+    if bulk:
+        bound, consts = _prepacked_bound(a3[:bulk], *operands, tile_m, out3[:bulk])
+        bound(a3[:bulk], *operands, *consts, out3[:bulk])
+    a_rest = a[bulk:]
+    if rest != m - bulk:
+        a_rest = pad_2d(a_rest.contiguous(), rest, k)
+    a3_rest = a_rest.contiguous().view(rest, k // 2, 2)
+    bound, consts = _prepacked_bound(a3_rest, *operands, rest, out3[bulk:])
+    bound(a3_rest, *operands, *consts, out3[bulk:])
+    out = out3[:m].view(m, n_pad)
+    return out if n == n_pad else out[:, :n]
+
+
+def _prepacked_tile_m(m: int, panels: int, panel: int) -> int:
+    """Rows of a :func:`_matmul_prepacked_vnni` tile: every thread a tile, the
+    f32 accumulator within 1 MiB, whole register tiles (a ragged row tile loses
+    AMX: 768-column panels gave 341 rows)."""
+    threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+    tiles_m = max(1, threads // panels)
+    return min(
+        _round_up(-(-m // tiles_m), BLOCK_M),
+        max(m // BLOCK_M * BLOCK_M, BLOCK_M),
+        max((1 << 18) // panel // BLOCK_M * BLOCK_M, BLOCK_M),
+    )
+
+
+def _prepacked_bound(
+    a3: Tensor,
+    b4: Tensor,
+    bias2: Tensor | None,
+    scale2: Tensor | None,
+    shift2: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+    tile_m: int,
+    out: Tensor | None = None,
+) -> tuple[BoundKernel, tuple[hl.constexpr, ...]]:
+    """:func:`_matmul_prepacked_vnni` of ``tile_m``-row tiles bound to the
+    operands (and ``out`` if given), with its constexpr arguments; cached like
+    the fused kernel."""
+    m, pairs, _ = map(int, a3.shape)
+    panels, _, panel, _ = map(int, b4.shape)
     key = (
         "prepacked",
         m,
-        n_pad,
+        panels * panel,
         panel,
-        k,
-        bias is None,
-        scale is None,
-        shift is None,
+        pairs,
+        tile_m,
+        out is None,
+        bias2 is None,
+        scale2 is None,
+        shift2 is None,
         os.environ.get("OMP_NUM_THREADS"),
         epilogue,
     )
     if (cached := _FUSED_PACK_BOUND.get(key)) is None:
-        threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
-        tiles_m = max(1, threads // panels)
-        tile_m = min(
-            _round_up(-(-m // tiles_m), BLOCK_M),
-            max(m // BLOCK_M * BLOCK_M, BLOCK_M),
-            (1 << 18) // panel,
-        )
-        pairs_even = k // 2 // BLOCK_K * BLOCK_K
+        pairs_even = pairs // BLOCK_K * BLOCK_K
         # Packed B per K chunk: 512 KiB, 256 KiB for tiles of few rows, which
         # stream the weight (128x32768x32768 at 256 columns: 8.7 ms, 9.2 at 512 KiB).
         chunk_bytes = (256 if tile_m < _MIN_SHARED_ROWS else 512) << 10
@@ -631,19 +690,18 @@ def _matmul_prepacked_vnni_call(
                 _matmul_prepacked_vnni,
                 backend="mlir",
                 config=helion.Config(block_sizes=list(tiles)),
+                ignore_warnings=_OUT_CHECK_WARNINGS,
             )
         consts = (hl.constexpr(pairs_chunked), hl.constexpr(pairs_even))
         bound = _PREPACKED_KERNELS[tiles].bind(
-            (a3, b4, bias2, scale2, shift2, epilogue, *consts)
+            (a3, b4, bias2, scale2, shift2, epilogue, *consts, out)
         )
         cached = _FUSED_PACK_BOUND[key] = (bound, consts)
         if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
             _FUSED_PACK_BOUND.popitem(last=False)
     else:
         _FUSED_PACK_BOUND.move_to_end(key)
-    bound, consts = cached
-    out = bound(a3, b4, bias2, scale2, shift2, epilogue, *consts).view(m, n_pad)
-    return out if n == n_pad else out[:, :n]
+    return cached
 
 
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[1, 1]))

@@ -8,6 +8,7 @@ from .elementwise import scalar_mul
 from .linear import CACHE_PREPACKED_WEIGHTS_ENV
 from .linear import AffineLinearCache
 from .linear import LinearCache
+from .linear import cache_prepacked_weights
 from .linear import linear
 from .linear import linear_affine
 from .matmul import bmm
@@ -34,6 +35,7 @@ __all__ = [
     "AffineLinearCache",
     "LinearCache",
     "bmm",
+    "cache_prepacked_weights",
     "group_norm",
     "identity_epilogue",
     "leaky_relu",

@@ -1902,11 +1902,13 @@ class TestPaddedPackingAndMultiPhaseExecution:
         )
 
     @pytest.mark.parametrize(
-        "mkn", [(64, 256, 128), (40, 66, 100), (50, 100, 70), (64, 4096, 64)]
+        "mkn",
+        [(64, 256, 128), (40, 66, 100), (50, 100, 70), (64, 4096, 64), (300, 128, 64)],
     )
     def test_matmul_prepacked_vnni(self, mkn):
         """A weight packed once into VNNI panels (``pack_b_vnni_t``) is read in
-        place by the fused kernel: ragged N and K included."""
+        place by the fused kernel: ragged M (a second call for the rows past the
+        last whole row tile), N and K included."""
         from helion_mlir_cpu_utils.matmul import matmul_prepacked_b
         from helion_mlir_cpu_utils.matmul import pack_b_vnni_t
 

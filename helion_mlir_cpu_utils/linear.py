@@ -23,6 +23,13 @@ if TYPE_CHECKING:
 CACHE_PREPACKED_WEIGHTS_ENV = "HELION_MLIR_CACHE_PREPACKED_WEIGHTS"
 
 
+def cache_prepacked_weights() -> bool:
+    """Whether constant weights are packed once and reused (the default);
+    ``HELION_MLIR_CACHE_PREPACKED_WEIGHTS=0`` packs them on every call."""
+    value = os.environ.get(CACHE_PREPACKED_WEIGHTS_ENV, "").strip().lower()
+    return value not in ("0", "false", "no")
+
+
 class LinearCache(NamedTuple):
     key: tuple
     packed_weight: Tensor
@@ -75,16 +82,14 @@ def linear(
     cache: LinearCache | None = None,
     biases: tuple[Tensor, ...] | None = None,
 ) -> tuple[Tensor, LinearCache | None]:
-    """Run a linear layer, optionally caching its packed constant weight.
-
-    The default path packs the weight on every call. Set
-    ``HELION_MLIR_CACHE_PREPACKED_WEIGHTS=1`` to build and reuse a packed
-    weight until the source parameters, input dtype, or device change.
+    """Run a linear layer, by default with its constant weight packed once and
+    reused until the source parameters, input dtype, or device change;
+    ``HELION_MLIR_CACHE_PREPACKED_WEIGHTS=0`` packs it on every call.
     """
     source_biases = (
         (() if layer.bias is None else (layer.bias,)) if biases is None else biases
     )
-    if os.environ.get(CACHE_PREPACKED_WEIGHTS_ENV, "").strip() != "1":
+    if not cache_prepacked_weights():
         weight = layer.weight.to(dtype=x.dtype, device=x.device)
         return (
             matmul(
@@ -136,7 +141,7 @@ def linear_affine(
 ) -> tuple[Tensor, AffineLinearCache | None]:
     """Run ``epilogue((linear(x)) * post_scale + post_bias)``; ``post_scale`` and
     ``post_bias`` are ``[1]`` or ``[out_features]``. Cached like :func:`linear`."""
-    use_cache = os.environ.get(CACHE_PREPACKED_WEIGHTS_ENV, "").strip() == "1"
+    use_cache = cache_prepacked_weights()
     if x.dtype == torch.bfloat16 and not use_cache:
         bias = None if layer.bias is None else layer.bias.to(dtype=x.dtype)
         result = matmul(
