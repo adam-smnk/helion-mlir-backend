@@ -245,13 +245,16 @@ def fold_empty_slices() -> ir.Module:
 
     A per-register-tile op writing a slice of a whole-tile temporary (e.g. a
     fused accumulator or epilogue) then gets a register-tile-sized buffer, not
-    one the size of the whole tile streaming through the caches.
+    one the size of the whole tile streaming through the caches. A tile
+    rank-expanded into an empty tensor before its insert into the output is
+    inserted directly, so bufferization writes it in place.
     """
     with schedule_boilerplate() as (schedule, named_seq):
         with ir.InsertionPoint(
             transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
         ):
             transform_tensor.apply_patterns_tensor_fold_tensor_empty()
+            transform_tensor.apply_patterns_tensor_merge_consecutive_insert_extract_slice()
             transform.apply_patterns_canonicalization()
         transform.yield_()
     return schedule

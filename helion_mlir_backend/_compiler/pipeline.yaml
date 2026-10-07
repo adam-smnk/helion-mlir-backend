@@ -50,6 +50,10 @@ Pipeline:
   ## Reduction register tiles: annotate K-like dims and tile ops individually.
   # Tiling clears the pins; operand packs must not be tiled into tiny ops either.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - include: x86_64/fuse-reductions.yaml {
+                          strategy=register_reduction
+                          use_forall=False
+                        }
   - include: x86_64/tile.yaml {
                           strategy=register_reduction
                           propagate=False
@@ -79,6 +83,9 @@ Pipeline:
 
   ## x86_64/lower.yaml, plus lower-vector-multi-reduction, which
   ## convert-vector-to-llvm does not include (reductions fail to JIT without it).
+  # Rank-reduced slices of an output tile's empty tensor (from unit-dim folding)
+  # stay empty tensors: else bufferization writes the tile to a temporary and copies.
+  - schedule: "helion_transforms.py[gen=fold_empty_slices]"
   - include: bufferization.yaml
   # Per-tile scratch (accumulators, staging) on the stack: no malloc/free per tile.
   - schedule: "helion_transforms.py[gen=promote_buffers_to_stack]{max_alloc_size_in_bytes=1048576}"
@@ -96,6 +103,9 @@ Pipeline:
   ## n-D transfers as 2-D ones, contiguous ones then 1-D: no per-element staging.
   - schedule: "helion_transforms.py[gen=unroll_transfers]"
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
+  ## Reductions of the innermost dim as horizontal reductions, of outer dims as
+  ## lane-wise ops: the pass alone lowers a row reduction to a scalar chain.
+  - schedule: "vectorization.py[gen=lower_vector_multi_reductions]"
   - pass: "func.func(lower-vector-multi-reduction)"
   ## Math functions (exp, tanh, ...) as polynomials: LLVM would scalarize vector ones
   ## into a libm call per element.
