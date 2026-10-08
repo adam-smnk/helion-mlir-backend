@@ -293,7 +293,8 @@ def approximate_math() -> ir.Module:
         with ir.InsertionPoint(
             transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
         ):
-            transform_math.ApplyPolynomialApproximationPatternsOp()
+            transform_math.ApplyF32ExpansionPatternsOp()
+            transform_math.ApplyPolynomialApproximationPatternsOp(enable_avx2=True)
         transform.yield_()
     return schedule
 
