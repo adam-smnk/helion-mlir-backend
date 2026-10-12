@@ -195,6 +195,18 @@ def split_transfers() -> ir.Module:
     return schedule
 
 
+def amx_move_offsets() -> ir.Module:
+    """Schedule: move the offsets of every function's in-bounds memref reads to
+    subviews, in the form the x86 AMX contraction rewrite matches."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.move_offsets_to_subview(funcs)
+        transform.apply_cse(funcs)
+        transform.yield_()
+    return schedule
+
+
 def pin_transposes() -> ir.Module:
     """Schedule: keep every function's small static transposes untiled."""
     ht.HelionTransformDialect.load()

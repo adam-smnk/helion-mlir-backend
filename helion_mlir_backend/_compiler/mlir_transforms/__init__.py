@@ -13,6 +13,7 @@ from .mark_operand_packs import OPERAND_PACK_ATTR_NAME
 from .mark_operand_packs import mark_operand_packs
 from .materialize_copies import materialize_copies
 from .materialize_operand_pads import materialize_operand_pads
+from .move_offsets_to_subview import move_offsets_to_subview
 from .outer_transpose_tile import outer_transpose_tile
 from .partition_linalg import partition_linalg
 from .pin_transposes import pin_transposes
@@ -34,6 +35,7 @@ __all__ = [
     "mark_operand_packs",
     "materialize_copies",
     "materialize_operand_pads",
+    "move_offsets_to_subview",
     "outer_transpose_tile",
     "partition_linalg",
     "pin_transposes",

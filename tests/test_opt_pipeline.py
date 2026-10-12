@@ -17,6 +17,7 @@ import torch
 from tests.harness import opt_pipeline
 
 from helion_mlir_backend._compiler.helion_transforms import align_operand_rows
+from helion_mlir_backend._compiler.helion_transforms import amx_move_offsets
 from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
@@ -298,6 +299,141 @@ def test_split_transfers_rank_reducing() -> None:
     # The read and the write, each on its in-bounds path (cleanup merges the ifs).
     assert "scf.if" in text
     assert text.count("in_bounds = [true]") == 2
+
+
+CONSTANT_OFFSET_READS = """
+func.func @f(%a: memref<64x64xbf16>, %i: index)
+    -> (vector<16x16xbf16>, vector<16x16xbf16>) {
+  %pad = arith.constant 0.0 : bf16
+  %i16 = affine.apply affine_map<(d0) -> (d0 + 16)>(%i)
+  %0 = vector.transfer_read %a[%i, %i], %pad {in_bounds = [true, true]}
+      : memref<64x64xbf16>, vector<16x16xbf16>
+  %1 = vector.transfer_read %a[%i, %i16], %pad {in_bounds = [true, true]}
+      : memref<64x64xbf16>, vector<16x16xbf16>
+  return %0, %1 : vector<16x16xbf16>, vector<16x16xbf16>
+}
+"""
+
+
+def _subviews(text: str) -> list[tuple[str, str]]:
+    """The source and offsets of every ``memref.subview`` in ``text``."""
+    return re.findall(r"memref\.subview (%\w+)\[([^\]]*)\]", text)
+
+
+def test_amx_move_offsets_constant_offsets_share_subview() -> None:
+    text = _apply(amx_move_offsets, CONSTANT_OFFSET_READS)
+    assert _subviews(text) == [("%arg0", "%arg1, %arg1")]
+    assert "vector.transfer_read %subview[%c0, %c16]" in text
+
+
+# A K loop over a runtime-shape operand, at an offset of k + j + 16.
+LOOP_OFFSET_READ = """
+func.func @f(%a: memref<?x?xbf16>, %j: index, %n: index) -> vector<16x16xbf16> {
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %pad = arith.constant 0.0 : bf16
+  %init = arith.constant dense<0.0> : vector<16x16xbf16>
+  %r = scf.for %k = %c0 to %n step %c16 iter_args(%acc = %init) -> vector<16x16xbf16> {
+    %off = affine.apply affine_map<(d0)[s0] -> (d0 + s0 + 16)>(%k)[%j]
+    %v = vector.transfer_read %a[%c0, %off], %pad {in_bounds = [true, true]}
+        : memref<?x?xbf16>, vector<16x16xbf16>
+    %s = arith.addf %acc, %v : vector<16x16xbf16>
+    scf.yield %s : vector<16x16xbf16>
+  }
+  return %r : vector<16x16xbf16>
+}
+"""
+
+
+def test_amx_move_offsets_splits_loop_offset() -> None:
+    text = _apply(amx_move_offsets, LOOP_OFFSET_READ)
+    # The K loop's induction variable is the offset of an inner subview, the
+    # rest of the offset of an outer one; the constant stays in the read.
+    assert _subviews(text) == [("%arg0", "%c0, %arg1"), ("%subview", "%c0, %arg3")]
+    assert "vector.transfer_read %subview_2[%c0, %c16]" in text
+    assert text.count("memref.dim") == 2
+
+
+# Reads whose bounds are checked or masked: a subview would change their bounds.
+UNSAFE_READS = """
+func.func @f(%a: memref<?x?xf32>, %i: index, %m: vector<16xi1>)
+    -> (vector<16xf32>, vector<16xf32>, vector<16xf32>) {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : f32
+  %0 = vector.transfer_read %a[%c0, %i], %pad : memref<?x?xf32>, vector<16xf32>
+  %1 = vector.transfer_read %a[%c0, %i], %pad, %m {in_bounds = [true]}
+      : memref<?x?xf32>, vector<16xf32>
+  %2 = vector.mask %m {
+    vector.transfer_read %a[%c0, %i], %pad {in_bounds = [true]}
+        : memref<?x?xf32>, vector<16xf32>
+  } : vector<16xi1> -> vector<16xf32>
+  return %0, %1, %2 : vector<16xf32>, vector<16xf32>, vector<16xf32>
+}
+"""
+
+
+def test_amx_move_offsets_keeps_bounded_reads() -> None:
+    assert _subviews(_apply(amx_move_offsets, UNSAFE_READS)) == []
+
+
+# A batch-reduce and a K loop reading at offsets of their bare induction variables.
+TWO_REDUCTION_LOOPS_READ = """
+func.func @f(%a: memref<16x64x64xbf16>, %m: index) -> vector<1x16x16xbf16> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c16 = arith.constant 16 : index
+  %c64 = arith.constant 64 : index
+  %pad = arith.constant 0.0 : bf16
+  %init = arith.constant dense<0.0> : vector<1x16x16xbf16>
+  %r = scf.for %b = %c0 to %c16 step %c1 iter_args(%acc = %init) -> vector<1x16x16xbf16> {
+    %r2 = scf.for %k = %c0 to %c64 step %c16 iter_args(%acc2 = %acc) -> vector<1x16x16xbf16> {
+      %v = vector.transfer_read %a[%b, %m, %k], %pad {in_bounds = [true, true, true]}
+          : memref<16x64x64xbf16>, vector<1x16x16xbf16>
+      %s = arith.addf %acc2, %v : vector<1x16x16xbf16>
+      scf.yield %s : vector<1x16x16xbf16>
+    }
+    scf.yield %r2 : vector<1x16x16xbf16>
+  }
+  return %r : vector<1x16x16xbf16>
+}
+"""
+
+
+def test_amx_move_offsets_keeps_reduction_ivs_in_one_subview() -> None:
+    # The AMX rewrite finds the induction variables of both reduction loops in
+    # the offsets of the same subview.
+    text = _apply(amx_move_offsets, TWO_REDUCTION_LOOPS_READ)
+    assert _subviews(text) == [("%arg0", "%arg2, %arg1, %arg4")]
+
+
+# A K loop around a loop over N tiles: the read is in the N loop.
+OUTER_REDUCTION_LOOP_READ = """
+func.func @f(%a: memref<64x128xbf16>, %j: index, %out: memref<64x128xbf16>) {
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
+  %pad = arith.constant 0.0 : bf16
+  scf.for %k = %c0 to %c64 step %c16 {
+    scf.for %n = %c0 to %c32 step %c16 {
+      %off = affine.apply affine_map<(d0)[s0] -> (d0 + s0)>(%k)[%j]
+      %v = vector.transfer_read %a[%c0, %off], %pad {in_bounds = [true, true]}
+          : memref<64x128xbf16>, vector<16x16xbf16>
+      vector.transfer_write %v, %out[%c0, %n] {in_bounds = [true, true]}
+          : vector<16x16xbf16>, memref<64x128xbf16>
+    }
+  }
+  return
+}
+"""
+
+
+def test_amx_move_offsets_splits_innermost_loop_only() -> None:
+    # Only the innermost loop's induction variable is split out: the K offset
+    # stays whole in a single subview.
+    text = _apply(amx_move_offsets, OUTER_REDUCTION_LOOP_READ)
+    assert _subviews(text) == [("%arg0", "0, %0")]
+    assert "%0 = affine.apply #map(%arg3)[%arg1]" in text
 
 
 # A 16x16 block of VNNI pairs transposed, as a pack of [N, K] into [K/2, N, 2].

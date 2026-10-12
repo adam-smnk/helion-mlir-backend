@@ -92,7 +92,7 @@ Pipeline:
   - include: bufferization-cleanup.yaml
   - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
-  - schedule: "x86/amx_move_offsets.py[gen=amx_move_offsets]"
+  - schedule: "helion_transforms.py[gen=amx_move_offsets]"
   # The AMX rewrite rebuilds a K loop without the loop-invariant index ops defined in
   # it (outer tiles of several blocks): left in the erased loop, they abort the rewrite.
   - pass: "loop-invariant-code-motion"
