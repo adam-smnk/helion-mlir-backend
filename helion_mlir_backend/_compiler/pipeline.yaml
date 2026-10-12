@@ -103,6 +103,9 @@ Pipeline:
   ## n-D transfers as 2-D ones, contiguous ones then 1-D: no per-element staging.
   - schedule: "helion_transforms.py[gen=unroll_transfers]"
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
+  ## n-D elementwise ops (e.g. between reshapes of flattened transfers) as 1-D:
+  ## lowered n-D, they unroll into per-row ops and shuffles.
+  - schedule: "helion_transforms.py[gen=linearize_vector_ops]"
   ## Reductions of the innermost dim as horizontal reductions, of outer dims as
   ## lane-wise ops: the pass alone lowers a row reduction to a scalar chain.
   - schedule: "vectorization.py[gen=lower_vector_multi_reductions]"

@@ -11,6 +11,10 @@ still copies when the old value is read after the update.
 An update ``acc = acc + sum(x)`` (also ``*``, ``max``, ``min``) whose partial
 reduction is used only there becomes a reduction that starts from ``acc``
 instead of the identity, so the partial result needs no buffer either.
+
+An update accumulated into further (``acc = acc * alpha + p @ v``: a contraction
+or reduction whose destination is the update) writes into ``acc`` likewise, also
+when the update is conditional (in the branches of an ``scf.if``).
 """
 
 from __future__ import annotations
@@ -42,13 +46,46 @@ def update_carried_values_in_place(module: ir.Module) -> None:
 def _update_loop(loop: ir.Operation) -> None:
     body = loop.regions[0].blocks[0]
     iter_args = list(body.arguments)[1:]
-    yielded = list(list(body.operations)[-1].operands)
-    for iter_arg, value in zip(iter_args, yielded, strict=True):
-        if isinstance(value, ir.OpResult):
-            producer = value.owner.operation
-            if producer.name == "linalg.generic" and producer.parent == loop:
-                _write_into(producer, value.result_number, iter_arg)
-                _start_reduction_from(producer)
+    terminator = list(body.operations)[-1]
+    for index, iter_arg in enumerate(iter_args):
+        producer = _loop_op(terminator.operands[index], loop)
+        if producer is not None and producer.name == "linalg.generic":
+            value = terminator.operands[index]
+            _write_into(producer, value.result_number, iter_arg)
+            _start_reduction_from(producer)
+        # The update may be accumulated into further, e.g. by a contraction.
+        value = terminator.operands[index]
+        while (op := _loop_op(value, loop)) is not None and _accumulates(op):
+            value = op.operands[len(op.opview.inputs) + value.result_number]
+        producer = _loop_op(value, loop)
+        if producer is not None and producer.name == "linalg.generic":
+            _write_into(producer, value.result_number, iter_arg)
+        elif producer is not None and producer.name == "scf.if":
+            # A conditional update, e.g. a rescale: each branch writes in place.
+            for region in producer.regions:
+                branch = list(region.blocks[0].operations)[-1]
+                update = _loop_op(branch.operands[value.result_number], producer)
+                if update is not None and update.name == "linalg.generic":
+                    result = branch.operands[value.result_number].result_number
+                    _write_into(update, result, iter_arg)
+
+
+def _loop_op(value: ir.Value, loop: ir.Operation) -> ir.Operation | None:
+    """The op in ``loop``'s body defining ``value``, if any."""
+    if not isinstance(value, ir.OpResult):
+        return None
+    op = value.owner.operation
+    return op if op.parent == loop else None
+
+
+def _accumulates(op: ir.Operation) -> bool:
+    """Whether ``op`` combines its inputs into its destinations' values."""
+    if op.name in ("linalg.contract", "linalg.matmul", "linalg.batch_matmul"):
+        return True
+    if op.name != "linalg.generic":
+        return False
+    iterators = ir.ArrayAttr(op.attributes["iterator_types"])
+    return any(str(iterator) != _PARALLEL for iterator in iterators)
 
 
 def _write_into(generic: ir.Operation, result: int, iter_arg: ir.Value) -> None:

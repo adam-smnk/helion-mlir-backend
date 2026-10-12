@@ -21,6 +21,7 @@ from helion_mlir_backend._compiler.helion_transforms import amx_move_offsets
 from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
+from helion_mlir_backend._compiler.helion_transforms import linearize_vector_ops
 from helion_mlir_backend._compiler.helion_transforms import lower_transposes
 from helion_mlir_backend._compiler.helion_transforms import materialize_operand_pads
 from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
@@ -299,6 +300,30 @@ def test_split_transfers_rank_reducing() -> None:
     # The read and the write, each on its in-bounds path (cleanup merges the ifs).
     assert "scf.if" in text
     assert text.count("in_bounds = [true]") == 2
+
+
+# A cast of VNNI pairs between the reshapes of flattened transfers.
+CAST_BETWEEN_RESHAPES = """
+func.func @f(%src: memref<64xf32>, %dst: memref<64xbf16>) {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : f32
+  %read = vector.transfer_read %src[%c0], %pad {in_bounds = [true]}
+      : memref<64xf32>, vector<32xf32>
+  %pairs = vector.shape_cast %read : vector<32xf32> to vector<16x2xf32>
+  %cast = arith.truncf %pairs : vector<16x2xf32> to vector<16x2xbf16>
+  %flat = vector.shape_cast %cast : vector<16x2xbf16> to vector<32xbf16>
+  vector.transfer_write %flat, %dst[%c0] {in_bounds = [true]}
+      : vector<32xbf16>, memref<64xbf16>
+  return
+}
+"""
+
+
+def test_linearize_vector_ops_casts_whole_vectors() -> None:
+    # Lowered 2-D, the cast would be unrolled into 16 casts of pairs.
+    text = _apply(linearize_vector_ops, CAST_BETWEEN_RESHAPES)
+    assert "arith.truncf %0 : vector<32xf32> to vector<32xbf16>" in text
+    assert "vector.shape_cast" not in text
 
 
 CONSTANT_OFFSET_READS = """

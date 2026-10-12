@@ -136,6 +136,25 @@ def unroll_transfers(max_rank: int = 2) -> ir.Module:
     return schedule
 
 
+def linearize_vector_ops() -> ir.Module:
+    """Schedule: every function's n-D elementwise ops and constants as 1-D ones
+    (upstream vector linearization), e.g. a cast between the reshapes of
+    flattened transfers: lowered n-D, it is unrolled row by row."""
+    with schedule_boilerplate() as (schedule, named_seq):
+        linearize = transform.ApplyConversionPatternsOp(
+            named_seq.bodyTarget,
+            num_default_type_converter_region=0,
+            legal_dialects=["vector"],
+            partial_conversion=True,
+            preserve_handles=True,
+        )
+        with ir.InsertionPoint(linearize.patterns.blocks.append()):
+            transform_vector.apply_conversion_patterns_vector_linearize()
+        lh_transform.cleanup(named_seq.bodyTarget)
+        transform.yield_()
+    return schedule
+
+
 def materialize_copies() -> ir.Module:
     """Schedule: large slice moves of every function as ``linalg.copy`` ops."""
     ht.HelionTransformDialect.load()

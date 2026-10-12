@@ -68,6 +68,70 @@ def _scaled_running_max_reference(x: torch.Tensor) -> torch.Tensor:
     return acc
 
 
+@helion.kernel(backend="mlir", static_shapes=True, config=_cfg(8, 16, 16))
+def decayed_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = acc * 0.5
+            acc = acc + torch.einsum("mk,kn->mn", x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="mlir", static_shapes=True, config=_cfg(8, 16, 16))
+def conditionally_decayed_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            a = x[tm, tk]
+            if a.sum(-1).sum() > 0:
+                acc = acc * 0.5
+            acc = acc + torch.einsum("mk,kn->mn", a, y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+def _decayed_matmul_reference(
+    x: torch.Tensor, y: torch.Tensor, conditional: bool = False
+) -> torch.Tensor:
+    acc = torch.zeros(x.size(0), y.size(1))
+    for start in range(0, x.size(1), 16):
+        rows = []
+        for row in range(0, x.size(0), 8):
+            a = x[row : row + 8, start : start + 16]
+            decay = 0.5 if not conditional or a.sum() > 0 else 1.0
+            rows.append(acc[row : row + 8] * decay + a @ y[start : start + 16])
+        acc = torch.cat(rows)
+    return acc
+
+
+def _iter_arg_destinations(kernel: helion.Kernel, *args: torch.Tensor) -> list[str]:
+    """The parent op of every ``linalg.generic`` writing into an ``scf.for`` iter
+    arg, after the in-place updates."""
+    module = inline_module(generate_mlir(kernel, list(args)))
+    found = []
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        if op.name == "linalg.generic":
+            for output in op.opview.outputs:
+                if (
+                    isinstance(output, ir.BlockArgument)
+                    and output.owner.owner.name == "scf.for"
+                ):
+                    found.append(op.parent.name)
+        return ir.WalkResult.ADVANCE
+
+    module.operation.walk(visit)
+    return found
+
+
 def _writes_into_iter_arg(kernel: helion.Kernel, x: torch.Tensor) -> list[bool]:
     """For each loop-carried value updated by a ``linalg.generic``, whether the
     update's destination is the loop's iter arg."""
@@ -126,6 +190,17 @@ def test_update_not_reading_the_iter_arg_keeps_its_destination() -> None:
     assert _writes_into_iter_arg(scaled_running_max, torch.randn(16, 64)) == [False]
 
 
+def test_update_accumulated_into_by_a_contraction_is_in_place() -> None:
+    # ``acc * 0.5`` is the contraction's destination, not the yielded value.
+    args = (torch.randn(16, 64), torch.randn(64, 32))
+    assert _iter_arg_destinations(decayed_matmul, *args) == ["scf.for"]
+
+
+def test_conditional_update_is_in_place() -> None:
+    args = (torch.randn(16, 64), torch.randn(64, 32))
+    assert _iter_arg_destinations(conditionally_decayed_matmul, *args) == ["scf.if"]
+
+
 @pytest.mark.parametrize(
     ("kernel", "reference"),
     [
@@ -144,4 +219,22 @@ def test_in_place_updates_execute(kernel, reference) -> None:
         paths=("direct", "generated"),
         atol=1e-5,
         rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kernel", "conditional"),
+    [(decayed_matmul, False), (conditionally_decayed_matmul, True)],
+    ids=["decayed_matmul", "conditionally_decayed_matmul"],
+)
+def test_accumulated_in_place_updates_execute(
+    kernel: helion.Kernel, conditional: bool
+) -> None:
+    torch.manual_seed(0)
+    check_kernel(
+        kernel,
+        lambda x, y: _decayed_matmul_reference(x, y, conditional),
+        [torch.randn(16, 64), torch.randn(64, 32)],
+        atol=1e-4,
+        rtol=1e-4,
     )
