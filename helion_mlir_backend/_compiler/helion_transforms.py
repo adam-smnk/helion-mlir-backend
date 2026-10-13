@@ -10,6 +10,7 @@ from lighthouse.schedule.builders import schedule_boilerplate
 import lighthouse.transform as lh_transform
 from mlir import ir
 from mlir.dialects import transform
+from mlir.dialects.transform import loop as transform_loop
 from mlir.dialects.transform import math as transform_math
 from mlir.dialects.transform import structured
 from mlir.dialects.transform import tensor as transform_tensor
@@ -143,13 +144,20 @@ def linearize_vector_ops() -> ir.Module:
     with schedule_boilerplate() as (schedule, named_seq):
         linearize = transform.ApplyConversionPatternsOp(
             named_seq.bodyTarget,
-            num_default_type_converter_region=0,
+            num_default_type_converter_region=1,
             legal_dialects=["vector"],
             partial_conversion=True,
             preserve_handles=True,
         )
         with ir.InsertionPoint(linearize.patterns.blocks.append()):
-            transform_vector.apply_conversion_patterns_vector_linearize()
+            transform_vector.apply_conversion_patterns_vector_linearize(
+                shuffle_like_ops=False
+            )
+            transform_loop.apply_conversion_patterns_scf_structural_conversions()
+        with ir.InsertionPoint(
+            linearize.default_type_converter_region[0].blocks.append()
+        ):
+            transform_vector.VectorLinearizeTypeConverterOp()
         lh_transform.cleanup(named_seq.bodyTarget)
         transform.yield_()
     return schedule
